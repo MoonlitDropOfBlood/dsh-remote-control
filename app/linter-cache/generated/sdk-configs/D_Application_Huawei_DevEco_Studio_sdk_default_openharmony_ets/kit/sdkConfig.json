@@ -1,0 +1,9 @@
+{
+  "apiPath": [
+    "D:\\Application\\Huawei\\DevEco Studio\\sdk\\default\\openharmony\\ets\\api",
+    "D:\\Application\\Huawei\\DevEco Studio\\sdk\\default\\openharmony\\ets\\arkts",
+    "D:\\Application\\Huawei\\DevEco Studio\\sdk\\default\\openharmony\\ets\\kits",
+    "D:\\Application\\Huawei\\DevEco Studio\\sdk\\default\\openharmony\\ets\\component"
+  ],
+  "prefix": "@kit"
+}

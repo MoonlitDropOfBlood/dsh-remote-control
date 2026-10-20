@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Remote Control (Phone)",
+    "description": "Control DeepSeek Harness from your HarmonyOS phone over an end-to-end-encrypted public relay: browse and switch sessions, send prompts, watch streamed replies, cancel turns, and answer approval or question requests remotely. Push notifications via Huawei Push Kit are optional and gracefully disabled when unconfigured."
+  }
+}

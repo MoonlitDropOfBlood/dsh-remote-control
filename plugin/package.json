@@ -1,0 +1,38 @@
+{
+  "name": "@duke-dsh-plugins/dsh-remote-control",
+  "version": "1.0.0",
+  "description": "Remote-control bridge for DeepSeek Harness: pairs a HarmonyOS phone app with the desktop Host over an end-to-end-encrypted public relay (WebSocket). Lets the phone list/create/switch sessions, send prompts, watch streamed replies, cancel turns, and answer approval and ask-user-question requests from anywhere; pushes Huawei Push Kit notifications (gracefully disabled when AGC is unconfigured) for approvals, questions, and turn completion. Fail-open by design: any relay timeout or fault hands the request back to the desktop answerer.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./icon": "./icon.svg",
+    "./locale/*.json": "./locale/*.json",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "lib",
+    "cordis.patch.yml",
+    "icon.svg",
+    "locale"
+  ],
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "engines": {
+      "dsh": "^0.1.5-rc.3 || ^0.2.0-rc.1 || ^0.2.1-rc.0"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh": "^0.1.5-rc.3 || ^0.2.0-rc.1 || ^0.2.1-rc.0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh": {
+      "optional": true
+    }
+  }
+}

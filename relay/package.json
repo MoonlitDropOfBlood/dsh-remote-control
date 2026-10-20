@@ -1,0 +1,20 @@
+{
+  "name": "dsh-remote-control-relay",
+  "version": "0.1.0",
+  "description": "Public WebSocket relay (dumb pipe) for dsh-remote-control. Implements contract section 4 transport frames only; never parses frame.data ciphertext.",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test \"test/**/*.test.mjs\"",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.18.1"
+  }
+}

@@ -1,0 +1,7 @@
+# dsh-remote-control — Host-only bundle: no Web UI client, no Typert surface.
+# The plugin runs entirely on the Host plane so its `approval/request` and
+# `user-questions/request` waterfall listeners see every live agent.
+- insert:
+  - id: dsh-remote-control
+    name: '@duke-dsh-plugins/dsh-remote-control'
+    config: {}

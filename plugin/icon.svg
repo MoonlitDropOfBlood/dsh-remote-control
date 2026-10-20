@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="dsh remote control">
+  <!--
+    Original artwork for dsh-remote-control. A phone slab seen head-on whose
+    screen carries a terminal caret (the Harness side); three concentric signal
+    arcs radiate from the top-right corner toward a node dot (the public relay
+    link to the phone). Flat geometry, single gradient ramp, legible at 16px.
+  -->
+  <defs>
+    <linearGradient id="bg" x1="12" y1="12" x2="116" y2="116" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2b4acb"/>
+      <stop offset="1" stop-color="#101a4d"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="112" height="112" rx="26" fill="url(#bg)"/>
+  <!-- phone slab -->
+  <rect x="30" y="34" width="44" height="72" rx="9" fill="none" stroke="#ffffff" stroke-width="6"/>
+  <!-- home indicator -->
+  <rect x="44" y="96" width="16" height="5" rx="2.5" fill="#8fb0ff"/>
+  <!-- terminal caret on screen -->
+  <path d="M41 56 L52 66 L41 76" fill="none" stroke="#7cf5c4" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+  <line x1="57" y1="78" x2="68" y2="78" stroke="#7cf5c4" stroke-width="6" stroke-linecap="round"/>
+  <!-- signal arcs from top-right toward the relay dot -->
+  <path d="M86 40 a26 26 0 0 1 12 24" fill="none" stroke="#9db8ff" stroke-width="6" stroke-linecap="round"/>
+  <path d="M82 27 a42 42 0 0 1 26 26" fill="none" stroke="#6d8cff" stroke-width="6" stroke-linecap="round" opacity="0.85"/>
+  <circle cx="98" cy="86" r="8" fill="#7cf5c4"/>
+</svg>

@@ -55,7 +55,7 @@ export struct ApprovalQueuePage {
     }
     .width('100%')
     .alignItems(VerticalAlign.Center)
-    .margin({ bottom: SP_3 })
+    .padding({ left: SP_4, right: SP_4, top: SP_2, bottom: SP_3 })
   }
 
   @Builder

@@ -104,14 +104,63 @@ export struct SessionCard {
   }
 }
 
+/** 筛选胶囊（未归档 / 已归档 / 全部）。 */
+@ComponentV2
+export struct FilterChip {
+  @Require @Param label: string = '';
+  @Require @Param count: number = 0;
+  @Require @Param active: boolean = false;
+  @Event onTap: () => void;
+
+  build() {
+    Text(this.label + ' · ' + this.count.toString())
+      .fontSize(FS_SMALL)
+      .fontWeight(this.active ? FontWeight.Medium : FontWeight.Normal)
+      .fontColor(this.active ? $r('app.color.label_on_brand') : $r('app.color.label_secondary'))
+      .padding({ left: SP_3, right: SP_3, top: SP_1 + 2, bottom: SP_1 + 2 })
+      .borderRadius(RADIUS_PILL)
+      .backgroundColor(this.active ? $r('app.color.brand_fill') : $r('app.color.bg_layer_2'))
+      .onClick((): void => {
+        this.onTap();
+      })
+  }
+}
+
 @ComponentV2
 export struct SessionListPage {
   @Local navPathStack: NavPathStack = new NavPathStack();
   @Local store: SessionStore = sessionStore;
   @Local refreshing: boolean = false;
+  /** 列表筛选：active=未归档（默认）/ archived=已归档 / all=全部。 */
+  @Local listFilter: string = 'active';
 
   aboutToAppear(): void {
     this.store.refreshSessions();
+  }
+
+  /** 当前筛选下的会话行（store.sessions 的 @Trace 读取会被 V2 追踪，列表随事件实时刷新）。 */
+  private filteredSessions(): SessionRow[] {
+    if (this.listFilter === 'all') {
+      return this.store.sessions;
+    }
+    const wantArchived: boolean = this.listFilter === 'archived';
+    const out: SessionRow[] = [];
+    for (const row of this.store.sessions) {
+      if (row.archived === wantArchived) {
+        out.push(row);
+      }
+    }
+    return out;
+  }
+
+  private countBy(archived: boolean): number {
+    let n: number = 0;
+    for (const row of this.store.sessions) {
+      if (row.archived === archived) {
+        n++;
+      }
+    }
+    return n;
   }
 
   /** 下拉刷新：拉 session.list，完成后收起刷新态。 */
@@ -185,7 +234,39 @@ export struct SessionListPage {
     }
     .width('100%')
     .alignItems(VerticalAlign.Center)
-    .margin({ bottom: SP_3 })
+    .padding({ left: SP_4, right: SP_4, top: SP_2, bottom: SP_3 })
+  }
+
+  @Builder
+  filterRow() {
+    Row({ space: SP_2 }) {
+      FilterChip({
+        label: '未归档',
+        count: this.countBy(false),
+        active: this.listFilter === 'active',
+        onTap: (): void => {
+          this.listFilter = 'active';
+        }
+      })
+      FilterChip({
+        label: '已归档',
+        count: this.countBy(true),
+        active: this.listFilter === 'archived',
+        onTap: (): void => {
+          this.listFilter = 'archived';
+        }
+      })
+      FilterChip({
+        label: '全部',
+        count: this.store.sessions.length,
+        active: this.listFilter === 'all',
+        onTap: (): void => {
+          this.listFilter = 'all';
+        }
+      })
+    }
+    .width('100%')
+    .padding({ left: SP_4, right: SP_4, bottom: SP_2 })
   }
 
   @Builder
@@ -218,11 +299,14 @@ export struct SessionListPage {
       Text('○')
         .fontSize(40)
         .fontColor($r('app.color.label_tertiary'))
-      Text(this.store.linkState === 'online' ? '暂无会话' : '未连接，暂无会话数据')
+      Text(this.store.linkState === 'online' ?
+        (this.store.sessions.length === 0 ? '暂无会话' : '当前筛选下暂无会话') :
+        '未连接，暂无会话数据')
         .fontSize(FS_BODY)
         .fontColor($r('app.color.label_secondary'))
         .margin({ top: SP_2 })
-      Text(this.store.linkState === 'online' ? '点下方「新建会话」开始遥控' :
+      Text(this.store.linkState === 'online' ?
+        (this.store.sessions.length === 0 ? '点下方「新建会话」开始遥控' : '试试切换上方筛选，或下拉刷新') :
         '在配对页填好中继地址与配对信息后点「连接」')
         .fontSize(FS_SMALL)
         .fontColor($r('app.color.label_tertiary'))
@@ -236,17 +320,18 @@ export struct SessionListPage {
     NavDestination() {
       Column() {
         this.topBar()
+        this.filterRow()
         if (this.store.pendingCount() > 0) {
           this.pendingBanner()
         }
         Refresh({ refreshing: this.refreshing }) {
           List({ space: SP_2 }) {
-            if (this.store.sessions.length === 0) {
+            if (this.filteredSessions().length === 0) {
               ListItem() {
                 this.emptyState()
               }
             } else {
-              Repeat(this.store.sessions)
+              Repeat(this.filteredSessions())
                 .each((cell: RepeatItem<SessionRow>): void => {
                   ListItem() {
                     SessionCard({

@@ -134,7 +134,10 @@ export async function deriveKey(secret: string, channel: string): Promise<Uint8A
     keySize: HKDF_KEY_LEN
   };
   const kdf: cryptoFramework.Kdf = cryptoFramework.createKdf(HKDF_KDF_ALG);
-  const out: cryptoFramework.DataBlob = await kdf.generateSecret(spec);
+  const out: cryptoFramework.DataBlob | null = await kdf.generateSecret(spec);
+  if (out === null) {
+    throw new Error('hkdf generateSecret returned null');
+  }
   return out.data;
 }
 
@@ -146,7 +149,10 @@ export async function hmacSha256(key: Uint8Array, data: Uint8Array): Promise<Uin
   const mac: cryptoFramework.Mac = cryptoFramework.createMac(HMAC_ALG);
   await mac.init(symKey);
   await mac.update({ data: data });
-  const out: cryptoFramework.DataBlob = await mac.doFinal();
+  const out: cryptoFramework.DataBlob | null = await mac.doFinal();
+  if (out === null) {
+    throw new Error('mac doFinal returned null');
+  }
   return out.data;
 }
 
@@ -186,9 +192,17 @@ async function gcmEncrypt(key: Uint8Array, ivBuf: Uint8Array, aad: Uint8Array,
     algName: GCM_PARAMS_ALG
   };
   cipher.initSync(cryptoFramework.CryptoMode.ENCRYPT_MODE, symKey, params);
-  const ct: cryptoFramework.DataBlob = cipher.updateSync({ data: ptBuf });
-  const tag: cryptoFramework.DataBlob = cipher.doFinalSync(null);
-  return concatBytes(ct.data, tag.data);
+  // 真机语义（SDK d.ts doFinalSync 文档）：GCM 单次加密中 updateSync 与 doFinalSync
+  // 的输出「拼接后」才是 ct||tag（authTag 恒为末 16 字节）；且真机上 updateSync 对
+  // 小数据可能返回 null（输出被缓冲推迟到 doFinal）——两处都必须判空再拼接。
+  const mid: cryptoFramework.DataBlob | null = cipher.updateSync({ data: ptBuf });
+  const fin: cryptoFramework.DataBlob | null = cipher.doFinalSync(null);
+  const out: Uint8Array = concatBytes(mid === null ? new Uint8Array(0) : mid.data,
+    fin === null ? new Uint8Array(0) : fin.data);
+  if (out.length < TAG_LEN) {
+    throw new Error('gcm encrypt: output shorter than authTag');
+  }
+  return out;
 }
 
 /**
@@ -211,9 +225,12 @@ async function gcmDecrypt(key: Uint8Array, ivBuf: Uint8Array, aad: Uint8Array,
     algName: GCM_PARAMS_ALG
   };
   cipher.initSync(cryptoFramework.CryptoMode.DECRYPT_MODE, symKey, params);
-  const pt: cryptoFramework.DataBlob = cipher.updateSync({ data: ct });
-  const fin: cryptoFramework.DataBlob = cipher.doFinalSync(null);
-  return concatBytes(pt.data, fin.data);
+  // 同 gcmEncrypt：update/doFinal 输出拼接才是明文；真机任一侧都可能返回 null。
+  // 认证失败在 doFinalSync 抛 BusinessError 17630001（调用方丢弃该帧）。
+  const mid: cryptoFramework.DataBlob | null = cipher.updateSync({ data: ct });
+  const fin: cryptoFramework.DataBlob | null = cipher.doFinalSync(null);
+  return concatBytes(mid === null ? new Uint8Array(0) : mid.data,
+    fin === null ? new Uint8Array(0) : fin.data);
 }
 
 /**

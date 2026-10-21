@@ -582,9 +582,12 @@ export class SessionStore {
     if (m.type !== MSG_EVENT) {
       return;
     }
+    if (m.payload === null || m.payload === undefined) {
+      return;
+    }
     const topic: string = m.payload.topic !== undefined ? m.payload.topic : '';
     const empty: DshrcValue = JSON.parse('{}') as DshrcValue;
-    const data: DshrcValue = m.payload.data !== undefined ? m.payload.data : empty;
+    const data: DshrcValue = m.payload.data !== undefined && m.payload.data !== null ? m.payload.data : empty;
     switch (topic) {
       case TOPIC_SESSION_ADDED: {
         // 契约 §5.2：session.added 的 data = {session: SessionSummary}（嵌套一层）

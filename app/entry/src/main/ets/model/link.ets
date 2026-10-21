@@ -477,7 +477,7 @@ export class DshrcLink {
     const key: Uint8Array | null = this.key;
     const sid: string = frame.sid !== undefined ? frame.sid : SID_LEGACY;
     const seq: number = frame.seq !== undefined ? frame.seq : 0;
-    const data: string = frame.data !== undefined ? frame.data : '';
+    const data: string = frame.data !== undefined && frame.data !== null ? frame.data : '';
     if (key === null || seq <= 0 || data.length === 0) {
       return;
     }

@@ -42,7 +42,11 @@ import {
 const AES_GCM_ALG: string = 'AES256|GCM|PKCS7';
 const HKDF_KDF_ALG: string = 'HKDF|SHA256|EXTRACT_AND_EXPAND';
 const HKDF_SPEC_ALG: string = 'HKDF';
-const HMAC_ALG: string = 'HMAC|SHA256';
+// HMAC 两个算法串语义不同（SDK d.ts）：
+//  - SymKeyGenerator 用 'HMAC|SHA256'（密钥规格带摘要）
+//  - createMac 只认摘要名 'SHA256'（真机传 'HMAC|SHA256' 报 401 Unsupported）
+const HMAC_KEYGEN_ALG: string = 'HMAC|SHA256';
+const MAC_DIGEST_ALG: string = 'SHA256';
 const GCM_PARAMS_ALG: string = 'GcmParamsSpec';
 
 const encHelper: util.Base64Helper = new util.Base64Helper();
@@ -143,10 +147,10 @@ export async function deriveKey(secret: string, channel: string): Promise<Uint8A
 
 /** 以 E2E key 为密钥的 HMAC-SHA256（契约 §3.4 hello 签名）。 */
 export async function hmacSha256(key: Uint8Array, data: Uint8Array): Promise<Uint8Array> {
-  // Mac.init 需要 SymKey：用 HMAC|SHA256 规格把 32 字节裸 key 转成对称密钥。
-  const keyGen: cryptoFramework.SymKeyGenerator = cryptoFramework.createSymKeyGenerator(HMAC_ALG);
+  // Mac.init 需要 SymKey：keygen 用 'HMAC|SHA256' 规格转换；createMac 只认摘要名 'SHA256'。
+  const keyGen: cryptoFramework.SymKeyGenerator = cryptoFramework.createSymKeyGenerator(HMAC_KEYGEN_ALG);
   const symKey: cryptoFramework.SymKey = await keyGen.convertKey({ data: key });
-  const mac: cryptoFramework.Mac = cryptoFramework.createMac(HMAC_ALG);
+  const mac: cryptoFramework.Mac = cryptoFramework.createMac(MAC_DIGEST_ALG);
   await mac.init(symKey);
   await mac.update({ data: data });
   const out: cryptoFramework.DataBlob | null = await mac.doFinal();
@@ -315,6 +319,14 @@ export async function assertKat(): Promise<boolean> {
   if (!crossRejected) {
     throw new Error('KAT aad role binding not enforced');
   }
+
+  // 5. HMAC-SHA256 向量（真机坑：createMac 只认摘要名——验不出就别连）
+  //    HMAC-SHA256(key=KAT key, UTF8("dshrc-hmac-kat")) =
+  //    4cdd85bbaf49ae76476d430f34ba6096e04432a98c9c31b5838e16224b8db9ad
+  const hmacHex: string = toHex(await hmacSha256(key, utf8Encode('dshrc-hmac-kat')));
+  if (hmacHex !== '4cdd85bbaf49ae76476d430f34ba6096e04432a98c9c31b5838e16224b8db9ad') {
+    throw new Error('KAT hmac mismatch: got ' + hmacHex);
+  }
   return true;
 }
 
@@ -322,7 +334,7 @@ export async function assertKat(): Promise<boolean> {
 export async function runKatCheck(): Promise<string> {
   try {
     const ok: boolean = await assertKat();
-    return ok ? 'KAT 通过 ✓（HKDF / AES-256-GCM 与契约 §7 逐字节一致）' : 'KAT 失败';
+    return ok ? 'KAT 通过 ✓（HKDF / AES-256-GCM / HMAC 与契约逐字节一致）' : 'KAT 失败';
   } catch (e) {
     const msg: string = e instanceof Error ? e.message : businessErrText(e);
     return 'KAT 失败：' + msg;

@@ -7,7 +7,9 @@
  * 设计：侧栏感列表（卡片 12vp 圆角 + 1px border_l1），空态居中提示，底部固定操作区。
  */
 import { promptAction } from '@kit.ArkUI';
+import { HRouter } from 'hrouter';
 import { dshrcLink } from '../model/link';
+import { goBack, openApprovalQueue, openSessionDetail } from '../model/routes';
 import {
   FS_BODY,
   FS_CAPTION,
@@ -26,7 +28,6 @@ import {
   relTime
 } from '../model/theme';
 import { SessionRow, SessionStore, sessionStore } from '../model/sessionstore';
-import { SessionDetailParam } from './SessionDetailPage';
 
 /** 单张会话卡（列表项）。 */
 @ComponentV2
@@ -126,9 +127,11 @@ export struct FilterChip {
   }
 }
 
+// hrouter 编译期扫描标记（注释形式：ArkTS 不允许 struct 上挂非框架装饰器）。
+// 页面本体保持普通组件，NavDestination 外壳由 hrouter-compiler 生成的 wrapper 提供。
+// @Route({ name: 'session_list' })
 @ComponentV2
 export struct SessionListPage {
-  @Local navPathStack: NavPathStack = new NavPathStack();
   @Local store: SessionStore = sessionStore;
   @Local refreshing: boolean = false;
   /** 列表筛选：active=未归档（默认）/ archived=已归档 / all=全部。 */
@@ -136,6 +139,12 @@ export struct SessionListPage {
 
   aboutToAppear(): void {
     this.store.refreshSessions();
+    // 返回本页时补一次刷新（替代原 NavDestination.onShown；页面卸载时 HRouter 自动清理回调）。
+    HRouter.registerLifecycle(this, {
+      onShown: (): void => {
+        this.store.refreshSessions();
+      }
+    });
   }
 
   /** 当前筛选下的会话行（store.sessions 的 @Trace 读取会被 V2 追踪，列表随事件实时刷新）。 */
@@ -184,8 +193,7 @@ export struct SessionListPage {
     }
     dshrcLink.sessionCreate('').then((sid: string): void => {
       if (sid.length > 0) {
-        const p: SessionDetailParam = { sessionId: sid };
-        this.navPathStack.pushPath({ name: 'SessionDetailPage', param: p });
+        openSessionDetail(sid);
       }
     }).catch((e: Error): void => {
       promptAction.showToast({ message: '新建会话失败：' + e.message, duration: 3000 });
@@ -194,8 +202,7 @@ export struct SessionListPage {
 
   /** 打开会话详情。 */
   private openSession(sid: string): void {
-    const p: SessionDetailParam = { sessionId: sid };
-    this.navPathStack.pushPath({ name: 'SessionDetailPage', param: p });
+    openSessionDetail(sid);
   }
 
   @Builder
@@ -212,7 +219,7 @@ export struct SessionListPage {
       .backgroundColor($r('app.color.bg_layer_2'))
       .borderRadius(RADIUS_CTRL)
       .onClick((): void => {
-        this.navPathStack.pop();
+        goBack();
       })
       Text('会话')
         .fontSize(FS_SUBTITLE)
@@ -289,7 +296,7 @@ export struct SessionListPage {
     .borderRadius(RADIUS_CTRL)
     .margin({ bottom: SP_3 })
     .onClick((): void => {
-      this.navPathStack.pushPathByName('ApprovalQueuePage', null);
+      openApprovalQueue();
     })
   }
 
@@ -317,77 +324,66 @@ export struct SessionListPage {
   }
 
   build() {
-    NavDestination() {
-      Column() {
-        this.topBar()
-        this.filterRow()
-        if (this.store.pendingCount() > 0) {
-          this.pendingBanner()
-        }
-        Refresh({ refreshing: this.refreshing }) {
-          List({ space: SP_2 }) {
-            if (this.filteredSessions().length === 0) {
-              ListItem() {
-                this.emptyState()
-              }
-            } else {
-              Repeat(this.filteredSessions())
-                .each((cell: RepeatItem<SessionRow>): void => {
-                  ListItem() {
-                    SessionCard({
-                      row: cell.item,
-                      onOpen: (sid: string): void => {
-                        this.openSession(sid);
-                      }
-                    })
-                  }
-                })
-                .key((row: SessionRow): string => row.sessionId)
+    // NavDestination 外壳由 hrouter-compiler 生成的 wrapper 提供（hideTitleBar/onReady 在那边）。
+    Column() {
+      this.topBar()
+      this.filterRow()
+      if (this.store.pendingCount() > 0) {
+        this.pendingBanner()
+      }
+      Refresh({ refreshing: this.refreshing }) {
+        List({ space: SP_2 }) {
+          if (this.filteredSessions().length === 0) {
+            ListItem() {
+              this.emptyState()
             }
+          } else {
+            Repeat(this.filteredSessions())
+              .each((cell: RepeatItem<SessionRow>): void => {
+                ListItem() {
+                  SessionCard({
+                    row: cell.item,
+                    onOpen: (sid: string): void => {
+                      this.openSession(sid);
+                    }
+                  })
+                }
+              })
+              .key((row: SessionRow): string => row.sessionId)
           }
-          .width('100%')
-          .height('100%')
-          .scrollBar(BarState.Off)
-          .padding({ left: SP_4, right: SP_4, bottom: SP_2 })
         }
         .width('100%')
-        .layoutWeight(1)
-        .backgroundColor($r('app.color.bg_base'))
-        .onRefreshing((): void => {
-          this.doRefresh();
-        })
-
-        Column() {
-          Button('新建会话')
-            .width('100%')
-            .height(46)
-            .fontSize(FS_BODY)
-            .fontWeight(FontWeight.Medium)
-            .fontColor($r('app.color.label_on_brand'))
-            .backgroundColor($r('app.color.brand_fill'))
-            .borderRadius(RADIUS_CTRL)
-            .onClick((): void => {
-              this.onCreateSession();
-            })
-        }
-        .width('100%')
-        .padding({ left: SP_4, right: SP_4, top: SP_3, bottom: SP_4 })
-        .backgroundColor($r('app.color.bg_layer_1'))
-        .border({ width: HAIRLINE, color: $r('app.color.border_l1') })
+        .height('100%')
+        .scrollBar(BarState.Off)
+        .padding({ left: SP_4, right: SP_4, bottom: SP_2 })
       }
       .width('100%')
-      .height('100%')
+      .layoutWeight(1)
+      .backgroundColor($r('app.color.bg_base'))
+      .onRefreshing((): void => {
+        this.doRefresh();
+      })
+
+      Column() {
+        Button('新建会话')
+          .width('100%')
+          .height(46)
+          .fontSize(FS_BODY)
+          .fontWeight(FontWeight.Medium)
+          .fontColor($r('app.color.label_on_brand'))
+          .backgroundColor($r('app.color.brand_fill'))
+          .borderRadius(RADIUS_CTRL)
+          .onClick((): void => {
+            this.onCreateSession();
+          })
+      }
+      .width('100%')
+      .padding({ left: SP_4, right: SP_4, top: SP_3, bottom: SP_4 })
+      .backgroundColor($r('app.color.bg_layer_1'))
+      .border({ width: HAIRLINE, color: $r('app.color.border_l1') })
     }
     .width('100%')
     .height('100%')
-    .hideTitleBar(true)
     .backgroundColor($r('app.color.bg_base'))
-    .onReady((ctx: NavDestinationContext): void => {
-      this.navPathStack = ctx.pathStack;
-    })
-    .onShown((): void => {
-      // 从详情/审批页返回时补一次列表刷新
-      this.store.refreshSessions();
-    })
   }
 }

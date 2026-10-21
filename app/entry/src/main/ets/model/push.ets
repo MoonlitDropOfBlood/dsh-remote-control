@@ -8,12 +8,11 @@
  */
 import { pushService } from '@kit.PushKit';
 import { BusinessError } from '@kit.BasicServicesKit';
-import { hilog } from '@kit.PerformanceAnalysisKit';
 import { Ability } from '@kit.AbilityKit';
+import { logDshrc } from './logger';
 import { sessionStore } from './sessionstore';
 
 const TAG: string = 'dshrc-push';
-const LOG_DOMAIN: number = 0x0000;
 
 /** 通知点击直达目标（契约 §6 intent extra）。 */
 export interface PushIntentTarget {
@@ -52,10 +51,10 @@ export class PushKit {
     pushService.getToken().then((t: string): void => {
       this.token = t;
       sessionStore.setPushToken(t);
-      hilog.info(LOG_DOMAIN, TAG, 'push token acquired, len=%{public}d', t.length);
+      logDshrc(TAG, 'info', 'push token acquired, len=' + t.length.toString());
     }).catch((e: BusinessError): void => {
-      hilog.error(LOG_DOMAIN, TAG,
-        'getToken failed: %{public}d %{public}s（推送降级，主链路不受影响）', e.code, e.message);
+      logDshrc(TAG, 'error',
+        'getToken failed: ' + e.code.toString() + ' ' + e.message + '（推送降级，主链路不受影响）');
     });
   }
 
@@ -69,11 +68,11 @@ export class PushKit {
       pushService.on('tokenUpdate', ability, (t: string): void => {
         this.token = t;
         sessionStore.setPushToken(t);
-        hilog.info(LOG_DOMAIN, TAG, 'push token updated, len=%{public}d', t.length);
+        logDshrc(TAG, 'info', 'push token updated, len=' + t.length.toString());
       });
     } catch (e) {
       const err: BusinessError = e as BusinessError;
-      hilog.error(LOG_DOMAIN, TAG, 'bind tokenUpdate failed: %{public}d', err.code);
+      logDshrc(TAG, 'error', 'bind tokenUpdate failed: ' + err.code.toString());
     }
   }
 }

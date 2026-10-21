@@ -10,10 +10,17 @@
  *  - 推送点击待导航目标（EntryAbility 解析 intent 后写入，Index 消费）
  * 本层不做加解密（链路层负责），状态一律 @ObservedV2 + @Trace，页面直接读即自动刷新。
  */
-import { hilog } from '@kit.PerformanceAnalysisKit';
 import { preferences } from '@kit.ArkData';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { Context } from '@kit.AbilityKit';
+import { logDshrc } from './logger';
+import {
+  postApprovalArrived,
+  postApprovalResolved,
+  postPendingNav,
+  postQuestionArrived,
+  postQuestionResolved
+} from './events';
 import { DshrcLink, LinkPeers, LinkState, dshrcLink } from './link';
 import {
   DshrcMsg,
@@ -36,7 +43,6 @@ import {
 } from './protocol';
 
 const TAG: string = 'dshrc-sessionstore';
-const LOG_DOMAIN: number = 0x0000;
 const PREF_NAME: string = 'dshrc_prefs';
 const KEY_PUSH_ENABLED: string = 'pushEnabled';
 const LOG_KEEP: number = 80;
@@ -145,7 +151,7 @@ export function loadPushEnabled(context: Context): boolean {
     return pref.getSync(KEY_PUSH_ENABLED, true) as boolean;
   } catch (e) {
     const err: BusinessError = e as BusinessError;
-    hilog.warn(LOG_DOMAIN, TAG, 'loadPushEnabled failed: %{public}s', err.message);
+    logDshrc(TAG, 'warn', 'loadPushEnabled failed: ' + err.message);
     return true;
   }
 }
@@ -160,7 +166,7 @@ export function savePushEnabled(context: Context, on: boolean): boolean {
     return true;
   } catch (e) {
     const err: BusinessError = e as BusinessError;
-    hilog.error(LOG_DOMAIN, TAG, 'savePushEnabled failed: %{public}s', err.message);
+    logDshrc(TAG, 'error', 'savePushEnabled failed: ' + err.message);
     return false;
   }
 }
@@ -260,7 +266,7 @@ export class SessionStore {
     }).catch((e: Error): void => {
       this.refreshing = false;
       this.lastError = e.message;
-      hilog.warn(LOG_DOMAIN, TAG, 'session.list failed: %{public}s', e.message);
+      logDshrc(TAG, 'warn', 'session.list failed: ' + e.message);
     });
   }
 
@@ -538,10 +544,10 @@ export class SessionStore {
     }
     this.link.pushRegister(this.pushToken).then((ok: boolean): void => {
       this.pushRegistered = ok;
-      hilog.info(LOG_DOMAIN, TAG, 'push.register ok=%{public}s', ok.toString());
+      logDshrc(TAG, 'info', 'push.register ok=' + ok.toString());
     }).catch((e: Error): void => {
       this.pushRegistered = false;
-      hilog.warn(LOG_DOMAIN, TAG, 'push.register failed: %{public}s', e.message);
+      logDshrc(TAG, 'warn', 'push.register failed: ' + e.message);
     });
   }
 
@@ -565,6 +571,8 @@ export class SessionStore {
     if (this.onPendingNav !== null) {
       this.onPendingNav();
     }
+    // 粘性广播：EntryAbility.onCreate 写入早于 Index 挂载，Index sticky 订阅补收。
+    postPendingNav(sessionId, askId);
   }
 
   /** Index 读取并清空待导航目标（消费一次即清）。 */
@@ -661,6 +669,7 @@ export class SessionStore {
             data.argsPreview !== undefined ? data.argsPreview : '',
             Date.now() + timeoutMs, timeoutMs);
           this.approvals = this.approvals.concat([card]);
+          postApprovalArrived(card.sessionId, askId, card.toolName);
         }
         break;
       }
@@ -668,6 +677,7 @@ export class SessionStore {
         const askId2: string = data.askId !== undefined ? data.askId : '';
         if (askId2.length > 0) {
           this.dropApproval(askId2);
+          postApprovalResolved(askId2);
         }
         break;
       }
@@ -680,6 +690,7 @@ export class SessionStore {
             data.questions !== undefined ? data.questions : [],
             data.multiSelect === true, Date.now() + timeoutMs3, timeoutMs3);
           this.questions = this.questions.concat([qcard]);
+          postQuestionArrived(qcard.sessionId, askId3);
         }
         break;
       }
@@ -687,6 +698,7 @@ export class SessionStore {
         const askId4: string = data.askId !== undefined ? data.askId : '';
         if (askId4.length > 0) {
           this.dropQuestion(askId4);
+          postQuestionResolved(askId4);
         }
         break;
       }
@@ -698,7 +710,7 @@ export class SessionStore {
       case TOPIC_ERROR: {
         // 契约 §5.2：error 事件的 data = {message}
         this.lastError = data.message !== undefined ? data.message : 'host 报错';
-        hilog.warn(LOG_DOMAIN, TAG, 'host error event: %{public}s', this.lastError);
+        logDshrc(TAG, 'warn', 'host error event: ' + this.lastError);
         break;
       }
       default: {

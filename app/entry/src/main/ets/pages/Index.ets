@@ -13,7 +13,11 @@ import { promptAction } from '@kit.ArkUI';
 import { common } from '@kit.AbilityKit';
 import { scanBarcode } from '@kit.ScanKit';
 import { BusinessError } from '@kit.BasicServicesKit';
-import { hilog } from '@kit.PerformanceAnalysisKit';
+import { EventPost } from 'eventpost';
+import { HRouter } from 'hrouter';
+import { EVT_PENDING_NAV } from '../model/events';
+import { logDshrc } from '../model/logger';
+import { openAbout, openApprovalQueue, openSessionDetail, openSessionList } from '../model/routes';
 import { dshrcLink } from '../model/link';
 import { PairQrResult, parsePairQr } from '../model/pairqr';
 import { CONTRACT_VERSION, isValidChannel } from '../model/protocol';
@@ -55,10 +59,6 @@ import {
   linkStateText
 } from '../model/theme';
 import { FieldInput } from './FieldInput';
-import { SessionListPage } from './SessionListPage';
-import { SessionDetailParam, SessionDetailPage } from './SessionDetailPage';
-import { ApprovalQueuePage } from './ApprovalQueuePage';
-import { AboutPage } from './AboutPage';
 
 @Entry
 @ComponentV2
@@ -78,6 +78,8 @@ struct Index {
   @Local scanHintOk: boolean = false;
 
   aboutToAppear(): void {
+    // hrouter：把本 Navigation 的栈注册为默认栈；页面跳转统一走 model/routes.ets。
+    HRouter.registerNavPathStack('default', this.navPathStack);
     const ctx: common.Context = getContext(this) as common.Context;
     const cfg: PairingConfig = loadPairing(ctx);
     this.relayUrl = cfg.relayUrl;
@@ -95,39 +97,27 @@ struct Index {
     this.store.onPendingNav = (): void => {
       this.consumePending();
     };
+    // 事件总线订阅（eventpost onFromComponent：组件销毁自动反注册，无需手动 off）。
+    // 与上面的直接回调并行——consumePending 幂等（takePendingNav 消费后即清空）。
+    // sticky=true：EntryAbility.onCreate 的写入早于本页挂载，补收最近一次。
+    EventPost.getDefault().onFromComponent(EVT_PENDING_NAV, this, (): void => {
+      this.consumePending();
+    }, true);
   }
 
   aboutToDisappear(): void {
     this.store.onPendingNav = null;
   }
 
-  /** 四个 NavDestination 的路由映射（单一 builder，链式 navDestination 会互相覆盖）。 */
-  @Builder
-  pageMap(name: string) {
-    if (name === 'SessionListPage') {
-      SessionListPage();
-    }
-    if (name === 'SessionDetailPage') {
-      SessionDetailPage();
-    }
-    if (name === 'ApprovalQueuePage') {
-      ApprovalQueuePage();
-    }
-    if (name === 'AboutPage') {
-      AboutPage();
-    }
-  }
-
   /** 消费推送点击目标：有 askId 直达审批队列，否则直达会话详情（契约 §6）。 */
   private consumePending(): void {
     const p: PendingNav = this.store.takePendingNav();
     if (p.askId.length > 0) {
-      this.navPathStack.pushPathByName('ApprovalQueuePage', null);
+      openApprovalQueue();
       return;
     }
     if (p.sessionId.length > 0) {
-      const param: SessionDetailParam = { sessionId: p.sessionId };
-      this.navPathStack.pushPath({ name: 'SessionDetailPage', param: param });
+      openSessionDetail(p.sessionId);
     }
   }
 
@@ -172,13 +162,13 @@ struct Index {
         this.applyScanText(res.originalValue);
       }).catch((err: BusinessError): void => {
         // 取消（1000500002）/ 失败均静默回到配对页（不打断输入），只记日志便于排障。
-        hilog.warn(0x0000, 'dshrc-scan', 'startScanForResult failed: %{public}d %{public}s',
-          err.code, err.message);
+        logDshrc('dshrc-scan', 'warn',
+          'startScanForResult failed: ' + err.code.toString() + ' ' + err.message);
       });
     } catch (e) {
       const err: BusinessError = e as BusinessError;
-      hilog.warn(0x0000, 'dshrc-scan', 'startScanForResult threw: %{public}d %{public}s',
-        err.code, err.message);
+      logDshrc('dshrc-scan', 'warn',
+        'startScanForResult threw: ' + err.code.toString() + ' ' + err.message);
       promptAction.showToast({ message: '当前设备不支持扫码功能', duration: 3000 });
     }
   }
@@ -274,7 +264,7 @@ struct Index {
         .fontColor($r('app.color.label_primary'))
         .backgroundColor($r('app.color.bg_layer_2'))
         .onClick((): void => {
-          this.navPathStack.pushPathByName('AboutPage', null);
+          openAbout();
         })
     }
     .width('100%')
@@ -531,7 +521,7 @@ struct Index {
         .backgroundColor($r('app.color.brand_fill'))
         .borderRadius(RADIUS_CTRL)
         .onClick((): void => {
-          this.navPathStack.pushPathByName('SessionListPage', null);
+          openSessionList();
         })
       if (this.store.pendingCount() > 0) {
         Button('待处理 ' + this.store.pendingCount().toString())
@@ -543,7 +533,7 @@ struct Index {
           .backgroundColor($r('app.color.state_warn_tint'))
           .borderRadius(RADIUS_CTRL)
           .onClick((): void => {
-            this.navPathStack.pushPathByName('ApprovalQueuePage', null);
+            openApprovalQueue();
           })
       }
     }
@@ -595,6 +585,5 @@ struct Index {
     .hideTitleBar(true)
     .hideToolBar(true)
     .backgroundColor($r('app.color.bg_base'))
-    .navDestination(this.pageMap)
   }
 }

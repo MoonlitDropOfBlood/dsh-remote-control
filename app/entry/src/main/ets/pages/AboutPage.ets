@@ -21,6 +21,8 @@ import {
   SP_6
 } from '../model/theme';
 import { runKatCheck } from '../model/crypto';
+import { DshrcLogFile, exportLogs, logDirPath } from '../model/logger';
+import { goBack } from '../model/routes';
 
 /** 信息行（左标题右值）。 */
 @ComponentV2
@@ -48,16 +50,38 @@ struct AboutRow {
   }
 }
 
+// hrouter 编译期扫描标记（注释形式：ArkTS 不允许 struct 上挂非框架装饰器）。
+// @Route({ name: 'about' })
 @ComponentV2
 export struct AboutPage {
-  @Local navPathStack: NavPathStack = new NavPathStack();
   @Local katText: string = 'KAT 自检中…';
   @Local katOk: boolean = false;
+  /** 文件日志摘要（exportLogs() 拉取；空串 = 未取到）。 */
+  @Local logSummary: string = '文件日志：读取中…';
 
   aboutToAppear(): void {
     runKatCheck().then((text: string): void => {
       this.katText = text;
       this.katOk = text.startsWith('KAT 通过');
+    });
+    this.refreshLogInfo();
+  }
+
+  /** 拉取 Logan 文件列表（@duke/logan-ext exportLogs），展示个数与总大小。 */
+  private refreshLogInfo(): void {
+    exportLogs().then((files: DshrcLogFile[]): void => {
+      if (files.length === 0) {
+        this.logSummary = '文件日志：暂无（目录 ' + logDirPath() + '）';
+        return;
+      }
+      let total: number = 0;
+      for (let i: number = 0; i < files.length; i++) {
+        total += files[i].size;
+      }
+      this.logSummary = '文件日志：' + files.length.toString() + ' 个 · 共 ' +
+        (total / 1024).toFixed(1) + ' KB';
+    }).catch((): void => {
+      this.logSummary = '文件日志：读取失败';
     });
   }
 
@@ -75,7 +99,7 @@ export struct AboutPage {
       .backgroundColor($r('app.color.bg_layer_2'))
       .borderRadius(RADIUS_CTRL)
       .onClick((): void => {
-        this.navPathStack.pop();
+        goBack();
       })
       Text('关于')
         .fontSize(FS_SUBTITLE)
@@ -89,10 +113,10 @@ export struct AboutPage {
   }
 
   build() {
-    NavDestination() {
-      Column() {
-        this.topBar()
-        Scroll() {
+    // NavDestination 外壳由 hrouter-compiler 生成的 wrapper 提供。
+    Column() {
+      this.topBar()
+      Scroll() {
           Column() {
             // 品牌头
             Column() {
@@ -139,6 +163,8 @@ export struct AboutPage {
                 label: 'KAT 自检',
                 value: this.katOk ? '通过 ✓' : (this.katText.startsWith('KAT 通过') ? '通过 ✓' : '运行中…')
               })
+              Divider().color($r('app.color.border_l1'))
+              AboutRow({ label: '本地日志', value: this.logSummary })
             }
             .width('100%')
             .padding(SP_4)
@@ -219,13 +245,6 @@ export struct AboutPage {
       }
       .width('100%')
       .height('100%')
+      .backgroundColor($r('app.color.bg_base'))
     }
-    .width('100%')
-    .height('100%')
-    .hideTitleBar(true)
-    .backgroundColor($r('app.color.bg_base'))
-    .onReady((ctx: NavDestinationContext): void => {
-      this.navPathStack = ctx.pathStack;
-    })
   }
-}

@@ -17,6 +17,56 @@
 >     全树 grep `@State|@Prop|@Link|@ObjectLink|@Observed[^V]|@Provide|@Consume|@Watch|@StorageLink` **0 命中**。
 > - **R3（已完成）**：**扫码配对**（契约 §3.5 v1.0.3）——Scan Kit 默认界面扫码 →
 >   `model/pairqr.ets` 解析 `dshrc://pair?…` / 裸 query → 自动填参并连接（见 §7）。
+> - **R4（已完成）**：**三方库集成**（用户指定，见 §0.5）——`@duke/logan-ext`（文件日志双写）+
+>   `eventpost`（link→store→UI 事件总线）+ `hrouter`（编译期路由表替代手写跳转）。
+
+---
+
+## 0.5 三方库（ohpm，R4 已集成）
+
+| 库 | 版本 | 用途 | 集成点 |
+|---|---|---|---|
+| `@duke/logan-ext` | 2.0.1（依赖 `@duke/logan` 1.1.0，native `liblogan.so`） | 文件日志（AES 加密落盘），真机崩溃后排障 | `model/logger.ets`：`initLogger()`（EntryAbility.onCreate）+ `logDshrc()` 双写（hilog + Logan）+ `exportLogs()`（About 页展示） |
+| `eventpost` | 2.2.1（native `libnative_event_post.so` + `@duke/component-lifecycle` + `@duke/view-model`） | link→store→UI 解耦的事件总线（组件 lifecycle 自动反注册） | `model/events.ets` 事件常量/载荷 + link.ets 广播（state/peers/bus-msg）+ sessionstore 广播（审批/提问/推送导航）+ Index `onFromComponent` 订阅 |
+| `hrouter` | 2.0.0（hvigor 插件 `hrouter-compiler` 2.0.0，npm） | 编译期扫描 `@Route` 生成 `router_map.json` + NavDestination wrapper | `hvigorfile.ts` 插件接入 + 页面 `// @Route(...)` 标记 + `model/routes.ets` 统一跳转 + EntryAbility `HRouter.init` + Index `registerNavPathStack` |
+
+**logger（@duke/logan-ext）**
+
+- `logDshrc(tag, level, msg, extra?)` 统一双写：hilog（实时）+ Logan 文件（`files/logan/<日期时间戳>`，
+  默认加密、单文件 10MB、保留 7 天）。初始化失败自动降级纯 hilog，绝不打断主链路（契约 §10）。
+- `exportLogs()` 返回日志文件路径 + 大小（About 页「本地日志」行展示）；`flushLogs()` 在
+  `onBackground` 强制落盘。真机实证：`haps/entry/files/logan/1792598400000`（268B）+ `logan_cache/logan.mmap2`。
+- 日志安全：secret / 配对 URI 不写日志（调用点保持脱敏，未回退）。
+- crypto.ets（KAT）原本就无日志调用——未触碰（KAT 字面量与协议逻辑零改动，git diff 为空）。
+
+**eventpost**
+
+- `model/events.ets` 集中定义 9 个事件（链路状态/对端在线/业务帧、审批与提问到达/解决、推送导航）。
+- link.ets 在保留现有直接回调（onState/onEvent/onPeers/onLog）的同时**并行广播**事件总线——
+  实时更新行为零变化（session.added/removed/status、assistant.delta 流式不受影响）。
+  粘性事件（EVT_LINK_STATE / EVT_PENDING_NAV）用 `postStick`，帧级事件用 `postNormal`。
+- 页面订阅用 `EventPost.getDefault().onFromComponent(事件, this, 回调, sticky)`——组件销毁
+  自动反注册（@duke/component-lifecycle 驱动），无需手动 off。真机实证：推送 intent →
+  EVT_PENDING_NAV 粘性补收 → consumePending → 跳转详情页（hilog 见 `push intent:` + `RouteBuilder.push`）。
+
+**hrouter**
+
+- `hvigor/hvigor-config.json5` dependencies 加 `hrouter-compiler`；根 `hvigorfile.ts` 注册插件
+  （`root: 'entry'`，`scanPaths: ['src/main/ets/pages']`）。
+  - **hvigor 26 兼容垫片**：hvigor 26 的插件节点不再暴露 `getRootProject`/`getProjectModel`，
+    而插件 2.0.0 用它们判定项目根节点——不打补丁就完全不扫描（0 routes）。`hvigorfile.ts`
+    包了一层 `hrouterCompat`（apply 时补 `getRootProject`），不 fork 插件源码。
+  - 插件 0 服务/拦截器时会向 module.json5 注入 `service_map` metadata 但跳过生成文件——
+    已手补空 `entry/src/main/resources/base/profile/service_map.json` 防悬挂引用（遗留问题①）。
+- 页面标记用**注释形式** `// @Route({ name: '...' })`（ArkTS 不允许 struct 上挂非框架装饰器，
+  插件扫描器对注释形式与装饰器形式等价解析）。
+- 四页面从 NavDestination-rooted 改为普通组件（wrapper 提供 NavDestination 外壳 + hideTitleBar）；
+  跳转统一走 `model/routes.ets`（openSessionList / openSessionDetail / openApprovalQueue /
+  openAbout / goBack）；详情页参数用 `HRouter.getParams<SessionDetailParam>(this)` 读取
+  （onAppear 兜底重读，防 wrapper onReady 时序差异）；onShown 生命周期用 `HRouter.registerLifecycle`。
+- 生成产物 `entry/src/main/ets/_generated/hrouter/` 与 `router_map.json` 每次构建重新生成，
+  已入 `.gitignore`。真机实证：`[hrouter][RouteBuilder.push] name=session_detail` →
+  `bindRouteContext param={"sessionId":"test-e2e-123"}` → `getParams id=4 -> {"sessionId":"test-e2e-123"}`。
 
 ---
 
@@ -140,9 +190,14 @@ devecocli check arkts entry/src/main/ets/model/protocol.ets … --project .
 node "C:/Users/wwhby/.dsh/skills/hmos-arkts-knowledge-retriever/linter-cli/bin/linter-cli.js" \
   --input "D:/ai-projects/dsh/dsh-remote-control/app/entry/src/main/ets/<file>.ets" \
   --sdk-path "D:/Application/Huawei/DevEco Studio/sdk/default/openharmony/ets" \
-  --sdk-path "D:/Application/Huawei/DevEco Studio/sdk/default/hms/ets"
+  --sdk-path "D:/Application/Huawei/DevEco Studio/sdk/default/hms/ets" \
+  --package-manager-type ohpm
 ```
 
+> **坑（R4 实测）**：接入 ohpm 三方库（eventpost / hrouter / @duke/logan-ext）后必须补
+> `--package-manager-type ohpm`，否则单文件模式报 `Cannot find module 'eventpost'`（非代码问题，
+> 是 linter-cli 默认按 npm 解析 oh_modules）。R4 全量 24 个 .ets（含 `_generated` wrapper）
+> 实测 **0 ERROR**。
 > **坑（R2 实测）**：`--sdk-path` **可重复传**，且必须补传 `hms/ets` ——
 > `@kit.PushKit` 是 HMS Kit，只存在于 `sdk/default/hms/ets/kits`；只传 openharmony/ets 时
 > `push.ets` 会报 `Cannot find module '@kit.PushKit'`（非代码问题）。传两个路径后 16/16 文件全部 0 ERROR。

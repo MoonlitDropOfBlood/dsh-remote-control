@@ -1,6 +1,9 @@
 {
   "modelVersion": "26.0.0",
   "dependencies": {
+    // hrouter 编译期插件：扫描 @Route/@Service/@Interceptor 生成 router_map.json / service_map.json
+    // 与页面 wrapper（发布构建也需要，故放 dependencies 而非 devDependencies）。
+    "hrouter-compiler": "^2.0.0"
   },
   "execution": {
     // "analyze": "normal",                     /* Define the build analyze mode. Value: [ "normal" | "advanced" | "ultrafine" | false ]. Default: "normal" */

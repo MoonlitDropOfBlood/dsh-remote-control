@@ -17,11 +17,13 @@ import {
   SP_4
 } from '../model/theme';
 import { ApprovalCard, QuestionCard, SessionStore, sessionStore } from '../model/sessionstore';
+import { goBack } from '../model/routes';
 import { ApprovalCardView, QuestionCardView } from './AskCards';
 
+// hrouter 编译期扫描标记（注释形式：ArkTS 不允许 struct 上挂非框架装饰器）。
+// @Route({ name: 'approval_queue' })
 @ComponentV2
 export struct ApprovalQueuePage {
-  @Local navPathStack: NavPathStack = new NavPathStack();
   @Local store: SessionStore = sessionStore;
 
   @Builder
@@ -38,7 +40,7 @@ export struct ApprovalQueuePage {
       .backgroundColor($r('app.color.bg_layer_2'))
       .borderRadius(RADIUS_CTRL)
       .onClick((): void => {
-        this.navPathStack.pop();
+        goBack();
       })
       Text('审批 / 提问')
         .fontSize(FS_SUBTITLE)
@@ -78,48 +80,41 @@ export struct ApprovalQueuePage {
   }
 
   build() {
-    NavDestination() {
-      Column() {
-        this.topBar()
-        Scroll() {
-          Column() {
-            if (this.store.pendingCount() === 0) {
-              this.emptyState()
-            }
-            Repeat(this.store.pendingApprovals())
-              .each((cell: RepeatItem<ApprovalCard>): void => {
-                ApprovalCardView({
-                  card: cell.item,
-                  sessionTitle: this.store.titleOf(cell.item.sessionId)
-                })
-              })
-              .key((c: ApprovalCard): string => c.askId)
-            Repeat(this.store.pendingQuestions())
-              .each((cell: RepeatItem<QuestionCard>): void => {
-                QuestionCardView({
-                  card: cell.item,
-                  sessionTitle: this.store.titleOf(cell.item.sessionId)
-                })
-              })
-              .key((c: QuestionCard): string => c.askId)
+    // NavDestination 外壳由 hrouter-compiler 生成的 wrapper 提供。
+    Column() {
+      this.topBar()
+      Scroll() {
+        Column() {
+          if (this.store.pendingCount() === 0) {
+            this.emptyState()
           }
-          .width('100%')
-          .padding({ left: SP_4, right: SP_4, top: SP_2, bottom: SP_4 })
+          Repeat(this.store.pendingApprovals())
+            .each((cell: RepeatItem<ApprovalCard>): void => {
+              ApprovalCardView({
+                card: cell.item,
+                sessionTitle: this.store.titleOf(cell.item.sessionId)
+              })
+            })
+            .key((c: ApprovalCard): string => c.askId)
+          Repeat(this.store.pendingQuestions())
+            .each((cell: RepeatItem<QuestionCard>): void => {
+              QuestionCardView({
+                card: cell.item,
+                sessionTitle: this.store.titleOf(cell.item.sessionId)
+              })
+            })
+            .key((c: QuestionCard): string => c.askId)
         }
         .width('100%')
-        .layoutWeight(1)
-        .scrollBar(BarState.Off)
-        .align(Alignment.Top)
+        .padding({ left: SP_4, right: SP_4, top: SP_2, bottom: SP_4 })
       }
       .width('100%')
-      .height('100%')
+      .layoutWeight(1)
+      .scrollBar(BarState.Off)
+      .align(Alignment.Top)
     }
     .width('100%')
     .height('100%')
-    .hideTitleBar(true)
     .backgroundColor($r('app.color.bg_base'))
-    .onReady((ctx: NavDestinationContext): void => {
-      this.navPathStack = ctx.pathStack;
-    })
   }
 }

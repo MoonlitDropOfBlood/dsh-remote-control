@@ -7,7 +7,9 @@
  *  - 本会话的审批 / 提问卡片内嵌在输入条上方（AskCards），resolved 后自动消失
  */
 import { promptAction } from '@kit.ArkUI';
+import { HRouter } from 'hrouter';
 import { dshrcLink } from '../model/link';
+import { SessionDetailParam, goBack } from '../model/routes';
 import {
   ApprovalCard,
   ChatItem,
@@ -32,11 +34,6 @@ import {
   clockTime
 } from '../model/theme';
 import { ApprovalCardView, QuestionCardView } from './AskCards';
-
-/** 会话详情路由参数（pushPath 的 param 禁内联字面量，先声明类型）。 */
-export interface SessionDetailParam {
-  sessionId: string;
-}
 
 /** 单条消息气泡（含代码分段渲染）。 */
 @ComponentV2
@@ -149,17 +146,46 @@ struct MessageBubble {
   }
 }
 
+// hrouter 编译期扫描标记（注释形式：ArkTS 不允许 struct 上挂非框架装饰器）。
+// @Route({ name: 'session_detail' })
 @ComponentV2
 export struct SessionDetailPage {
-  @Local navPathStack: NavPathStack = new NavPathStack();
   @Local store: SessionStore = sessionStore;
   @Local sessionId: string = '';
   @Local draft: string = '';
   private scroller: Scroller = new Scroller();
 
   aboutToAppear(): void {
+    // 路由参数由 hrouter 传递（routes.openSessionDetail 的 param → 本页 getParams）。
+    this.readRouteParams();
     if (this.sessionId.length > 0) {
       this.store.openSession(this.sessionId);
+    }
+    // onAppear 兜底：万一 aboutToAppear 时 wrapper onReady 尚未回填 contextMap（真机时序差异），
+    // 组件上树后再补读一次参数。
+    // 返回本页时重开会话（替代原 NavDestination.onShown；页面卸载时自动清理）。
+    HRouter.registerLifecycle(this, {
+      onAppear: (): void => {
+        if (this.sessionId.length === 0) {
+          this.readRouteParams();
+          if (this.sessionId.length > 0) {
+            this.store.openSession(this.sessionId);
+          }
+        }
+      },
+      onShown: (): void => {
+        if (this.sessionId.length > 0) {
+          this.store.openSession(this.sessionId);
+        }
+      }
+    });
+  }
+
+  /** 从 hrouter 路由上下文读取 sessionId（幂等）。 */
+  private readRouteParams(): void {
+    const params: SessionDetailParam | undefined = HRouter.getParams<SessionDetailParam>(this);
+    if (params !== undefined && params.sessionId.length > 0) {
+      this.sessionId = params.sessionId;
     }
   }
 
@@ -226,7 +252,7 @@ export struct SessionDetailPage {
       .backgroundColor($r('app.color.bg_layer_2'))
       .borderRadius(RADIUS_CTRL)
       .onClick((): void => {
-        this.navPathStack.pop();
+        goBack();
       })
       Column() {
         Text(this.store.titleOf(this.sessionId))
@@ -288,128 +314,106 @@ export struct SessionDetailPage {
   }
 
   build() {
-    NavDestination() {
-      Column() {
-        this.topBar()
+    // NavDestination 外壳由 hrouter-compiler 生成的 wrapper 提供。
+    Column() {
+      this.topBar()
 
-        Scroll(this.scroller) {
-          Column() {
-            if (this.store.messages.length === 0) {
-              this.emptyState()
-            } else {
-              Repeat(this.store.messages)
-                .each((cell: RepeatItem<ChatItem>): void => {
-                  MessageBubble({ item: cell.item })
-                })
-                .key((m: ChatItem): string => m.id)
-            }
-          }
-          .width('100%')
-          .padding({ left: SP_4, right: SP_4, top: SP_2, bottom: SP_3 })
-        }
-        .width('100%')
-        .layoutWeight(1)
-        .scrollBar(BarState.Off)
-        .align(Alignment.Top)
-
-        // 本会话的审批 / 提问卡片（输入条上方；resolved / answered 后消失）
-        if (this.store.approvalsFor(this.sessionId).length > 0 ||
-          this.store.questionsFor(this.sessionId).length > 0) {
-          Scroll() {
-            Column() {
-              Repeat(this.store.approvalsFor(this.sessionId))
-                .each((cell: RepeatItem<ApprovalCard>): void => {
-                  ApprovalCardView({ card: cell.item, sessionTitle: '' })
-                })
-                .key((c: ApprovalCard): string => c.askId)
-              Repeat(this.store.questionsFor(this.sessionId))
-                .each((cell: RepeatItem<QuestionCard>): void => {
-                  QuestionCardView({ card: cell.item, sessionTitle: '' })
-                })
-                .key((c: QuestionCard): string => c.askId)
-            }
-            .width('100%')
-            .padding({ left: SP_3, right: SP_3, top: SP_2 })
-          }
-          .width('100%')
-          .constraintSize({ maxHeight: '46%' })
-          .scrollBar(BarState.Off)
-        }
-
-        // 输入条
-        Row() {
-          TextArea({ text: this.draft, placeholder: '输入提示词，Enter 发送…' })
-            .onChange((v: string): void => {
-              this.draft = v;
-            })
-            .layoutWeight(1)
-            .height(44)
-            .padding({ left: SP_3, right: SP_3, top: 8, bottom: 8 })
-            .backgroundColor($r('app.color.bg_layer_2'))
-            .borderRadius(RADIUS_CARD)
-            .border({ width: HAIRLINE, color: $r('app.color.border_l1') })
-            .fontSize(FS_BODY)
-            .fontColor($r('app.color.label_primary'))
-            .placeholderColor($r('app.color.label_tertiary'))
-            .caretColor($r('app.color.brand_fill'))
-          if (this.store.runningOf(this.sessionId)) {
-            Button('取消')
-              .height(44)
-              .margin({ left: SP_2 })
-              .padding({ left: SP_3, right: SP_3 })
-              .fontSize(FS_BODY)
-              .fontColor($r('app.color.state_error'))
-              .backgroundColor($r('app.color.bg_layer_1'))
-              .border({ width: HAIRLINE, color: $r('app.color.state_error') })
-              .borderRadius(RADIUS_CTRL)
-              .onClick((): void => {
-                this.cancelTurn();
+      Scroll(this.scroller) {
+        Column() {
+          if (this.store.messages.length === 0) {
+            this.emptyState()
+          } else {
+            Repeat(this.store.messages)
+              .each((cell: RepeatItem<ChatItem>): void => {
+                MessageBubble({ item: cell.item })
               })
+              .key((m: ChatItem): string => m.id)
           }
-          Button('发送')
-            .height(44)
-            .margin({ left: SP_2 })
-            .padding({ left: SP_4, right: SP_4 })
-            .fontSize(FS_BODY)
-            .fontWeight(FontWeight.Medium)
-            .fontColor($r('app.color.label_on_brand'))
-            .backgroundColor($r('app.color.brand_fill'))
-            .borderRadius(RADIUS_CTRL)
-            .enabled(this.draft.trim().length > 0 && this.store.linkState === 'online')
-            .onClick((): void => {
-              this.send();
-            })
         }
         .width('100%')
-        .alignItems(VerticalAlign.Center)
-        .padding({ left: SP_3, right: SP_3, top: SP_3, bottom: SP_4 })
-        .backgroundColor($r('app.color.bg_layer_1'))
-        .border({ width: HAIRLINE, color: $r('app.color.border_l1') })
+        .padding({ left: SP_4, right: SP_4, top: SP_2, bottom: SP_3 })
       }
       .width('100%')
-      .height('100%')
+      .layoutWeight(1)
+      .scrollBar(BarState.Off)
+      .align(Alignment.Top)
+
+      // 本会话的审批 / 提问卡片（输入条上方；resolved / answered 后消失）
+      if (this.store.approvalsFor(this.sessionId).length > 0 ||
+        this.store.questionsFor(this.sessionId).length > 0) {
+        Scroll() {
+          Column() {
+            Repeat(this.store.approvalsFor(this.sessionId))
+              .each((cell: RepeatItem<ApprovalCard>): void => {
+                ApprovalCardView({ card: cell.item, sessionTitle: '' })
+              })
+              .key((c: ApprovalCard): string => c.askId)
+            Repeat(this.store.questionsFor(this.sessionId))
+              .each((cell: RepeatItem<QuestionCard>): void => {
+                QuestionCardView({ card: cell.item, sessionTitle: '' })
+              })
+              .key((c: QuestionCard): string => c.askId)
+          }
+          .width('100%')
+          .padding({ left: SP_3, right: SP_3, top: SP_2 })
+        }
+        .width('100%')
+        .constraintSize({ maxHeight: '46%' })
+        .scrollBar(BarState.Off)
+      }
+
+      // 输入条
+      Row() {
+        TextArea({ text: this.draft, placeholder: '输入提示词，Enter 发送…' })
+          .onChange((v: string): void => {
+            this.draft = v;
+          })
+          .layoutWeight(1)
+          .height(44)
+          .padding({ left: SP_3, right: SP_3, top: 8, bottom: 8 })
+          .backgroundColor($r('app.color.bg_layer_2'))
+          .borderRadius(RADIUS_CARD)
+          .border({ width: HAIRLINE, color: $r('app.color.border_l1') })
+          .fontSize(FS_BODY)
+          .fontColor($r('app.color.label_primary'))
+          .placeholderColor($r('app.color.label_tertiary'))
+          .caretColor($r('app.color.brand_fill'))
+        if (this.store.runningOf(this.sessionId)) {
+          Button('取消')
+            .height(44)
+            .margin({ left: SP_2 })
+            .padding({ left: SP_3, right: SP_3 })
+            .fontSize(FS_BODY)
+            .fontColor($r('app.color.state_error'))
+            .backgroundColor($r('app.color.bg_layer_1'))
+            .border({ width: HAIRLINE, color: $r('app.color.state_error') })
+            .borderRadius(RADIUS_CTRL)
+            .onClick((): void => {
+              this.cancelTurn();
+            })
+        }
+        Button('发送')
+          .height(44)
+          .margin({ left: SP_2 })
+          .padding({ left: SP_4, right: SP_4 })
+          .fontSize(FS_BODY)
+          .fontWeight(FontWeight.Medium)
+          .fontColor($r('app.color.label_on_brand'))
+          .backgroundColor($r('app.color.brand_fill'))
+          .borderRadius(RADIUS_CTRL)
+          .enabled(this.draft.trim().length > 0 && this.store.linkState === 'online')
+          .onClick((): void => {
+            this.send();
+          })
+      }
+      .width('100%')
+      .alignItems(VerticalAlign.Center)
+      .padding({ left: SP_3, right: SP_3, top: SP_3, bottom: SP_4 })
+      .backgroundColor($r('app.color.bg_layer_1'))
+      .border({ width: HAIRLINE, color: $r('app.color.border_l1') })
     }
     .width('100%')
     .height('100%')
-    .hideTitleBar(true)
     .backgroundColor($r('app.color.bg_base'))
-    .onReady((ctx: NavDestinationContext): void => {
-      this.navPathStack = ctx.pathStack;
-      const param: Object | undefined = ctx.pathInfo.param as Object | undefined;
-      if (param !== undefined && param !== null) {
-        const p: SessionDetailParam = param as SessionDetailParam;
-        if (p.sessionId.length > 0) {
-          this.sessionId = p.sessionId;
-        }
-      }
-      if (this.sessionId.length > 0) {
-        this.store.openSession(this.sessionId);
-      }
-    })
-    .onShown((): void => {
-      if (this.sessionId.length > 0) {
-        this.store.openSession(this.sessionId);
-      }
-    })
   }
 }

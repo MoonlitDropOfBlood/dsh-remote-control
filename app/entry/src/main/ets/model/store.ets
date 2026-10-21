@@ -6,12 +6,11 @@
  */
 import { preferences } from '@kit.ArkData';
 import { BusinessError } from '@kit.BasicServicesKit';
-import { hilog } from '@kit.PerformanceAnalysisKit';
 import { Context } from '@kit.AbilityKit';
+import { logDshrc } from './logger';
 import { LinkConfig } from './link';
 
 const TAG: string = 'dshrc-store';
-const LOG_DOMAIN: number = 0x0000;
 const PREF_NAME: string = 'dshrc_prefs';
 
 const KEY_RELAY_URL: string = 'relayUrl';
@@ -42,7 +41,7 @@ export function loadPairing(context: Context): PairingConfig {
     cfg.relayToken = pref.getSync(KEY_RELAY_TOKEN, '') as string;
   } catch (e) {
     const err: BusinessError = e as BusinessError;
-    hilog.error(LOG_DOMAIN, TAG, 'loadPairing failed: %{public}s', err.message);
+    logDshrc(TAG, 'error', 'loadPairing failed: ' + err.message);
   }
   return cfg;
 }
@@ -59,7 +58,7 @@ export function savePairing(context: Context, cfg: PairingConfig): boolean {
     return true;
   } catch (e) {
     const err: BusinessError = e as BusinessError;
-    hilog.error(LOG_DOMAIN, TAG, 'savePairing failed: %{public}s', err.message);
+    logDshrc(TAG, 'error', 'savePairing failed: ' + err.message);
     return false;
   }
 }

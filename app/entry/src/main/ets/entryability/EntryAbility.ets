@@ -7,24 +7,26 @@
  *  - onCreate / onNewWant 双入口解析（冷启动 / 应用存活两种拉起路径）
  */
 import { AbilityConstant, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
-import { hilog } from '@kit.PerformanceAnalysisKit';
 import { window } from '@kit.ArkUI';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { notificationManager } from '@kit.NotificationKit';
+import { HRouter } from 'hrouter';
+import { flushLogs, initLogger, logDshrc } from '../model/logger';
 import { parsePushIntent, PushIntentTarget, pushKit } from '../model/push';
 import { sessionStore } from '../model/sessionstore';
 
-const DOMAIN = 0x0000;
 const TAG = 'dshrc-ability';
 
 export default class EntryAbility extends UIAbility {
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
+    // 文件日志（@duke/logan-ext）必须在任何 logDshrc 之前初始化；失败自动降级为纯 hilog。
+    initLogger(this.context);
     try {
       this.context.getApplicationContext().setColorMode(ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET);
     } catch (err) {
-      hilog.error(DOMAIN, TAG, 'Failed to set colorMode. Cause: %{public}s', JSON.stringify(err));
+      logDshrc(TAG, 'error', 'Failed to set colorMode. Cause: ' + JSON.stringify(err));
     }
-    hilog.info(DOMAIN, TAG, '%{public}s', 'Ability onCreate');
+    logDshrc(TAG, 'info', 'Ability onCreate');
     // 推送 token（契约 §6：取到后由 sessionStore 在链路在线时 push.register 上报）
     pushKit.fetchToken();
     // 冷启动点击通知：先记下直达目标，Index 挂载后消费
@@ -33,7 +35,7 @@ export default class EntryAbility extends UIAbility {
 
   /** 应用存活时点击通知（单例应用再次拉起）。 */
   onNewWant(want: Want, launchParam: AbilityConstant.LaunchParam): void {
-    hilog.info(DOMAIN, TAG, '%{public}s', 'Ability onNewWant');
+    logDshrc(TAG, 'info', 'Ability onNewWant');
     this.handleWant(want);
   }
 
@@ -42,36 +44,41 @@ export default class EntryAbility extends UIAbility {
     try {
       const target: PushIntentTarget = parsePushIntent(want.parameters);
       if (target.sessionId.length > 0 || target.askId.length > 0) {
-        hilog.info(DOMAIN, TAG, 'push intent: session=%{public}s ask=%{public}s kind=%{public}s',
-          target.sessionId, target.askId, target.kind);
+        logDshrc(TAG, 'info', 'push intent: session=' + target.sessionId +
+          ' ask=' + target.askId + ' kind=' + target.kind);
         sessionStore.setPendingNav(target.sessionId, target.askId);
       }
     } catch (e) {
       const err: BusinessError = e as BusinessError;
-      hilog.warn(DOMAIN, TAG, 'parse intent failed: %{public}s', err.message);
+      logDshrc(TAG, 'warn', 'parse intent failed: ' + err.message);
     }
   }
 
   onDestroy(): void {
-    hilog.info(DOMAIN, TAG, '%{public}s', 'Ability onDestroy');
+    logDshrc(TAG, 'info', 'Ability onDestroy');
   }
 
   onWindowStageCreate(windowStage: window.WindowStage): void {
-    hilog.info(DOMAIN, TAG, '%{public}s', 'Ability onWindowStageCreate');
+    logDshrc(TAG, 'info', 'Ability onWindowStageCreate');
+    // hrouter 运行时初始化（读取 service_map、注册 NavDestination observer）。
+    // 失败只降级为「无路由表增强」，不阻断 loadContent（契约 §10 优雅降级）。
+    HRouter.init(this.context, { enableLog: true }).catch((e: Error): void => {
+      logDshrc(TAG, 'error', 'HRouter.init failed: ' + e.message);
+    });
 
     windowStage.loadContent('pages/Index', (err) => {
       if (err.code) {
-        hilog.error(DOMAIN, TAG, 'Failed to load the content. Cause: %{public}s', JSON.stringify(err));
+        logDshrc(TAG, 'error', 'Failed to load the content. Cause: ' + JSON.stringify(err));
         return;
       }
-      hilog.info(DOMAIN, TAG, '%{public}s', 'Succeeded in loading the content.');
+      logDshrc(TAG, 'info', 'Succeeded in loading the content.');
       // 通知授权（必须在页面加载完成后请求，否则弹窗体验/时序不合规）
       notificationManager.requestEnableNotification(this.context).then((): void => {
-        hilog.info(DOMAIN, TAG, '%{public}s', '[ANS] requestEnableNotification success');
+        logDshrc(TAG, 'info', '[ANS] requestEnableNotification success');
       }).catch((e: BusinessError): void => {
         // 未开通推送服务/用户拒绝时优雅降级（契约 §10），不影响主链路
-        hilog.error(DOMAIN, TAG, '[ANS] requestEnableNotification failed: %{public}d %{public}s',
-          e.code, e.message);
+        logDshrc(TAG, 'error', '[ANS] requestEnableNotification failed: ' +
+          e.code.toString() + ' ' + e.message);
       });
       // token 变化监听（卸载重装/签名变化后 token 会变，需重新上报）
       pushKit.bindTokenUpdate(this);
@@ -79,14 +86,16 @@ export default class EntryAbility extends UIAbility {
   }
 
   onWindowStageDestroy(): void {
-    hilog.info(DOMAIN, TAG, '%{public}s', 'Ability onWindowStageDestroy');
+    logDshrc(TAG, 'info', 'Ability onWindowStageDestroy');
   }
 
   onForeground(): void {
-    hilog.info(DOMAIN, TAG, '%{public}s', 'Ability onForeground');
+    logDshrc(TAG, 'info', 'Ability onForeground');
   }
 
   onBackground(): void {
-    hilog.info(DOMAIN, TAG, '%{public}s', 'Ability onBackground');
+    logDshrc(TAG, 'info', 'Ability onBackground');
+    // 进后台强制落盘：真机崩溃/被杀时缓冲日志不丢。
+    flushLogs();
   }
 }

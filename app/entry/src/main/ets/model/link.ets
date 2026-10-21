@@ -14,8 +14,8 @@
  */
 import { webSocket } from '@kit.NetworkKit';
 import { BusinessError } from '@kit.BasicServicesKit';
-import { hilog } from '@kit.PerformanceAnalysisKit';
 import { util } from '@kit.ArkTS';
+import { logDshrc } from './logger';
 import {
   BACKOFF_BASE_MS,
   BACKOFF_MAX_MS,
@@ -57,9 +57,9 @@ import {
   makeMsg
 } from './protocol';
 import { assertKat, deriveKey, helloSig, open, seal } from './crypto';
+import { postBusMsg, postLinkPeers, postLinkState } from './events';
 
 const TAG: string = 'dshrc-link';
-const LOG_DOMAIN: number = 0x0000;
 const DEFAULT_REQ_TIMEOUT_MS: number = 15000;
 const HOST_HELLO_TIMEOUT_MS: number = 15000;
 
@@ -211,7 +211,8 @@ export class DshrcLink {
   }
 
   private log(line: string): void {
-    hilog.info(LOG_DOMAIN, TAG, '%{public}s', line);
+    // 双写：hilog（实时）+ Logan 文件（崩溃后排障）——logger.ets 统一入口。
+    logDshrc(TAG, 'info', line);
     if (this.onLog !== null) {
       this.onLog(line);
     }
@@ -219,9 +220,19 @@ export class DshrcLink {
 
   private setState(s: LinkState): void {
     this.state = s;
+    // 兼容保留直接回调；同时走事件总线广播（页面用 onFromComponent 订阅，自动反注册）。
     if (this.onState !== null) {
       this.onState(s);
     }
+    postLinkState(s);
+  }
+
+  /** peers 变化统一出口：直接回调（兼容）+ 事件总线广播。 */
+  private emitPeers(): void {
+    if (this.onPeers !== null) {
+      this.onPeers(this.peers);
+    }
+    postLinkPeers(this.peers.host);
   }
 
   /** 启动链路：先做 KAT 级密钥派生，再连接。重复调用以最新配置重启。 */
@@ -411,9 +422,7 @@ export class DshrcLink {
         this.setState('online');
         this.startHeartbeat();
         this.log('online, peers=' + JSON.stringify(this.peers));
-        if (this.onPeers !== null) {
-          this.onPeers(this.peers);
-        }
+        this.emitPeers();
         this.sendBusinessHello();
         break;
       }
@@ -422,9 +431,7 @@ export class DshrcLink {
           // host（重）上线：v1.0.2 起 host 每条连接生成新 sid 并重置 seq，
           // 去重按 sid 分桶，无需清空游标（契约 §4 v1.0.2）。
           this.peers.host = true;
-          if (this.onPeers !== null) {
-            this.onPeers(this.peers);
-          }
+          this.emitPeers();
           this.log('host joined');
         }
         break;
@@ -432,9 +439,7 @@ export class DshrcLink {
       case FRAME_PEER_LEFT: {
         if (frame.role === 'host') {
           this.peers.host = false;
-          if (this.onPeers !== null) {
-            this.onPeers(this.peers);
-          }
+          this.emitPeers();
           this.log('host left');
         }
         break;
@@ -498,9 +503,11 @@ export class DshrcLink {
       if (this.correlator.deliver(m)) {
         return;
       }
+      // 直接回调（兼容，sessionstore 实时更新走这条）+ 事件总线并行广播。
       if (this.onEvent !== null) {
         this.onEvent(m);
       }
+      postBusMsg(m);
     }).catch((e: BusinessError) => {
       // 认证失败（AAD/密钥不匹配）：丢弃该帧
       this.log('decrypt failed seq=' + seq + ' err=' + e.code);
@@ -557,9 +564,7 @@ export class DshrcLink {
     this.ws = null;
     this.correlator.rejectAll('connection lost: ' + reason);
     this.peers = { host: false, client: false };
-    if (this.onPeers !== null) {
-      this.onPeers(this.peers);
-    }
+    this.emitPeers();
     if (!this.shouldRun) {
       return;
     }

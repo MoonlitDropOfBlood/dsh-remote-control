@@ -1,0 +1,24 @@
+{
+  "routerMap": [
+    {
+      "name": "about",
+      "pageSourceFile": "src/main/ets/_generated/hrouter/AboutPageGeneratedWrapper.ets",
+      "buildFunction": "generatedHRouterAboutPageBuilder"
+    },
+    {
+      "name": "approval_queue",
+      "pageSourceFile": "src/main/ets/_generated/hrouter/ApprovalQueuePageGeneratedWrapper.ets",
+      "buildFunction": "generatedHRouterApprovalQueuePageBuilder"
+    },
+    {
+      "name": "session_detail",
+      "pageSourceFile": "src/main/ets/_generated/hrouter/SessionDetailPageGeneratedWrapper.ets",
+      "buildFunction": "generatedHRouterSessionDetailPageBuilder"
+    },
+    {
+      "name": "session_list",
+      "pageSourceFile": "src/main/ets/_generated/hrouter/SessionListPageGeneratedWrapper.ets",
+      "buildFunction": "generatedHRouterSessionListPageBuilder"
+    }
+  ]
+}

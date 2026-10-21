@@ -161,8 +161,14 @@ export function registerPairingCommand(ctx, deps) {
     }
     // §3.5：URI 不得写入日志——只记脱敏形式与元数据
     log("info", "pairing QR rendered", { version: rendered.version, size: rendered.size, svgPath: svgPath || "(none)", uri: redactUri(uri) });
+    // loopback 检测：127.0.0.1/localhost/[::1] 只有本机能连，手机扫了也白扫。
+    const loopback = /^(ws|wss):\/\/(127\.0\.0\.1|localhost|\[::1\])(?::\d+)?/i.test(cfg.relayUrl ?? "");
     const lines = [
       note ? note + "\n" : "",
+      loopback
+        ? "⚠️ 警告：relayUrl 是回环地址（127.0.0.1/localhost）——只有这台 PC 自己能连，手机扫码后无法连接！\n" +
+          "请把 config.json 里的 relayUrl 改成本机的局域网地址（如 ws://192.168.x.x:8788）后重新运行本命令。\n"
+        : "",
       "【配对二维码】手机端打开 App「配对」页 → 扫码，自动填入 relayUrl / channel / secret。",
       "",
       rendered.ascii,

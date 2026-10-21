@@ -314,7 +314,8 @@ export class DshrcLink {
     this.ws = ws;
 
     ws.on('open', (err: BusinessError, value: Object) => {
-      if (err.code !== 0) {
+      // 官方语义：成功时 err 为 undefined —— 必须判空再读 code（真机崩溃点）
+      if (err !== undefined && err !== null) {
         this.log('open error: ' + err.code + ' ' + err.message);
         return;
       }
@@ -335,7 +336,8 @@ export class DshrcLink {
       if (this.ws !== ws) {
         return;
       }
-      this.log('closed: code=' + err.code + ' reason=' + value.reason);
+      const closeCode: number = err !== undefined && err !== null ? err.code : -1;
+      this.log('closed: code=' + closeCode + ' reason=' + value.reason);
       this.onWsDown('closed');
     });
     ws.on('error', (err: BusinessError) => {

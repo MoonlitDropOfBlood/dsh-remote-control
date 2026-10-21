@@ -82,13 +82,19 @@ export function apply(ctx, config) {
   /** @type {RelayClient|null} rotate 后热更换链路用；空转时为 null。 */
   let relay = null;
   try {
-    const disposeCommand = registerPairingCommand(ctx, {
-      config: cfg,
-      configPath,
-      log,
-      getRelay: () => relay,
+    // 用官方 inject 范式等 commands 服务挂载后再注册（直接 ctx.commands 在
+    // 服务未就绪时会抛错并被本 try/catch 吞掉，命令静默消失——实测踩坑）。
+    let disposeCommand = () => {};
+    ctx.inject(["commands"], (scope) => {
+      disposeCommand = registerPairingCommand(scope, {
+        config: cfg,
+        configPath,
+        log,
+        getRelay: () => relay,
+      });
+      log("info", "/remote-pairing command registered");
     });
-    ctx.effect(() => disposeCommand, "dsh-remote-control: /remote-pairing command");
+    ctx.effect(() => disposeCommand(), "dsh-remote-control: /remote-pairing command");
   } catch (e) {
     log("warn", "register /remote-pairing failed", { error: String(e && e.message) });
   }

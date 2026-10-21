@@ -38,7 +38,7 @@
      中继路由用。示例（仅演示格式）：`KMNPQRTVWXY23456`。
    - `secret`：≥32 字符随机串（base64url 24 字节），E2E 密钥材料，**不发给中继**。
 2. 用户在手机端「配对」页输入：`relayUrl`（如 `wss://relay.example.com/ws`）、`channel`、`secret`。
-   （可选增强：插件在控制台/配置页输出二维码，v1 手输即可。）
+   （推荐**扫码配对**：见 §3.5；手动输入保留为兜底。）
 3. **E2E 密钥派生**（两端必须一致，见 §7 测试向量）：
 
 ```
@@ -51,6 +51,22 @@ key = HKDF-SHA256(
 
 4. 轻量握手证明（防滥用，中继可选校验）：`hello` 帧携带
    `sig = base64url(HMAC-SHA256(key, UTF8("hello|" + role + "|" + channel)))`，role ∈ {host, client}。
+
+### 3.5 配对二维码（v1.0.3）
+
+PC 端（DSH 插件）把配对信息编码成一条 URI 并渲染为二维码显示；手机端扫码后自动填参连接。
+
+```
+dshrc://pair?r=<encodeURIComponent(relayUrl)>&c=<channel>&s=<secret>[&t=<encodeURIComponent(relayToken)>]
+```
+
+- `r`：中继地址（必须 URL 编码）；`c`：channel（`^[A-Z2-7]{16,64}$`，无需编码）；
+  `s`：secret（base64url，URL 安全字符集，无需编码）；`t`：中继鉴权 token，可选。
+- 手机端必须同时接受**完整 URI**（含 `dshrc://pair?` 前缀）与**裸 query 串**（`r=…&c=…&s=…`）两种扫描结果；
+  解析失败/字段缺失时回落手动输入并提示，不得静默丢弃。
+- **安全提示**：二维码含 secret 明文（与手动口述同级信任域），只在受信任的屏幕上展示；
+  PC 端展示应提供「重新生成配对信息」（换 secret，旧二维码即失效）与隐藏能力；
+  二维码内容（URI/图片）不得写入日志。
 
 ## 4. 传输层：中继帧协议（明文 JSON，WebSocket text 帧）
 

@@ -15,6 +15,8 @@
 >   + Push Kit 接入（`push.ets`：getToken / tokenUpdate / `push.register` 上报 / 通知 intent 直达）。
 >   - 状态管理**全部 V2 装饰器**（@ObservedV2/@Trace/@Local/@Param/@Event/@Monitor/@ComponentV2），
 >     全树 grep `@State|@Prop|@Link|@ObjectLink|@Observed[^V]|@Provide|@Consume|@Watch|@StorageLink` **0 命中**。
+> - **R3（已完成）**：**扫码配对**（契约 §3.5 v1.0.3）——Scan Kit 默认界面扫码 →
+>   `model/pairqr.ets` 解析 `dshrc://pair?…` / 裸 query → 自动填参并连接（见 §7）。
 
 ---
 
@@ -88,7 +90,7 @@ app/
         │   ├── entryability/EntryAbility.ets      # ★ Push token + 通知 intent 解析 + 通知授权
         │   ├── entrybackupability/EntryBackupAbility.ets
         │   ├── pages/                             # ★ 五页面 UI（全部 @ComponentV2）
-        │   │   ├── Index.ets             # ① 配对/设置页（Navigation 根 + 路由映射）
+        │   │   ├── Index.ets             # ① 配对/设置页（Navigation 根 + 路由映射 + ★ 扫码配对按钮）
         │   │   ├── SessionListPage.ets   # ② 会话列表（Refresh 下拉 + Repeat 会话卡）
         │   │   ├── SessionDetailPage.ets # ③ 会话详情（气泡流 + 输入条 + 取消；含 SessionDetailParam）
         │   │   ├── AskCards.ets          # ④ 审批卡 / 提问卡组件（倒计时 + 允许/拒绝 + 问答）
@@ -100,6 +102,7 @@ app/
         │       ├── crypto.ets            # HKDF-SHA256 + AES-256-GCM + assertKat()
         │       ├── link.ets              # WS 链路层（hello/welcome/心跳/重连/sid:seq 去重/Correlator）
         │       ├── store.ets             # Preferences 配对持久化
+        │       ├── pairqr.ets            # ★ R3 配对二维码解析（契约 §3.5：dshrc://pair URI / 裸 query 双形态）
         │       ├── theme.ets             # ★ 设计 token：间距/圆角/字号 + 状态语义映射 + 时间格式化
         │       ├── sessionstore.ets      # ★ @ObservedV2 状态仓：§5.2 全事件 + 消息缓存 + 审批问答
         │       └── push.ets              # ★ Push Kit：getToken/tokenUpdate/intent 解析（§6 降级）
@@ -258,7 +261,73 @@ KAT 字面量与 `docs/PROTOCOL.md` §7 程序化比对：`keyHex / ivHex / ctHe
 页面在 `NavDestination().onReady` 取 `ctx.pathStack` / `ctx.pathInfo.param`（`SessionDetailParam {sessionId}`，
 先声明 interface 再传，避免 10605038）；全部 `hideTitleBar(true)` 自绘顶栏。
 
-## 7. AGC Push 配置步骤（手机端 + 插件端）
+## 7. 扫码配对（契约 §3.5 v1.0.3）
+
+**一句话流程**：PC 端打开 DSH 插件的 **`/remote-pairing`** 页面出配对二维码 →
+手机端配对页点 **「扫码配对」**（品牌蓝主按钮，在「配对信息」卡上方）→
+Scan Kit 系统扫码界面 → 自动填入 中继地址 / channel / secret（/ 中继令牌）→ **自动保存 + 连接**。
+
+### 7.1 使用步骤
+
+1. **PC 端**：启用 dsh-remote-control 插件（host 角色）→ 打开 `/remote-pairing` 页面 → 页面展示配对二维码
+   （内容为 `dshrc://pair?r=<encodeURIComponent(relayUrl)>&c=<channel>&s=<secret>[&t=<encodeURIComponent(relayToken)>]`）。
+   二维码含 secret 明文，只在受信任屏幕上展示；「重新生成配对信息」会换 secret 使旧码失效。
+2. **手机端**：打开 dsh-remote-control App → 配对页点 **「扫码配对」** → 对准 PC 屏幕上的二维码。
+3. 扫码成功：Toast「**已扫码，正在连接…**」+ 状态行（`state_success`）→ 输入框自动填好四项字段 →
+   自动走与「连接」按钮相同的校验 → Preferences 保存 → 启动链路（先 KAT 再建链）。
+4. 扫到别的二维码 / 字段缺失 / 字段不合法：Toast **明确原因**（如「配对二维码缺少必填字段：s（secret）」），
+   停在手动输入页；已解析出的字段照常回填输入框，可手动修补后点「连接」。
+5. 打开扫码界面后**取消或扫码失败**：静默回到配对页（只写 hilog，不打断输入）。
+
+### 7.2 二维码解析（`model/pairqr.ets`）
+
+按 §3.5 要求**同时接受两种扫描结果形态**：
+
+| 形态 | 示例 | 处理 |
+|---|---|---|
+| 完整 URI | `dshrc://pair?r=wss%3A%2F%2F…&c=…&s=…` | 剥掉 `dshrc://pair?` 前缀（比较时忽略大小写）取 query |
+| 裸 query | `r=wss://…&c=…&s=…[&t=…]` | 整串当 query（**不能用 contains('://') 判形态**——裸 query 里的 relayUrl 自带 `wss://`，正确做法是只认「字符串开头的 scheme://」） |
+
+- 每个值 `decodeURIComponent` 解码（值未编码 / 编码非法时按原样使用，交给字段校验报错）；
+- 字段级校验复用 `store.validatePairing()`（relayUrl `ws://|wss://` 前缀、channel `^[A-Z2-7]{16,64}$`、secret ≥32）；
+- 失败路径（全部 Toast 明确原因 + 回落手动输入，不静默丢弃）：空串 / `dshrc://pair` 无参数 /
+  其它 scheme（如 `https://…`）/ 缺 `r|c|s` / 字段不合法。
+
+解析测试样例（`app/pairqr-node-test.mjs`，Node 镜像逐行对应 `pairqr.ets` 逻辑，8 组用例全过）：
+
+| 输入形态 | 输入 | 预期 |
+|---|---|---|
+| 完整 URI（r/t 编码） | `dshrc://pair?r=wss%3A%2F%2Frelay.example.com%2Fws&c=ABCDEFGHJKLMNPQR&s=dshrc-demo-secret-0123456789abcdefgh&t=tok%20en%2F%2B%3D%3Fx` | ok=true，四字段解码回填（relayToken 含空格/+/= 均正确还原） |
+| 裸 query | `r=wss://relay.example.com/ws&c=ABCDEFGHJKLMNPQR&s=dshrc-demo-secret-0123456789abcdefgh` | ok=true，relayToken 为空 |
+| 坏输入（别的 scheme） | `https://example.com/remote-pairing?ch=XXXX` | ok=false，「不是 DSH 配对二维码…」 |
+| 缺字段 | `r=wss://relay.example.com/ws&c=ABCDEFGHJKLMNPQR` | ok=false，「配对二维码缺少必填字段：s（secret）」，r/c 仍回填 |
+| 字段不合法 | `r=wss://…&c=abcdefg&s=…` / `…&s=short` | ok=false，channel 正则 / secret 长度校验文案 |
+
+### 7.3 权限与依赖
+
+- **无需新增权限**：Scan Kit 默认界面扫码的相机权限由**系统预授权**（调用期间安全访问），
+  `module.json5` 保持仅 `ohos.permission.INTERNET`（webSocket 需要）。
+- `@kit.ScanKit` 是系统 Kit（`sdk/default/hms/ets`），**无需 ohpm 依赖**；linter-cli 必须补
+  `--sdk-path …/hms/ets` 才能解析它（与 `@kit.PushKit` 同因，见 §3.2）。
+- 设备兼容性兜底：`startScanForResult` 包 try/catch（不支持扫码的设备同步/异步报错 → Toast 提示）。
+  没用 skill 文档里的全局 `canIUse()`：linter-cli 按 compatible SDK 10 推断时解析不到 `@since 11` 的
+  全局 `canIUse`（报 `Cannot find name 'canIUse'`），try/catch 为等价且 lint 干净的写法。
+
+### 7.4 实测验证（本轮）
+
+```bash
+# ① 构建（cwd=app/）
+devecocli build   → BUILD SUCCESSFUL in 1 s 718 ms（33 tasks，18 executed / 15 up-to-date）
+                    产出 entry-default-signed.hap + entry-default-unsigned.hap
+
+# ② linter-cli 双 --sdk-path 全量 17 个 .ets → 17 OK / 0 FAIL（含新增 pairqr.ets 与改动的 Index.ets）
+# ③ V2 自检：grep -rn "@State\b\|@Prop\b\|@Link\b\|@ObjectLink\b\|@Observed\b\|@Provide\b\|@Consume\b\|@Watch\b\|@StorageLink\b" → 零命中
+# ④ KAT 未动：protocol.ets / crypto.ets / link.ets mtime 保持不变；§7 KAT 字面量 grep 原样在位
+```
+
+
+
+## 8. AGC Push 配置步骤（手机端 + 插件端）
 
 手机端代码已接好（token 获取 / 变化重取 / `push.register` 上报 / 通知点击直达），**未配置 AGC 时按契约 §10
 优雅降级**（`getToken` 失败仅写 hilog，主链路不受影响）。要收到真机推送按序配置：
@@ -280,12 +349,14 @@ KAT 字面量与 `docs/PROTOCOL.md` §7 程序化比对：`keyHex / ivHex / ctHe
    通知点击应直达审批队列 / 会话详情（`EntryAbility.onCreate/onNewWant` 解析 intent）。
    主机侧未开通时状态行显示 `主机侧未开通推送`（`push.state` 事件），属预期降级。
 
-## 8. 阶段遗留清单
+## 9. 阶段遗留清单
 
 - [x] 五页面 UI：① 配对/设置 ② 会话列表 ③ 会话详情（`assistant.delta` 流式追加、发送/取消）④ 审批/提问卡片 + 队列页 ⑤ 关于
 - [x] `sessionstore.ets`：@ObservedV2 状态仓（§5.2 全事件合并 + 消息缓存 + 审批问答 + push.register 上报）
 - [x] Push Kit：`push.ets` 取 token → `push.register` 上报 → 点击 intent 直达会话（AGC 未配置时 §10 优雅降级）
 - [x] 状态管理 V2 全覆盖：全树 V1 装饰器 grep 0 命中
+- [x] 扫码配对（契约 §3.5 v1.0.3）：Scan Kit 默认界面 + `pairqr.ets` 双形态解析 + 自动填参连接（§7）
 - [ ] 签名与真机联调：`devecocli auth login` + `signature generate` + `run`（需要用户华为账号/真机）
-- [ ] AGC 推送真机验证：按 §7 配置后联调（需要用户 AGC 项目与 clientId/secret）
+- [ ] 扫码配对真机验证：需在装有 DSH 插件的 PC 上出码后实扫（本机无真机/无插件运行态）
+- [ ] AGC 推送真机验证：按 §8 配置后联调（需要用户 AGC 项目与 clientId/secret）
 - [ ] `devecocli check lint` 恒 `Files checked: 0`（1.3.6 疑似未挂载 linter 引擎）→ lint 以 linter-cli 为准，或升级 `devecocli update` 后复测

@@ -127,6 +127,41 @@ export class RelayClient {
   }
 
   /**
+   * 以新的配对信息热更换（/remote-pairing rotate，契约 §3.5）：换 channel/secret
+   * 后立即用新密钥重连；旧密钥、旧连接、去重表即刻作废（旧二维码/旧口述失效）。
+   * 未传的字段保持原值；close() 之后调用是 no-op。
+   * @param {{channel?:string, secret?:string, relayToken?:string, relayUrl?:string}} next
+   */
+  reload(next) {
+    if (this.#closed) return;
+    const n = next ?? {};
+    if (typeof n.channel === "string" && n.channel !== "") this.#opts.channel = n.channel;
+    if (typeof n.secret === "string" && n.secret !== "") this.#opts.secret = n.secret;
+    if (n.relayToken !== undefined) this.#opts.relayToken = n.relayToken;
+    if (typeof n.relayUrl === "string" && n.relayUrl !== "") this.#opts.relayUrl = n.relayUrl;
+    this.#key = deriveKey(this.#opts.secret, this.#opts.channel);
+    this.#tries = 0;
+    this.#seen.clear();
+    this.#seq = 0;
+    this.#sid = "";
+    this.#handshaken = false;
+    this.peers = { host: false, client: false };
+    // 摘除旧 socket：先置空，close 事件里的 #ws !== ws 守卫会忽略它（不触发退避重连）
+    const ws = this.#ws;
+    this.#ws = null;
+    this.#clearHelloTimer();
+    if (ws !== null) {
+      try {
+        ws.close();
+      } catch {
+        /* 已关闭 */
+      }
+    }
+    this.#opts.log?.("info", "pairing identity reloaded; reconnecting", { channel: this.#opts.channel });
+    this.#connect();
+  }
+
+  /**
    * 发送一条明文业务消息：加密 → {t:"frame", seq, data, urgent?}。
    * 未就绪时返回 false（调用方决定是否缓存或丢弃；中继另有离线缓存）。
    * @param {object} message 明文业务消息

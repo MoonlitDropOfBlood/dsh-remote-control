@@ -42,10 +42,10 @@ cd relay && npm install && node server.js          # 默认 0.0.0.0:8787
 # 2. 安装 DSH 插件（link 安装）
 dsh plugin add ./plugin                            # 或 DSH 的 plugin_manager install_bundle
 
-# 3. 配对
-#    插件首次启动生成 channel/secret → %DSH_HOME%/remote-control/config.json
-#    把中继地址填进 config.json 的 relayUrl（如 ws://192.168.3.2:8787）
-#    手机 App「配对」页输入同样的 relayUrl / channel / secret，连接即配对
+# 3. 配对（推荐扫码）
+#    DSH 会话里发送 /remote-pairing → PC 屏幕显示配对二维码
+#    手机 App 配对页点「扫码配对」→ 自动填参并连接
+#    （手动输入兜底：config.json 的 channel/secret + relayUrl 三项照填）
 ```
 
 App 侧构建与装机见 [app/README.md](app/README.md)；mock 联调（无真机/无 DSH）见 [e2e/README.md](e2e/README.md)。

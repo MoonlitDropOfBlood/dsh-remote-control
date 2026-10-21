@@ -2,6 +2,7 @@
  * Copyright (c) 2026 dukedsh.
  * 五页面之①：配对/设置页（Navigation 根页）。
  *  - relayUrl / channel / secret / relayToken 输入 → Preferences 持久化 → 链路启动
+ *  - 扫码配对（契约 §3.5）：Scan Kit 默认界面扫码 → 解析 dshrc://pair URI / 裸 query → 自动填参并连接
  *  - 连接状态灯（连接中/已连接/重连中/错误）+ 主机在线徽标 + KAT 自检指示 + 链路日志
  *  - 推送开关（本机 Preferences + push.register 上报状态，契约 §6）
  *  - 「进入会话列表」「待审批」「关于」入口；消费推送点击直达目标（契约 §6 intent）
@@ -10,7 +11,11 @@
  */
 import { promptAction } from '@kit.ArkUI';
 import { common } from '@kit.AbilityKit';
+import { scanBarcode } from '@kit.ScanKit';
+import { BusinessError } from '@kit.BasicServicesKit';
+import { hilog } from '@kit.PerformanceAnalysisKit';
 import { dshrcLink } from '../model/link';
+import { PairQrResult, parsePairQr } from '../model/pairqr';
 import { CONTRACT_VERSION, isValidChannel } from '../model/protocol';
 import {
   APP_NAME,
@@ -68,6 +73,9 @@ struct Index {
   @Local katOk: boolean = false;
   @Local pushEnabled: boolean = true;
   @Local showLog: boolean = false;
+  /** 扫码结果提示行（空 = 不显示）；scanHintOk 决定用 state_success / state_error。 */
+  @Local scanHint: string = '';
+  @Local scanHintOk: boolean = false;
 
   aboutToAppear(): void {
     const ctx: common.Context = getContext(this) as common.Context;
@@ -149,6 +157,60 @@ struct Index {
   /** 断开链路。 */
   private onStopClick(): void {
     dshrcLink.stop();
+  }
+
+  /**
+   * 扫码配对（契约 §3.5）：Scan Kit 默认界面扫码。
+   * 默认界面自带相机预授权（系统级 UI），无需 CAMERA 权限；
+   * 调用包 try/catch 兜底设备兼容性（PC / 无后置相机设备上调用会同步/异步报错，等价于 canIUse 守卫——
+   * linter-cli 按 compatible SDK 10 解析不到 @since 11 的全局 canIUse，故用等价写法）。
+   */
+  private onScanClick(): void {
+    const ctx: common.Context = getContext(this) as common.Context;
+    try {
+      scanBarcode.startScanForResult(ctx).then((res: scanBarcode.ScanResult): void => {
+        this.applyScanText(res.originalValue);
+      }).catch((err: BusinessError): void => {
+        // 取消（1000500002）/ 失败均静默回到配对页（不打断输入），只记日志便于排障。
+        hilog.warn(0x0000, 'dshrc-scan', 'startScanForResult failed: %{public}d %{public}s',
+          err.code, err.message);
+      });
+    } catch (e) {
+      const err: BusinessError = e as BusinessError;
+      hilog.warn(0x0000, 'dshrc-scan', 'startScanForResult threw: %{public}d %{public}s',
+        err.code, err.message);
+      promptAction.showToast({ message: '当前设备不支持扫码功能', duration: 3000 });
+    }
+  }
+
+  /**
+   * 处理扫码文本：解析（§3.5 完整 URI / 裸 query 两种形态）→ 回填字段 → 成功即保存+连接；
+   * 失败 Toast 明确原因并停留手动输入（已解析出的字段照常回填，不静默丢弃）。
+   */
+  private applyScanText(raw: string): void {
+    const parsed: PairQrResult = parsePairQr(raw);
+    if (parsed.cfg.relayUrl.length > 0) {
+      this.relayUrl = parsed.cfg.relayUrl;
+    }
+    if (parsed.cfg.channel.length > 0) {
+      this.channel = parsed.cfg.channel;
+    }
+    if (parsed.cfg.secret.length > 0) {
+      this.secret = parsed.cfg.secret;
+    }
+    if (parsed.cfg.relayToken.length > 0) {
+      this.relayToken = parsed.cfg.relayToken;
+    }
+    if (!parsed.ok) {
+      this.scanHintOk = false;
+      this.scanHint = '扫码未采用：' + parsed.reason + '（请核对后手动输入）';
+      promptAction.showToast({ message: parsed.reason, duration: 3000 });
+      return;
+    }
+    this.scanHintOk = true;
+    this.scanHint = '已扫码，正在连接…';
+    promptAction.showToast({ message: '已扫码，正在连接…', duration: 2000 });
+    this.onConnectClick();
   }
 
   /** 推送开关：写本地状态 + 持久化 + 联动 token 上报。 */
@@ -353,6 +415,42 @@ struct Index {
     .margin({ bottom: SP_3 })
   }
 
+  /** 扫码配对卡：主按钮（brand_fill）+ 说明 + 扫码结果提示行（成功 state_success / 失败 state_error）。 */
+  @Builder
+  scanCard() {
+    Column() {
+      Button('扫码配对')
+        .width('100%')
+        .height(46)
+        .fontSize(FS_BODY)
+        .fontWeight(FontWeight.Medium)
+        .fontColor($r('app.color.label_on_brand'))
+        .backgroundColor($r('app.color.brand_fill'))
+        .borderRadius(RADIUS_CTRL)
+        .onClick((): void => {
+          this.onScanClick();
+        })
+      Text('扫描 PC 端「/remote-pairing」页面出示的配对二维码，自动填入并连接（契约 §3.5）')
+        .fontSize(FS_SMALL)
+        .fontColor($r('app.color.label_secondary'))
+        .width('100%')
+        .margin({ top: SP_2 })
+      if (this.scanHint.length > 0) {
+        Text(this.scanHint)
+          .fontSize(FS_SMALL)
+          .fontColor(this.scanHintOk ? $r('app.color.state_success') : $r('app.color.state_error'))
+          .width('100%')
+          .margin({ top: SP_1 })
+      }
+    }
+    .width('100%')
+    .padding(SP_4)
+    .backgroundColor($r('app.color.bg_layer_1'))
+    .borderRadius(RADIUS_CARD)
+    .border({ width: HAIRLINE, color: $r('app.color.border_l1') })
+    .margin({ bottom: SP_3 })
+  }
+
   @Builder
   actionRow() {
     Row() {
@@ -466,6 +564,7 @@ struct Index {
         Column() {
           this.headerBlock()
           this.statusCard()
+          this.scanCard()
           this.fieldsCard()
           this.actionRow()
           this.pushCard()

@@ -27,6 +27,7 @@ import { loadConfig, saveConfig, dataDir } from "./lib/config.mjs";
 import { RelayClient } from "./lib/relay-client.mjs";
 import { PushSender, pushConfigured, pushUnavailableReason } from "./lib/push.mjs";
 import { HostBridge } from "./lib/host-bridge.mjs";
+import { registerPairingCommand } from "./lib/pairing.mjs";
 
 /**
  * @param {import('@deepseek-ai/cordis').Context} ctx
@@ -75,6 +76,23 @@ export function apply(ctx, config) {
   if (typeof rowCfg.interceptQuestions === "boolean") cfg.interceptQuestions = rowCfg.interceptQuestions;
   if (typeof rowCfg.approvalTimeoutMs === "number") cfg.approvalTimeoutMs = rowCfg.approvalTimeoutMs;
 
+  // ---- 2.5 配对二维码命令 /remote-pairing（契约 §3.5）----------------------
+  // 在所有早退路径之前注册：KAT 失败 / 未启用 / 未配置 relayUrl 时也要能给出
+  // 可操作的提示（如「先配置 relayUrl」）与 rotate/hide 能力。
+  /** @type {RelayClient|null} rotate 后热更换链路用；空转时为 null。 */
+  let relay = null;
+  try {
+    const disposeCommand = registerPairingCommand(ctx, {
+      config: cfg,
+      configPath,
+      log,
+      getRelay: () => relay,
+    });
+    ctx.effect(() => disposeCommand, "dsh-remote-control: /remote-pairing command");
+  } catch (e) {
+    log("warn", "register /remote-pairing failed", { error: String(e && e.message) });
+  }
+
   if (!katOk) {
     log("error", "KAT failure takes precedence: not connecting", { channel: cfg.channel });
     return;
@@ -102,11 +120,12 @@ export function apply(ctx, config) {
   // ---- 4. 中继链路 + Host 桥接 ---------------------------------------------
   /** @type {HostBridge|null} */
   let bridge = null;
-  const relay = new RelayClient({
+  relay = new RelayClient({
     relayUrl: cfg.relayUrl,
     channel: cfg.channel,
     secret: cfg.secret,
     relayToken: cfg.relayToken,
+    role: "host",
     log,
     onStatus: (s, detail) => {
       log(s === "ready" ? "info" : "info", "relay " + s + (detail ? ": " + detail : ""), {

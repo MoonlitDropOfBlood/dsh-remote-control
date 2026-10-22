@@ -41,7 +41,9 @@ function dshVersion() {
   return process.env.DSH_VERSION || "unknown";
 }
 
-/** 契约 §5.3 SessionSummary ← Host SessionSummary（title 来自投影）。 */
+/** 契约 §5.3 SessionSummary ← Host SessionSummary（title 来自投影）。
+ * v1.0.4：透传 Host 原生 origin/parentSessionId/blank（§5.3 客户端据此做
+ * subagent 分组与 blank 隐藏；wire 字段名与 Host 逐字一致）。 */
 function mapSummary(raw) {
   const values = raw?.projections?.values;
   const title = values && typeof values.title === "string" ? values.title : "";
@@ -52,6 +54,73 @@ function mapSummary(raw) {
     running: raw?.running === true,
     updatedAt: typeof raw?.updatedAt === "number" ? raw.updatedAt : 0,
     archived: false,
+    origin: raw?.origin === "subagent" ? "subagent" : "",
+    parentSessionId: typeof raw?.parentSessionId === "string" ? raw.parentSessionId : "",
+    blank: raw?.blank === true,
+  };
+}
+
+/** 契约 §5.1 session.history 默认/上限页大小（宿主 DEFAULT_MAX_MESSAGES=50）。 */
+const HISTORY_DEFAULT_MAX = 50;
+const HISTORY_MAX_LIMIT = 200;
+
+/**
+ * 契约 §5.1 ChatMessage 提取：SessionWireEvent → {id,role,text,ts,seq} 或 null。
+ *
+ * 事件形态（@deepseek-ai/dsh-session 类型实证）：
+ *   user/message      data = UserMessage  {content:[ContentBlock], source:{kind}}
+ *   assistant/message data = {turn, step, message: AssistantMessage, stream, usage?}
+ * 显示口径（自行权衡，宁缺勿崩）：
+ *   - 只收 append-origin 表面事件（surfaceOp==='append'）——replace 副本是
+ *     模型可见的压缩影子，不是人看的逐字记录（宿主 surface 语义）；
+ *   - user 只收 source.kind==='user' 的真人输入（agent.inject 的注入跳过）；
+ *   - ContentBlock 只取 type==='text' 的纯文本（reasoning/tool-call 跳过，
+ *     image/file 给占位符）；空文本一律跳过（不产生空泡）；
+ *   - 任何不认识的形态返回 null（跳过），绝不抛出。
+ */
+export function mapHistoryMessage(sessionId, record) {
+  const event = record?.event ?? record;
+  if (!event || typeof event !== "object") return null;
+  const type = event.type;
+  if (type !== "user/message" && type !== "assistant/message") return null;
+  if (event.surfaceOp !== "append") return null;
+  const seq = Number(event?.seq);
+  const time = Number(event?.time);
+  if (!Number.isSafeInteger(seq) || seq < 0) return null;
+  const data = event.data;
+  if (!data || typeof data !== "object") return null;
+
+  let role;
+  let content;
+  if (type === "user/message") {
+    if (data?.source?.kind !== "user") return null;
+    role = "user";
+    content = data.content;
+  } else {
+    role = "assistant";
+    content = data?.message?.content;
+  }
+  if (!Array.isArray(content)) return null;
+
+  let text = "";
+  for (const block of content) {
+    if (!block || typeof block !== "object") continue;
+    if (block.type === "text" && typeof block.text === "string") {
+      text += block.text;
+    } else if (block.type === "image") {
+      text += "[图片]";
+    } else if (block.type === "file") {
+      text += "[文件]";
+    }
+    // reasoning / tool-call / tool-addition / tool-removal / 未知块：跳过
+  }
+  if (text.trim() === "") return null;
+  return {
+    id: `${sessionId}:${seq}`,
+    role,
+    text,
+    ts: Number.isSafeInteger(time) && time > 0 ? time : 0,
+    seq,
   };
 }
 
@@ -294,6 +363,8 @@ export class HostBridge {
           return this.#reply(m, resultOf(m, { pong: Date.now() }));
         case "session.list":
           return await this.#rSessionList(m);
+        case "session.history":
+          return await this.#rSessionHistory(m);
         case "session.create":
           return await this.#rSessionCreate(m);
         case "session.prompt":
@@ -381,6 +452,77 @@ export class HostBridge {
       this.#reply(m, resultOf(m, { sessions }));
     } catch (e) {
       this.#reply(m, errorOf(m, "session-list-failed", errText(e)));
+    }
+  }
+
+  /** 契约 §5.1 session.history：向后翻页的历史消息页（v1.0.4）。
+   *  throughSeq（宿主实证）必须是日志中真实存在的末尾 seq——直接传
+   *  MAX_SAFE_INTEGER 会被宿主 bad-request 拒绝（past cursor），-1 只用于空日志；
+   *  故先 inspect 冷读拿日志尾 seq 作为切点，再 page 取消息对齐的一页。
+   *  向前翻页：客户端回传上一页的 oldestSeq 作 beforeSeq（开区间）。 */
+  async #rSessionHistory(m) {
+    const p = m.payload ?? {};
+    const sessionId = typeof p.sessionId === "string" ? p.sessionId : "";
+    if (sessionId === "") {
+      this.#reply(m, errorOf(m, "bad-params", "sessionId required"));
+      return;
+    }
+    let maxMessages = Number.isSafeInteger(p.maxMessages) ? p.maxMessages : HISTORY_DEFAULT_MAX;
+    if (maxMessages <= 0) maxMessages = HISTORY_DEFAULT_MAX;
+    if (maxMessages > HISTORY_MAX_LIMIT) maxMessages = HISTORY_MAX_LIMIT;
+    const beforeSeq =
+      Number.isSafeInteger(p.beforeSeq) && p.beforeSeq >= 0 ? p.beforeSeq : undefined;
+    const signal = this.#signal(30_000);
+    try {
+      const sc = this.#sc();
+      let cursor = -1;
+      let address = { kind: "session", sessionId };
+      try {
+        const inspected = await sc.inspect(sessionId, signal);
+        const events = inspected?.events;
+        if (Array.isArray(events) && events.length > 0) {
+          const lastSeq = Number(events[events.length - 1]?.seq);
+          if (Number.isSafeInteger(lastSeq) && lastSeq >= 0) cursor = lastSeq;
+        }
+        // subagent 会话必须走 durable subagent 地址（宿主校验：kind:'session' 会被拒）
+        const header = inspected?.meta;
+        const parent = typeof header?.parentSession === "string" ? header.parentSession : "";
+        if (header?.origin === "subagent" && parent !== "") {
+          address = { kind: "subagent", parentSessionId: parent, childSessionId: sessionId, mode: "unknown" };
+        }
+      } catch (e) {
+        // inspect 失败（会话不存在等）→ 直接把错误回给手机端
+        throw e;
+      }
+      if (cursor < 0) {
+        // 空会话（无任何事件）：直接回空页，不折腾 page
+        this.#reply(m, resultOf(m, { messages: [], hasMore: false, oldestSeq: 0 }));
+        return;
+      }
+      const request = { address, throughSeq: cursor, maxMessages };
+      if (beforeSeq !== undefined) request.beforeSeq = beforeSeq;
+      const page = await sc.page(request, signal);
+      const messages = [];
+      let oldestSeq = Number.MAX_SAFE_INTEGER;
+      let oldestEventSeq = Number.MAX_SAFE_INTEGER;
+      for (const record of page?.records ?? []) {
+        const rawSeq = Number(record?.event?.seq);
+        if (Number.isSafeInteger(rawSeq) && rawSeq >= 0 && rawSeq < oldestEventSeq) {
+          oldestEventSeq = rawSeq;
+        }
+        const mapped = mapHistoryMessage(sessionId, record);
+        if (mapped !== null) {
+          messages.push(mapped);
+          if (mapped.seq < oldestSeq) oldestSeq = mapped.seq;
+        }
+      }
+      if (oldestSeq === Number.MAX_SAFE_INTEGER) {
+        // 本页无可聊消息（全被过滤）→ 用页内最老事件 seq 续翻，避免卡页
+        oldestSeq = oldestEventSeq === Number.MAX_SAFE_INTEGER ? 0 : oldestEventSeq;
+      }
+      this.#reply(m, resultOf(m, { messages, hasMore: page?.hasMore === true, oldestSeq }));
+    } catch (e) {
+      this.#reply(m, errorOf(m, "session-history-failed", errText(e)));
     }
   }
 

@@ -26,6 +26,8 @@ import {
   DshrcMsg,
   DshrcQuestion,
   DshrcSessionSummary,
+  DshrcChatMessage,
+  DshrcHistoryPage,
   DshrcValue,
   MSG_EVENT,
   TOPIC_APPROVAL_REQUEST,
@@ -47,7 +49,7 @@ const PREF_NAME: string = 'dshrc_prefs';
 const KEY_PUSH_ENABLED: string = 'pushEnabled';
 const LOG_KEEP: number = 80;
 
-/** 会话列表一行（契约 §5.3 SessionSummary 的可观察形态）。 */
+/** 会话列表一行（契约 §5.3 SessionSummary 的可观察形态；v1.0.4 补 subagent/blank 三字段）。 */
 @ObservedV2
 export class SessionRow {
   @Trace sessionId: string = '';
@@ -56,6 +58,9 @@ export class SessionRow {
   @Trace running: boolean = false;
   @Trace updatedAt: number = 0;
   @Trace archived: boolean = false;
+  @Trace origin: string = ''; // "subagent" | ""（Host 原生字段透传）
+  @Trace parentSessionId: string = ''; // fork/spawn 血缘（subagent 会话=父会话 id）
+  @Trace blank: boolean = false; // 尚无对话的空会话（列表一律隐藏，DSH 官方语义）
 
   constructor(s: DshrcSessionSummary) {
     this.apply(s);
@@ -69,10 +74,20 @@ export class SessionRow {
     this.running = s.running;
     this.updatedAt = s.updatedAt;
     this.archived = s.archived;
+    // v1.0.4 三字段（旧插件不发时按空/false 处理，向后兼容）
+    this.origin = s.origin !== undefined ? s.origin : '';
+    this.parentSessionId = s.parentSessionId !== undefined ? s.parentSessionId : '';
+    this.blank = s.blank === true;
+  }
+
+  /** subagent 会话（origin 标记或有父会话血缘）→ 进「子代理」筛选，不与根会话混排。 */
+  isSubagent(): boolean {
+    return this.origin === 'subagent' || this.parentSessionId.length > 0;
   }
 }
 
-/** 一条聊天消息（user / assistant；assistant 可处于流式追加中）。 */
+/** 一条聊天消息（user / assistant；assistant 可处于流式追加中）。
+ *  seq：host 日志持久序号（session.history 历史消息）；-1=本地/直播气泡（无持久序号）。 */
 @ObservedV2
 export class ChatItem {
   @Trace id: string = '';
@@ -81,6 +96,7 @@ export class ChatItem {
   @Trace streaming: boolean = false;
   @Trace ts: number = 0;
   @Trace errorText: string = '';
+  @Trace seq: number = -1;
 
   constructor(id: string, role: string, text: string, ts: number, streaming: boolean) {
     this.id = id;
@@ -137,6 +153,13 @@ export class QuestionCard {
   }
 }
 
+/** 每会话历史翻页元数据（非 @Trace：详情页读 store 的活动会话投影字段）。 */
+class HistMeta {
+  loaded: boolean = false; // 首页（最新一页）是否已拉取
+  hasMore: boolean = false; // 是否还有更早的消息页
+  oldestSeq: number = 0; // 已加载的最老 durable seq（向前翻页的 beforeSeq）
+}
+
 /** 推送点击待导航目标（契约 §6：intent 携带 sessionId / askId）。 */
 export interface PendingNav {
   sessionId: string;
@@ -189,6 +212,10 @@ export class SessionStore {
   @Trace refreshing: boolean = false;
   @Trace activeId: string = '';
   @Trace messages: ChatItem[] = [];
+  // ---- 历史消息（契约 §5.1 session.history，v1.0.4；活动会话投影）----
+  @Trace historyLoading: boolean = false;
+  @Trace historyHasMore: boolean = false;
+  @Trace historyLoaded: boolean = false;
   // ---- 审批 / 提问（契约 §5.5）----
   @Trace approvals: ApprovalCard[] = [];
   @Trace questions: QuestionCard[] = [];
@@ -208,6 +235,7 @@ export class SessionStore {
 
   private link: DshrcLink = dshrcLink;
   private cache: Map<string, ChatItem[]> = new Map<string, ChatItem[]>();
+  private histMeta: Map<string, HistMeta> = new Map<string, HistMeta>();
   private chatSeq: number = 0;
 
   private constructor() {
@@ -337,6 +365,8 @@ export class SessionStore {
     this.activeId = sid;
     if (sid.length === 0) {
       this.messages = [];
+      this.historyHasMore = false;
+      this.historyLoaded = false;
       return;
     }
     if (!this.cache.has(sid)) {
@@ -344,6 +374,115 @@ export class SessionStore {
     }
     const items: ChatItem[] | undefined = this.cache.get(sid);
     this.messages = items !== undefined ? items.slice() : [];
+    // 投影本会话的历史翻页状态（详情页据此渲染「加载更早消息」）
+    const meta: HistMeta | undefined = this.histMeta.get(sid);
+    this.historyLoaded = meta !== undefined && meta.loaded;
+    this.historyHasMore = meta !== undefined && meta.hasMore;
+  }
+
+  // ---- 历史消息（契约 §5.1 session.history，v1.0.4）----
+
+  private metaOf(sid: string): HistMeta {
+    let meta: HistMeta | undefined = this.histMeta.get(sid);
+    if (meta === undefined) {
+      meta = new HistMeta();
+      this.histMeta.set(sid, meta);
+    }
+    const got: HistMeta = meta;
+    return got;
+  }
+
+  /**
+   * 拉一页历史消息并并入会话缓存；永不 reject。
+   * prepend=false：详情页打开时拉最新一页；prepend=true：列表顶部「加载更早消息」向前翻页
+   * （beforeSeq 回传上一页的 oldestSeq，开区间）。
+   */
+  loadHistory(sid: string, prepend: boolean): Promise<void> {
+    if (sid.length === 0 || this.link.getState() !== 'online' || this.historyLoading) {
+      return Promise.resolve();
+    }
+    const meta: HistMeta = this.metaOf(sid);
+    if (prepend && !meta.hasMore) {
+      return Promise.resolve();
+    }
+    this.historyLoading = true;
+    const before: number | undefined = prepend ? meta.oldestSeq : undefined;
+    return this.link.sessionHistory(sid, before).then((page: DshrcHistoryPage): void => {
+      meta.hasMore = page.hasMore;
+      if (page.oldestSeq > 0) {
+        meta.oldestSeq = page.oldestSeq;
+      }
+      meta.loaded = true;
+      this.mergeHistory(sid, page.messages, prepend);
+      if (sid === this.activeId) {
+        this.historyHasMore = meta.hasMore;
+        this.historyLoaded = true;
+      }
+      this.historyLoading = false;
+    }).catch((e: Error): void => {
+      this.historyLoading = false;
+      this.lastError = '加载历史失败：' + e.message;
+      logDshrc(TAG, 'warn', 'session.history failed: ' + e.message);
+    });
+  }
+
+  /**
+   * 历史页并入缓存（历史与直播气泡合并去重，用 seq 对齐）：
+   *  1) durable 消息按页覆盖区间判重——与本页 [pageMin,pageMax] 重叠的旧副本摘除，
+   *     统一按 seq 升序重排（页内可能含被过滤的非聊天事件，不能只按单点 seq 比对）；
+   *  2) 直播气泡（seq<0）：非 prepend 时若与本页某条历史同 role+text，视为同一句话，丢弃直播副本；
+   *  3) 组装：prepend=旧页在最前；否则历史接在旧 durable 之后；直播气泡永远在最后（时间上最新）。
+   */
+  private mergeHistory(sid: string, messages: DshrcChatMessage[], prepend: boolean): void {
+    const items: ChatItem[] = this.cacheOf(sid);
+    let pageMin: number = Number.MAX_SAFE_INTEGER;
+    let pageMax: number = -1;
+    for (let i: number = 0; i < messages.length; i++) {
+      const sq: number = messages[i].seq;
+      if (sq < pageMin) {
+        pageMin = sq;
+      }
+      if (sq > pageMax) {
+        pageMax = sq;
+      }
+    }
+    const durable: ChatItem[] = [];
+    const live: ChatItem[] = [];
+    for (let j: number = 0; j < items.length; j++) {
+      const it: ChatItem = items[j];
+      if (it.seq >= 0) {
+        if (messages.length > 0 && it.seq >= pageMin && it.seq <= pageMax) {
+          continue; // 与本页覆盖区间重叠：旧副本摘除，统一用本页副本
+        }
+        durable.push(it);
+        continue;
+      }
+      if (!prepend && it.text.length > 0 && this.textCoveredByPage(messages, it)) {
+        continue; // 直播副本已被 durable 历史覆盖，同一句话不显示两遍
+      }
+      live.push(it);
+    }
+    durable.sort((a: ChatItem, b: ChatItem): number => a.seq - b.seq);
+    const pageItems: ChatItem[] = [];
+    for (let k: number = 0; k < messages.length; k++) {
+      const msg: DshrcChatMessage = messages[k];
+      const ci: ChatItem = new ChatItem(msg.id, msg.role, msg.text, msg.ts, false);
+      ci.seq = msg.seq;
+      pageItems.push(ci);
+    }
+    const body: ChatItem[] = prepend ? pageItems.concat(durable) : durable.concat(pageItems);
+    this.cache.set(sid, body.concat(live));
+    this.notifyActive(sid);
+  }
+
+  /** 直播气泡是否已被本页历史覆盖（存在同 role+text 的 durable 消息）。 */
+  private textCoveredByPage(messages: DshrcChatMessage[], it: ChatItem): boolean {
+    for (let i: number = 0; i < messages.length; i++) {
+      if (messages[i].role === it.role && messages[i].text === it.text) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /** 本地乐观追加一条用户消息（发送即上屏）。 */
@@ -429,6 +568,7 @@ export class SessionStore {
     for (let j: number = 0; j < keys.length; j++) {
       if (!alive.has(keys[j])) {
         this.cache.delete(keys[j]);
+        this.histMeta.delete(keys[j]);
       }
     }
     if (this.activeId.length > 0 && !alive.has(this.activeId)) {

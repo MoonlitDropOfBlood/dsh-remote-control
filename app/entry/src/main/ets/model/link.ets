@@ -25,6 +25,7 @@ import {
   DshrcValue,
   DshrcAnswers,
   DshrcSessionSummary,
+  DshrcHistoryPage,
   DshrcRelayFrame,
   DshrcRelayPeers,
   FRAME_ERROR,
@@ -40,6 +41,7 @@ import {
   MSG_HELLO,
   MSG_RESULT,
   MSG_SESSION_LIST,
+  MSG_SESSION_HISTORY,
   MSG_SESSION_CREATE,
   MSG_SESSION_PROMPT,
   MSG_SESSION_CANCEL,
@@ -667,6 +669,26 @@ export class DshrcLink {
     const p: DshrcPayload = { includeArchived: includeArchived };
     return this.request(MSG_SESSION_LIST, p).then((v: DshrcValue): DshrcSessionSummary[] => {
       return v.sessions !== undefined ? v.sessions : [];
+    });
+  }
+
+  /** session.history（§5.1 v1.0.4）：向后翻页的历史消息页。
+   *  beforeSeq 缺省取最新一页；向前翻页回传上一页的 oldestSeq。 */
+  sessionHistory(sessionId: string, beforeSeq?: number, maxMessages?: number): Promise<DshrcHistoryPage> {
+    const p: DshrcPayload = { sessionId: sessionId };
+    if (beforeSeq !== undefined && beforeSeq >= 0) {
+      p.beforeSeq = beforeSeq;
+    }
+    if (maxMessages !== undefined && maxMessages > 0) {
+      p.maxMessages = maxMessages;
+    }
+    return this.request(MSG_SESSION_HISTORY, p, 20000).then((v: DshrcValue): DshrcHistoryPage => {
+      const page: DshrcHistoryPage = {
+        messages: v.messages !== undefined ? v.messages : [],
+        hasMore: v.hasMore === true,
+        oldestSeq: v.oldestSeq !== undefined ? v.oldestSeq : 0
+      };
+      return page;
     });
   }
 

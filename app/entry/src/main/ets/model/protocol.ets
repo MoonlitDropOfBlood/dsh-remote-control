@@ -8,8 +8,8 @@
 /** 协议版本（契约 §5.1 hello.proto）。 */
 export const PROTO_VERSION: number = 1;
 
-/** 协议契约文档版本（v1.0.2：frame 携带 sid，接收端去重键为 sid+":"+seq；关于页展示用）。 */
-export const CONTRACT_VERSION: string = 'v1.0.2';
+/** 协议契约文档版本（v1.0.4：§5.1 session.history、§5.3 SessionSummary 补 origin/parentSessionId/blank；关于页展示用）。 */
+export const CONTRACT_VERSION: string = 'v1.0.4';
 
 /** 角色：host = PC 端 DSH 插件；client = 本 App。 */
 export const ROLE_HOST: string = 'host';
@@ -61,6 +61,7 @@ export const TAG_LEN: number = 16;
 /** 业务消息 type（契约 §5.1，client → host 请求）。 */
 export const MSG_HELLO: string = 'hello';
 export const MSG_SESSION_LIST: string = 'session.list';
+export const MSG_SESSION_HISTORY: string = 'session.history'; // v1.0.4：历史消息翻页
 export const MSG_SESSION_CREATE: string = 'session.create';
 export const MSG_SESSION_PROMPT: string = 'session.prompt';
 export const MSG_SESSION_CANCEL: string = 'session.cancel';
@@ -126,6 +127,9 @@ export interface DshrcPayload {
   text?: string;
   accepted?: boolean;
   cancelled?: boolean;
+  // session.history（§5.1 v1.0.4）
+  beforeSeq?: number;
+  maxMessages?: number;
   // approval / question（§5.1）
   askId?: string;
   decision?: string;
@@ -178,6 +182,26 @@ export interface DshrcValue {
   multiSelect?: boolean;
   // push.state（§5.2）：推送通道是否可用；未开通推送服务时为 false 并附 reason
   enabled?: boolean;
+  // session.history（§5.1 v1.0.4）：历史消息页
+  messages?: DshrcChatMessage[];
+  hasMore?: boolean;
+  oldestSeq?: number;
+}
+
+/** session.history 的单条历史消息（契约 §5.1 v1.0.4 ChatMessage）。 */
+export interface DshrcChatMessage {
+  id: string;
+  role: string; // "user" | "assistant"
+  text: string;
+  ts: number;
+  seq: number; // host 日志持久序号（去重键）
+}
+
+/** session.history 响应 value（契约 §5.1 v1.0.4）。 */
+export interface DshrcHistoryPage {
+  messages: DshrcChatMessage[];
+  hasMore: boolean;
+  oldestSeq: number;
 }
 
 /** result.error（契约 §5）。 */
@@ -200,7 +224,7 @@ export interface DshrcQuestion {
   options?: DshrcQuestionOption[];
 }
 
-/** SessionSummary（契约 §5.3）。 */
+/** SessionSummary（契约 §5.3；v1.0.4 补充 origin/parentSessionId/blank，Host 原生字段透传）。 */
 export interface DshrcSessionSummary {
   sessionId: string;
   title: string;
@@ -208,6 +232,10 @@ export interface DshrcSessionSummary {
   running: boolean;
   updatedAt: number;
   archived: boolean;
+  // v1.0.4：subagent 标记 / fork-spawn 血缘 / 空会话（旧插件缺省时按空处理）
+  origin?: string; // "subagent" | ""
+  parentSessionId?: string;
+  blank?: boolean;
 }
 
 /**

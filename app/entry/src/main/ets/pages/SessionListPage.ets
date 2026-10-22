@@ -33,6 +33,8 @@ import { SessionRow, SessionStore, sessionStore } from '../model/sessionstore';
 @ComponentV2
 export struct SessionCard {
   @Require @Param row: SessionRow;
+  /** 父会话标题（subagent 卡副标题；由列表页用 titleOf(parentSessionId) 算好传入）。 */
+  @Require @Param parentTitle: string = '';
   @Event onOpen: (sessionId: string) => void;
 
   build() {
@@ -45,6 +47,15 @@ export struct SessionCard {
           .layoutWeight(1)
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
+        if (this.row.isSubagent()) {
+          Text('子代理')
+            .fontSize(FS_CAPTION)
+            .fontColor($r('app.color.label_secondary'))
+            .padding({ left: 8, right: 8, top: 3, bottom: 3 })
+            .margin({ left: SP_2 })
+            .borderRadius(RADIUS_PILL)
+            .backgroundColor($r('app.color.bg_layer_2'))
+        }
         if (this.row.running) {
           Row() {
             Circle({ width: 6, height: 6 }).fill($r('app.color.brand_fill'))
@@ -70,6 +81,17 @@ export struct SessionCard {
       }
       .width('100%')
       .alignItems(VerticalAlign.Center)
+
+      if (this.row.parentSessionId.length > 0 && this.parentTitle.length > 0) {
+        // subagent 卡副标题：父会话标题（契约 §5.3 parentSessionId 血缘）
+        Text('父会话：' + this.parentTitle)
+          .fontSize(FS_SMALL)
+          .fontColor($r('app.color.label_secondary'))
+          .width('100%')
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .margin({ top: SP_1 })
+      }
 
       if (this.row.cwd.length > 0) {
         Text(this.row.cwd)
@@ -134,7 +156,9 @@ export struct FilterChip {
 export struct SessionListPage {
   @Local store: SessionStore = sessionStore;
   @Local refreshing: boolean = false;
-  /** 列表筛选：active=未归档（默认）/ archived=已归档 / all=全部。 */
+  /** 列表筛选：active=未归档（默认）/ archived=已归档 / sub=子代理 / all=全部。
+   *  显示规则（契约 §5.3 v1.0.4）：blank 一律隐藏；subagent 只进「子代理」与「全部」，
+   *  不与根会话混排刷屏。 */
   @Local listFilter: string = 'active';
 
   aboutToAppear(): void {
@@ -149,27 +173,66 @@ export struct SessionListPage {
 
   /** 当前筛选下的会话行（store.sessions 的 @Trace 读取会被 V2 追踪，列表随事件实时刷新）。 */
   private filteredSessions(): SessionRow[] {
-    if (this.listFilter === 'all') {
-      return this.store.sessions;
-    }
-    const wantArchived: boolean = this.listFilter === 'archived';
     const out: SessionRow[] = [];
     for (const row of this.store.sessions) {
-      if (row.archived === wantArchived) {
-        out.push(row);
+      if (row.blank) {
+        continue; // blank===true：任何筛选下都隐藏（DSH 官方语义）
+      }
+      const sub: boolean = row.isSubagent();
+      if (this.listFilter === 'all') {
+        out.push(row); // 「全部」：一切非 blank（含子代理）
+      } else if (this.listFilter === 'sub') {
+        if (sub) {
+          out.push(row);
+        }
+      } else if (!sub) {
+        // 「未归档 / 已归档」：根会话专属，子代理不混排
+        const wantArchived: boolean = this.listFilter === 'archived';
+        if (row.archived === wantArchived) {
+          out.push(row);
+        }
       }
     }
     return out;
   }
 
-  private countBy(archived: boolean): number {
+  /** 各筛选胶囊计数（与 filteredSessions 同一套规则）。 */
+  private countSub(): number {
     let n: number = 0;
     for (const row of this.store.sessions) {
-      if (row.archived === archived) {
+      if (!row.blank && row.isSubagent()) {
         n++;
       }
     }
     return n;
+  }
+
+  private countVisible(): number {
+    let n: number = 0;
+    for (const row of this.store.sessions) {
+      if (!row.blank) {
+        n++;
+      }
+    }
+    return n;
+  }
+
+  private countRoot(archived: boolean): number {
+    let n: number = 0;
+    for (const row of this.store.sessions) {
+      if (!row.blank && !row.isSubagent() && row.archived === archived) {
+        n++;
+      }
+    }
+    return n;
+  }
+
+  /** subagent 卡的父会话标题（titleOf 兜底短 id）。 */
+  private parentTitleOf(row: SessionRow): string {
+    if (row.parentSessionId.length === 0) {
+      return '';
+    }
+    return this.store.titleOf(row.parentSessionId);
   }
 
   /** 下拉刷新：拉 session.list，完成后收起刷新态。 */
@@ -246,32 +309,44 @@ export struct SessionListPage {
 
   @Builder
   filterRow() {
-    Row({ space: SP_2 }) {
-      FilterChip({
-        label: '未归档',
-        count: this.countBy(false),
-        active: this.listFilter === 'active',
-        onTap: (): void => {
-          this.listFilter = 'active';
-        }
-      })
-      FilterChip({
-        label: '已归档',
-        count: this.countBy(true),
-        active: this.listFilter === 'archived',
-        onTap: (): void => {
-          this.listFilter = 'archived';
-        }
-      })
-      FilterChip({
-        label: '全部',
-        count: this.store.sessions.length,
-        active: this.listFilter === 'all',
-        onTap: (): void => {
-          this.listFilter = 'all';
-        }
-      })
+    // 四个胶囊横向可滚（窄屏放不下时滑动，不裁切）
+    Scroll() {
+      Row({ space: SP_2 }) {
+        FilterChip({
+          label: '未归档',
+          count: this.countRoot(false),
+          active: this.listFilter === 'active',
+          onTap: (): void => {
+            this.listFilter = 'active';
+          }
+        })
+        FilterChip({
+          label: '已归档',
+          count: this.countRoot(true),
+          active: this.listFilter === 'archived',
+          onTap: (): void => {
+            this.listFilter = 'archived';
+          }
+        })
+        FilterChip({
+          label: '子代理',
+          count: this.countSub(),
+          active: this.listFilter === 'sub',
+          onTap: (): void => {
+            this.listFilter = 'sub';
+          }
+        })
+        FilterChip({
+          label: '全部',
+          count: this.countVisible(),
+          active: this.listFilter === 'all',
+          onTap: (): void => {
+            this.listFilter = 'all';
+          }
+        })
+      }
     }
+    .scrollBar(BarState.Off)
     .width('100%')
     .padding({ left: SP_4, right: SP_4, bottom: SP_2 })
   }
@@ -343,6 +418,7 @@ export struct SessionListPage {
                 ListItem() {
                   SessionCard({
                     row: cell.item,
+                    parentTitle: this.parentTitleOf(cell.item),
                     onOpen: (sid: string): void => {
                       this.openSession(sid);
                     }

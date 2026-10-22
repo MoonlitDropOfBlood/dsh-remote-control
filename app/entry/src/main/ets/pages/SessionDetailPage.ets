@@ -160,6 +160,8 @@ export struct SessionDetailPage {
     this.readRouteParams();
     if (this.sessionId.length > 0) {
       this.store.openSession(this.sessionId);
+      // 契约 §5.1 v1.0.4：先拉最新一页历史消息（修复打开历史会话空白）
+      this.store.loadHistory(this.sessionId, false);
     }
     // onAppear 兜底：万一 aboutToAppear 时 wrapper onReady 尚未回填 contextMap（真机时序差异），
     // 组件上树后再补读一次参数。
@@ -170,12 +172,15 @@ export struct SessionDetailPage {
           this.readRouteParams();
           if (this.sessionId.length > 0) {
             this.store.openSession(this.sessionId);
+            this.store.loadHistory(this.sessionId, false);
           }
         }
       },
       onShown: (): void => {
         if (this.sessionId.length > 0) {
           this.store.openSession(this.sessionId);
+          // 重进页面补拉最新一页（store 内按 seq 去重，不会重复显示）
+          this.store.loadHistory(this.sessionId, false);
         }
       }
     });
@@ -189,7 +194,7 @@ export struct SessionDetailPage {
     }
   }
 
-  /** 新气泡或流式增长时贴底滚动。 */
+  /** 新气泡或流式增长时贴底滚动；顶部加载更早消息（prepend）不打断阅读位置。 */
   @Monitor('store.messages')
   onMessagesChanged(mon: IMonitor): void {
     const now: ChatItem[] | undefined = mon.value<ChatItem[]>()?.now;
@@ -197,9 +202,13 @@ export struct SessionDetailPage {
     if (now === undefined) {
       return;
     }
-    const grown: boolean = before === undefined || now.length > before.length;
-    const streaming: boolean = now.length > 0 && now[now.length - 1].streaming;
-    if (grown || streaming) {
+    const lastNow: ChatItem | undefined = now.length > 0 ? now[now.length - 1] : undefined;
+    const lastBefore: ChatItem | undefined =
+      before !== undefined && before.length > 0 ? before[before.length - 1] : undefined;
+    const tailChanged: boolean = lastNow !== undefined &&
+      (lastBefore === undefined || lastBefore.id !== lastNow.id);
+    const streaming: boolean = lastNow !== undefined && lastNow.streaming;
+    if ((tailChanged && (before === undefined || now.length > before.length)) || streaming) {
       this.scroller.scrollEdge(Edge.Bottom);
     }
   }
@@ -299,6 +308,39 @@ export struct SessionDetailPage {
   }
 
   @Builder
+  historyBar() {
+    // 历史翻页条：加载中 / 「加载更早消息」（hasMore 时显示，向前翻页）
+    Column() {
+      if (this.store.historyLoading) {
+        Row({ space: SP_2 }) {
+          LoadingProgress()
+            .width(16)
+            .height(16)
+            .color($r('app.color.label_tertiary'))
+          Text(this.store.historyHasMore ? '加载更早消息…' : '正在加载历史消息…')
+            .fontSize(FS_SMALL)
+            .fontColor($r('app.color.label_tertiary'))
+        }
+        .justifyContent(FlexAlign.Center)
+        .width('100%')
+        .padding({ top: SP_2, bottom: SP_2 })
+      } else if (this.store.historyHasMore) {
+        Text('加载更早消息')
+          .fontSize(FS_SMALL)
+          .fontColor($r('app.color.brand_label'))
+          .padding({ left: SP_4, right: SP_4, top: SP_1 + 2, bottom: SP_1 + 2 })
+          .borderRadius(RADIUS_PILL)
+          .backgroundColor($r('app.color.bg_layer_2'))
+          .onClick((): void => {
+            this.store.loadHistory(this.sessionId, true);
+          })
+      }
+    }
+    .width('100%')
+    .margin({ bottom: SP_1 })
+  }
+
+  @Builder
   emptyState() {
     Column() {
       Text('还没有消息')
@@ -320,8 +362,11 @@ export struct SessionDetailPage {
 
       Scroll(this.scroller) {
         Column() {
+          this.historyBar()
           if (this.store.messages.length === 0) {
-            this.emptyState()
+            if (!this.store.historyLoading) {
+              this.emptyState()
+            }
           } else {
             Repeat(this.store.messages)
               .each((cell: RepeatItem<ChatItem>): void => {

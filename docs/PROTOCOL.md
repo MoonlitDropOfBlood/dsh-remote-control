@@ -112,6 +112,7 @@ dshrc://pair?r=<encodeURIComponent(relayUrl)>&c=<channel>&s=<secret>[&t=<encodeU
 |---|---|---|---|
 | `hello` | `{proto:1, clientName, appVersion, pushToken?, sig}` | `{hostName, dshVersion, pluginVersion}` | 连接/重连后首条；`sig` 见 §3.4 |
 | `session.list` | `{includeArchived?:bool}` | `{sessions:[SessionSummary]}` | SessionSummary 见 §5.3 |
+| `session.history` | `{sessionId, beforeSeq?:number, maxMessages?:number}` | `{messages:[ChatMessage], hasMore, oldestSeq}` | **v1.0.4** 向后翻页的历史消息；`beforeSeq` 缺省取最新一页。ChatMessage：`{id, role:"user"\|"assistant", text, ts, seq}` |
 | `session.create` | `{title?, cwd?}` | `{sessionId}` | cwd 缺省用主机默认工作目录 |
 | `session.prompt` | `{sessionId, text}` | `{accepted:bool}` | 立即返回；实际回复走事件流 |
 | `session.cancel` | `{sessionId}` | `{cancelled:bool}` | 取消当前运行的 turn |
@@ -142,8 +143,16 @@ dshrc://pair?r=<encodeURIComponent(relayUrl)>&c=<channel>&s=<secret>[&t=<encodeU
 
 ```json
 { "sessionId": "…", "title": "…", "cwd": "…",
-  "running": false, "updatedAt": 1760000000000, "archived": false }
+  "running": false, "updatedAt": 1760000000000, "archived": false,
+  "origin": "subagent", "parentSessionId": "…", "blank": false }
 ```
+
+**v1.0.4 补充字段**（Host `SessionSummary` 原生字段，插件必须透传）：
+- `origin:"subagent"`：subagent 会话标记。**客户端显示规则**：默认列表隐藏 subagent 会话，
+  放入「子代理」筛选项并加徽标；不得与根会话混排刷屏。
+- `parentSessionId`：fork/spawn 血缘（subagent 会话=父会话 id）；根会话缺省。
+- `blank:true`：尚无对话的空会话——**客户端应直接隐藏**（DSH 官方语义：
+  clients hide blank Sessions from lists）。
 
 ### 5.4 Question（ask_user_question 结构）
 

@@ -35,6 +35,104 @@ import {
 } from '../model/theme';
 import { ApprovalCardView, QuestionCardView } from './AskCards';
 
+/** 内联 markdown 碎片（`code` / **bold** / 普通）。 */
+class InlineChunk {
+  text: string;
+  bold: boolean;
+  code: boolean;
+
+  constructor(text: string, bold: boolean, code: boolean) {
+    this.text = text;
+    this.bold = bold;
+    this.code = code;
+  }
+}
+
+/**
+ * 轻量内联 markdown 解析（够用即可，不做完整 CommonMark）：
+ *  - `code`  → 等宽 span（剥反引号）
+ *  - **bold** → 加粗 span（剥星号）
+ *  - `## ` 开头的标题行 → 剥井号整行加粗
+ *  - `|` 开头的表格行 → 整行等宽（竖线对齐）
+ */
+function chunksOf(input: string): InlineChunk[] {
+  const out: InlineChunk[] = [];
+  const lines: string[] = input.split('\n');
+  for (let li: number = 0; li < lines.length; li++) {
+    let line: string = lines[li];
+    const lineEnd: string = li < lines.length - 1 ? '\n' : '';
+    let heading: boolean = false;
+    let tableRow: boolean = false;
+    let k: number = 0;
+    while (k < line.length && line.charAt(k) === '#') {
+      k++;
+    }
+    if (k > 0 && k <= 6 && k < line.length && line.charAt(k) === ' ') {
+      line = line.substring(k + 1);
+      heading = true;
+    } else if (line.charAt(0) === '|') {
+      tableRow = true;
+    }
+    if (heading || tableRow) {
+      out.push(new InlineChunk(line + lineEnd, heading, tableRow));
+      continue;
+    }
+    let buf: string = '';
+    let bold: boolean = false;
+    let code: boolean = false;
+    let i: number = 0;
+    const flush = (): void => {
+      if (buf.length > 0) {
+        out.push(new InlineChunk(buf, bold, code));
+        buf = '';
+      }
+    };
+    while (i < line.length) {
+      const c: string = line.charAt(i);
+      if (!code && c === '*' && line.charAt(i + 1) === '*') {
+        flush();
+        bold = !bold;
+        i += 2;
+        continue;
+      }
+      if (c === '`') {
+        flush();
+        code = !code;
+        i += 1;
+        continue;
+      }
+      buf += c;
+      i += 1;
+    }
+    flush();
+    if (lineEnd.length > 0) {
+      out.push(new InlineChunk(lineEnd, false, false));
+    }
+  }
+  return out;
+}
+
+/** 剥掉代码段首行的语言标记（如 ts / bash / json），返回剩余代码文本。 */
+function stripLangLine(seg: string): string {
+  const nl: number = seg.indexOf('\n');
+  if (nl < 0 || nl > 12) {
+    return seg;
+  }
+  const head: string = seg.substring(0, nl).trim();
+  if (head.length === 0 || head.length > 12) {
+    return seg;
+  }
+  for (let i: number = 0; i < head.length; i++) {
+    const c: string = head.charAt(i);
+    const ok: boolean = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+      (c >= '0' && c <= '9') || c === '+' || c === '#' || c === '-' || c === '_';
+    if (!ok) {
+      return seg;
+    }
+  }
+  return seg.substring(nl + 1);
+}
+
 /** 单条消息气泡（含代码分段渲染）。 */
 @ComponentV2
 struct MessageBubble {
@@ -43,13 +141,18 @@ struct MessageBubble {
   /**
    * 按 ``` 围栏切段：偶数段=正文，奇数段=代码（等宽字体 + bg_layer_2 底）。
    * build 中经方法读取 item.text（@Trace），增量到达自动重建分段。
+   * 代码段首行若只是语言标记（如 ts / bash）则剥掉，不占正文高度。
    */
   private segsOf(): string[] {
     const t: string = this.item.text;
     if (t.indexOf('```') < 0) {
       return [t];
     }
-    return t.split('```');
+    const raw: string[] = t.split('```');
+    for (let i: number = 1; i < raw.length; i += 2) {
+      raw[i] = stripLangLine(raw[i]);
+    }
+    return raw;
   }
 
   @Builder
@@ -59,47 +162,56 @@ struct MessageBubble {
         .fontFamily('monospace')
         .fontSize(13)
         .fontColor($r('app.color.label_primary'))
-                .width('100%')
+        .width('100%')
         .padding({ left: SP_2, right: SP_2, top: SP_2, bottom: SP_2 })
         .margin({ top: SP_1, bottom: SP_1 })
         .backgroundColor($r('app.color.bg_layer_2'))
         .borderRadius(RADIUS_CTRL)
     } else {
-      Text(seg)
-        .fontSize(FS_BODY)
-        .fontColor($r('app.color.label_primary'))
-                .width('100%')
+      // 正文段：轻量内联 markdown（粗体/行内代码/标题/表格行），Span 流式排版
+      Text() {
+        Repeat(chunksOf(seg))
+          .each((cell: RepeatItem<InlineChunk>): void => {
+            Span(cell.item.text)
+              .fontSize(cell.item.code ? 13 : FS_BODY)
+              .fontFamily(cell.item.code ? 'monospace' : 'default')
+              .fontWeight(cell.item.bold ? FontWeight.Bold : FontWeight.Normal)
+              .fontColor($r('app.color.label_primary'))
+          })
+          .key((c: InlineChunk, i: number): string => i.toString())
+      }
+      .width('100%')
     }
   }
 
   build() {
     Column() {
       if (this.item.role === 'user') {
-        // 用户：右对齐品牌蓝气泡 + 白字
+        // 用户：右对齐品牌蓝气泡。Text 自身即气泡（padding/bg 挂 Text），
+        // constraintSize 的百分比解析自外层 Row（定宽）——绝不把 width('100%')
+        // 塞进自适应 Column（循环百分比 → 不换行 → 文字甩出气泡，真机实测 bug）。
         Row() {
-          Column() {
-            Text(this.item.text)
-              .fontSize(FS_BODY)
-              .fontColor($r('app.color.label_on_brand'))
-                            .width('100%')
-          }
-          .padding({ left: 12, right: 12, top: 10, bottom: 10 })
-          .backgroundColor($r('app.color.brand_fill'))
-          .borderRadius(RADIUS_BUBBLE)
-          .constraintSize({ maxWidth: '82%' })
+          Text(this.item.text)
+            .fontSize(FS_BODY)
+            .fontColor($r('app.color.label_on_brand'))
+            .padding({ left: 12, right: 12, top: 10, bottom: 10 })
+            .backgroundColor($r('app.color.brand_fill'))
+            .borderRadius(RADIUS_BUBBLE)
+            .constraintSize({ maxWidth: '82%' })
         }
         .width('100%')
         .justifyContent(FlexAlign.End)
         .margin({ top: SP_1, bottom: SP_1 })
       } else {
-        // 助手：左对齐浅面卡片，代码片段等宽
+        // 助手：左对齐浅面卡片。Column 用定宽 82%（消除循环百分比），
+        // 内部 Text width('100%') 有确定父宽可换行；内容左对齐。
         Row() {
           Column() {
             Repeat(this.segsOf())
               .each((cell: RepeatItem<string>): void => {
                 this.segView(cell.item, cell.index)
               })
-              .key((s: string, i: number): string => i.toString() + '-' + s.length.toString())
+              .key((s: string, i: number): string => i.toString())
             if (this.item.streaming) {
               Text('▍')
                 .fontSize(FS_BODY)
@@ -113,11 +225,12 @@ struct MessageBubble {
                 .margin({ top: SP_1 })
             }
           }
+          .width('82%')
+          .alignItems(HorizontalAlign.Start)
           .padding({ left: 12, right: 12, top: 10, bottom: 10 })
           .backgroundColor($r('app.color.bg_layer_1'))
           .border({ width: HAIRLINE, color: $r('app.color.border_l1') })
           .borderRadius(RADIUS_BUBBLE)
-          .constraintSize({ maxWidth: '86%' })
         }
         .width('100%')
         .justifyContent(FlexAlign.Start)

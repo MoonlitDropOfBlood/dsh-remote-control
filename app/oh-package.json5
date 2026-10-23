@@ -4,7 +4,8 @@
   "dependencies": {
     "eventpost": "^2.2.1",
     "hrouter": "^2.0.0",
-    "@duke/logan-ext": "^2.0.1"
+    "@duke/logan-ext": "^2.0.1",
+    "@luvi/lv-markdown-in": "^3.4.7"
   },
   "devDependencies": {
     "@ohos/hypium": "1.0.25",

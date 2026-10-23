@@ -6,6 +6,7 @@
  *  - 底部输入条 + 发送；running 时显示「取消」；顶部标题栏 + 运行状态徽标
  *  - 本会话的审批 / 提问卡片内嵌在输入条上方（AskCards），resolved 后自动消失
  */
+import { Markdown, MarkdownController } from '@luvi/lv-markdown-in';
 import { promptAction } from '@kit.ArkUI';
 import { HRouter } from 'hrouter';
 import { dshrcLink } from '../model/link';
@@ -35,154 +36,13 @@ import {
 } from '../model/theme';
 import { ApprovalCardView, QuestionCardView } from './AskCards';
 
-/** 内联 markdown 碎片（`code` / **bold** / 普通）。 */
-class InlineChunk {
-  text: string;
-  bold: boolean;
-  code: boolean;
 
-  constructor(text: string, bold: boolean, code: boolean) {
-    this.text = text;
-    this.bold = bold;
-    this.code = code;
-  }
-}
-
-/**
- * 轻量内联 markdown 解析（够用即可，不做完整 CommonMark）：
- *  - `code`  → 等宽 span（剥反引号）
- *  - **bold** → 加粗 span（剥星号）
- *  - `## ` 开头的标题行 → 剥井号整行加粗
- *  - `|` 开头的表格行 → 整行等宽（竖线对齐）
- */
-function chunksOf(input: string): InlineChunk[] {
-  const out: InlineChunk[] = [];
-  const lines: string[] = input.split('\n');
-  for (let li: number = 0; li < lines.length; li++) {
-    let line: string = lines[li];
-    const lineEnd: string = li < lines.length - 1 ? '\n' : '';
-    let heading: boolean = false;
-    let tableRow: boolean = false;
-    let k: number = 0;
-    while (k < line.length && line.charAt(k) === '#') {
-      k++;
-    }
-    if (k > 0 && k <= 6 && k < line.length && line.charAt(k) === ' ') {
-      line = line.substring(k + 1);
-      heading = true;
-    } else if (line.charAt(0) === '|') {
-      tableRow = true;
-    }
-    if (heading || tableRow) {
-      out.push(new InlineChunk(line + lineEnd, heading, tableRow));
-      continue;
-    }
-    let buf: string = '';
-    let bold: boolean = false;
-    let code: boolean = false;
-    let i: number = 0;
-    const flush = (): void => {
-      if (buf.length > 0) {
-        out.push(new InlineChunk(buf, bold, code));
-        buf = '';
-      }
-    };
-    while (i < line.length) {
-      const c: string = line.charAt(i);
-      if (!code && c === '*' && line.charAt(i + 1) === '*') {
-        flush();
-        bold = !bold;
-        i += 2;
-        continue;
-      }
-      if (c === '`') {
-        flush();
-        code = !code;
-        i += 1;
-        continue;
-      }
-      buf += c;
-      i += 1;
-    }
-    flush();
-    if (lineEnd.length > 0) {
-      out.push(new InlineChunk(lineEnd, false, false));
-    }
-  }
-  return out;
-}
-
-/** 剥掉代码段首行的语言标记（如 ts / bash / json），返回剩余代码文本。 */
-function stripLangLine(seg: string): string {
-  const nl: number = seg.indexOf('\n');
-  if (nl < 0 || nl > 12) {
-    return seg;
-  }
-  const head: string = seg.substring(0, nl).trim();
-  if (head.length === 0 || head.length > 12) {
-    return seg;
-  }
-  for (let i: number = 0; i < head.length; i++) {
-    const c: string = head.charAt(i);
-    const ok: boolean = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-      (c >= '0' && c <= '9') || c === '+' || c === '#' || c === '-' || c === '_';
-    if (!ok) {
-      return seg;
-    }
-  }
-  return seg.substring(nl + 1);
-}
-
-/** 单条消息气泡（含代码分段渲染）。 */
+/** 单条消息气泡（agent 消息用 lv-markdown-in 渲染 markdown）。 */
 @ComponentV2
 struct MessageBubble {
   @Require @Param item: ChatItem;
-
-  /**
-   * 按 ``` 围栏切段：偶数段=正文，奇数段=代码（等宽字体 + bg_layer_2 底）。
-   * build 中经方法读取 item.text（@Trace），增量到达自动重建分段。
-   * 代码段首行若只是语言标记（如 ts / bash）则剥掉，不占正文高度。
-   */
-  private segsOf(): string[] {
-    const t: string = this.item.text;
-    if (t.indexOf('```') < 0) {
-      return [t];
-    }
-    const raw: string[] = t.split('```');
-    for (let i: number = 1; i < raw.length; i += 2) {
-      raw[i] = stripLangLine(raw[i]);
-    }
-    return raw;
-  }
-
-  @Builder
-  segView(seg: string, idx: number) {
-    if (idx % 2 === 1) {
-      Text(seg)
-        .fontFamily('monospace')
-        .fontSize(13)
-        .fontColor($r('app.color.label_primary'))
-        .width('100%')
-        .padding({ left: SP_2, right: SP_2, top: SP_2, bottom: SP_2 })
-        .margin({ top: SP_1, bottom: SP_1 })
-        .backgroundColor($r('app.color.bg_layer_2'))
-        .borderRadius(RADIUS_CTRL)
-    } else {
-      // 正文段：轻量内联 markdown（粗体/行内代码/标题/表格行），Span 流式排版
-      Text() {
-        Repeat(chunksOf(seg))
-          .each((cell: RepeatItem<InlineChunk>): void => {
-            Span(cell.item.text)
-              .fontSize(cell.item.code ? 13 : FS_BODY)
-              .fontFamily(cell.item.code ? 'monospace' : 'default')
-              .fontWeight(cell.item.bold ? FontWeight.Bold : FontWeight.Normal)
-              .fontColor($r('app.color.label_primary'))
-          })
-          .key((c: InlineChunk, i: number): string => i.toString())
-      }
-      .width('100%')
-    }
-  }
+  /** 共享的 markdown 渲染控制器（DSH 风格配色，页面级创建后下传）。 */
+  @Require @Param mdController: MarkdownController;
 
   build() {
     Column() {
@@ -203,15 +63,15 @@ struct MessageBubble {
         .justifyContent(FlexAlign.End)
         .margin({ top: SP_1, bottom: SP_1 })
       } else {
-        // 助手：左对齐浅面卡片。Column 用定宽 82%（消除循环百分比），
-        // 内部 Text width('100%') 有确定父宽可换行；内容左对齐。
+        // 助手：左对齐浅面卡片 + lv-markdown-in 渲染（标题/列表/表格/代码块/行内代码/
+        // 引用/分割线全支持；text 随流式增量更新，库侧 @Prop 响应）。
         Row() {
           Column() {
-            Repeat(this.segsOf())
-              .each((cell: RepeatItem<string>): void => {
-                this.segView(cell.item, cell.index)
-              })
-              .key((s: string, i: number): string => i.toString())
+            Markdown({
+              text: this.item.text,
+              controller: this.mdController
+            })
+              .width('100%')
             if (this.item.streaming) {
               Text('▍')
                 .fontSize(FS_BODY)
@@ -267,8 +127,50 @@ export struct SessionDetailPage {
   @Local sessionId: string = '';
   @Local draft: string = '';
   private scroller: Scroller = new Scroller();
+  /** markdown 渲染控制器（DSH 风格配色，深浅色随系统资源自动适配）。 */
+  private mdCtrl: MarkdownController = new MarkdownController();
+
+  /**
+   * markdown 渲染样式：全部走 app.color 资源（深浅色自动适配），
+   * 视觉口径对齐 DSH 自身主题（背景层/描边/标签层级）。
+   */
+  private setupMarkdownTheme(): void {
+    try {
+      this.mdCtrl
+        .setTextColor($r('app.color.label_primary'))
+        .setTitleColor($r('app.color.label_primary'))
+        .setTextSize(FS_BODY)
+        // setTitleSize 收 6 元组（h1..h6），单值不合法
+        .setTitleSize([FS_SUBTITLE, FS_SUBTITLE, FS_SUBTITLE, FS_SUBTITLE, FS_SUBTITLE, FS_SUBTITLE])
+        .setTextLineHeight(22)
+        .setInlineCodeColor($r('app.color.label_primary'))
+        .setInlineCodeBackgroundColor($r('app.color.bg_layer_2'))
+        .setInlineCodeBackgroundRadius(4)
+        .setQuoteBackgroundColor($r('app.color.bg_layer_2'))
+        .setQuoteTextColor($r('app.color.label_secondary'))
+        .setQuoteBorderColor($r('app.color.border_l1'))
+        .setQuoteBorderRadius(RADIUS_CTRL)
+        .setHyperlinkTextColor($r('app.color.brand_label'))
+        .setTableBackgroundColor($r('app.color.bg_layer_2'))
+        .setTableTitleBackgroundColor($r('app.color.bg_layer_1'))
+        .setTableTitleTextColor($r('app.color.label_primary'))
+        .setTableOuterBorderColor($r('app.color.border_l1'))
+        .setTableInnerBorderColor($r('app.color.border_l1'))
+        .setTableBorderRadius(RADIUS_CTRL)
+        .setLineColor($r('app.color.border_l1'))
+        .setFootnoteTextColor($r('app.color.label_secondary'))
+        .setCodeBlockBorderRadius(RADIUS_CTRL)
+        .setTextSelectionEnable(true);
+      // 以下两个返回 void（不能链式），单独调用
+      this.mdCtrl.setTableNormalTextColor($r('app.color.label_primary'));
+      this.mdCtrl.setTableInterleaveTextColor($r('app.color.label_secondary'));
+    } catch (err) {
+      // 样式设置失败不影响渲染（库会走默认主题）
+    }
+  }
 
   aboutToAppear(): void {
+    this.setupMarkdownTheme();
     // 路由参数由 hrouter 传递（routes.openSessionDetail 的 param → 本页 getParams）。
     this.readRouteParams();
     if (this.sessionId.length > 0) {
@@ -483,7 +385,7 @@ export struct SessionDetailPage {
           } else {
             Repeat(this.store.messages)
               .each((cell: RepeatItem<ChatItem>): void => {
-                MessageBubble({ item: cell.item })
+                MessageBubble({ item: cell.item, mdController: this.mdCtrl })
               })
               .key((m: ChatItem): string => m.id)
           }

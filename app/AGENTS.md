@@ -73,3 +73,10 @@ grep -rnE "@State|@Prop|@Link|@ObjectLink|@Observed[^V]|@Provide|@Consume|@Watch
   `model/routes.ets`，禁页面直接 pushPath；详情页取参用 `HRouter.getParams`（onAppear 兜底重读）；
   生命周期用 `HRouter.registerLifecycle`。`hvigorfile.ts` 里的 `hrouterCompat` 垫片
   （hvigor 26 无 getRootProject）与手补的空 `service_map.json` 都是**必需**的，勿删。
+- `@luvi/lv-markdown-in@3.4.7`（用户指定）：**agent 消息的 markdown 渲染**。用法——
+  详情页 `SessionDetailPage.setupMarkdownTheme()` 建一个 `MarkdownController`（DSH 配色，
+  全部 `$r('app.color.*')` 深浅色自动适配），下传给 `MessageBubble` 的
+  `@Require @Param mdController`，助手气泡内 `Markdown({ text: this.item.text, controller })`。
+  **禁自写 markdown 解析**（曾经的 InlineChunk/chunksOf 手写实现已删除）。
+  签名坑：`setTitleSize` 收 **6 元组**（h1..h6）不收单值；`setTableNormalTextColor` /
+  `setTableInterleaveTextColor` **返回 void**（不能链式，单独调）。

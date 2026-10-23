@@ -10,12 +10,14 @@ import { Markdown, MarkdownController } from '@luvi/lv-markdown-in';
 import { promptAction } from '@kit.ArkUI';
 import { HRouter } from 'hrouter';
 import { dshrcLink } from '../model/link';
-import { SessionDetailParam, goBack } from '../model/routes';
+import { SessionDetailParam, goBack, openSessionDetail } from '../model/routes';
 import {
   ApprovalCard,
   ChatItem,
   QuestionCard,
+  SessionRow,
   SessionStore,
+  SubagentRow,
   sessionStore
 } from '../model/sessionstore';
 import {
@@ -36,6 +38,47 @@ import {
 } from '../model/theme';
 import { ApprovalCardView, QuestionCardView } from './AskCards';
 
+
+/** 子代理目录 chip（契约 §5.6 v1.0.5；点击进入子代理详情）。 */
+@ComponentV2
+struct SubagentChip {
+  @Require @Param row: SubagentRow;
+  @Event onOpen: (sessionId: string) => void;
+
+  build() {
+    Row() {
+      if (this.row.running) {
+        Circle({ width: 6, height: 6 }).fill($r('app.color.brand_fill'))
+      } else {
+        Circle({ width: 6, height: 6 }).fill($r('app.color.label_tertiary'))
+      }
+      Text(this.row.displayName())
+        .fontSize(FS_SMALL)
+        .fontColor($r('app.color.label_primary'))
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+        .constraintSize({ maxWidth: 140 })
+        .margin({ left: 5 })
+      if (this.row.isOneShot()) {
+        Text('一次性')
+          .fontSize(10)
+          .fontColor($r('app.color.label_secondary'))
+          .padding({ left: 6, right: 6, top: 1, bottom: 1 })
+          .margin({ left: SP_1 })
+          .borderRadius(RADIUS_PILL)
+          .backgroundColor($r('app.color.bg_layer_2'))
+      }
+    }
+    .padding({ left: SP_3, right: SP_3, top: SP_1 + 2, bottom: SP_1 + 2 })
+    .borderRadius(RADIUS_PILL)
+    .backgroundColor($r('app.color.bg_layer_2'))
+    .border({ width: HAIRLINE, color: $r('app.color.border_l1') })
+    .alignItems(VerticalAlign.Center)
+    .onClick((): void => {
+      this.onOpen(this.row.sessionId);
+    })
+  }
+}
 
 /** 单条消息气泡（agent 消息用 lv-markdown-in 渲染 markdown）。 */
 @ComponentV2
@@ -177,6 +220,8 @@ export struct SessionDetailPage {
       this.store.openSession(this.sessionId);
       // 契约 §5.1 v1.0.4：先拉最新一页历史消息（修复打开历史会话空白）
       this.store.loadHistory(this.sessionId, false);
+      // 契约 §5.6 v1.0.5：根会话拉子代理目录（详情页子代理入口区数据）
+      this.maybeLoadSubagents();
     }
     // onAppear 兜底：万一 aboutToAppear 时 wrapper onReady 尚未回填 contextMap（真机时序差异），
     // 组件上树后再补读一次参数。
@@ -196,9 +241,28 @@ export struct SessionDetailPage {
           this.store.openSession(this.sessionId);
           // 重进页面补拉最新一页（store 内按 seq 去重，不会重复显示）
           this.store.loadHistory(this.sessionId, false);
+          this.maybeLoadSubagents();
         }
       }
     });
+  }
+
+  /** 当前会话是否 subagent（父目录 mode 判断用）。 */
+  private isSubagentView(): boolean {
+    const row: SessionRow | undefined = this.store.rowOf(this.sessionId);
+    return row !== undefined && row.isSubagent();
+  }
+
+  /** 根会话时拉子代理目录（subagent 详情页不拉——孙代入口在子代理详情里同样适用，
+   *  但当前会话行若也是根…… 简化：只要不是 blank 都拉，目录空则入口区隐藏）。 */
+  private maybeLoadSubagents(): void {
+    this.store.loadSubagents(this.sessionId);
+  }
+
+  /** 当前 subagent 会话的 mode（父目录缓存里查；查不到按 continuable 处理，发送失败有 toast）。 */
+  private subagentMode(): string {
+    const cached: string = this.store.subagentModeOf(this.sessionId);
+    return cached.length > 0 ? cached : 'continuable';
   }
 
   /** 从 hrouter 路由上下文读取 sessionId（幂等）。 */
@@ -228,7 +292,7 @@ export struct SessionDetailPage {
     }
   }
 
-  /** 发送提示词（乐观上屏 + session.prompt）。 */
+  /** 发送提示词（乐观上屏；根会话走 session.prompt，subagent 走 session.subagentPrompt §5.1 v1.0.5）。 */
   private send(): void {
     const text: string = this.draft.trim();
     if (text.length === 0 || this.sessionId.length === 0) {
@@ -238,9 +302,14 @@ export struct SessionDetailPage {
       promptAction.showToast({ message: '未连接，请先在配对页连接中继', duration: 2500 });
       return;
     }
+    const row: SessionRow | undefined = this.store.rowOf(this.sessionId);
+    const parent: string = row !== undefined ? row.parentSessionId : '';
     this.store.pushLocalUser(this.sessionId, text);
     this.draft = '';
-    dshrcLink.sessionPrompt(this.sessionId, text).then((accepted: boolean): void => {
+    const sent: Promise<boolean> = parent.length > 0 ?
+      dshrcLink.subagentPrompt(parent, this.sessionId, text) :
+      dshrcLink.sessionPrompt(this.sessionId, text);
+    sent.then((accepted: boolean): void => {
       if (!accepted) {
         promptAction.showToast({ message: '主机未接受该提示词', duration: 2500 });
       }
@@ -250,11 +319,16 @@ export struct SessionDetailPage {
     this.scroller.scrollEdge(Edge.Bottom);
   }
 
-  /** 取消当前 turn。 */
+  /** 取消当前 turn（subagent 走 session.subagentCancel §5.1 v1.0.5）。 */
   private cancelTurn(): void {
-    dshrcLink.sessionCancel(this.sessionId).then((cancelled: boolean): void => {
+    const row: SessionRow | undefined = this.store.rowOf(this.sessionId);
+    const parent: string = row !== undefined ? row.parentSessionId : '';
+    const cancelled: Promise<boolean> = parent.length > 0 ?
+      dshrcLink.subagentCancel(parent, this.sessionId) :
+      dshrcLink.sessionCancel(this.sessionId);
+    cancelled.then((ok: boolean): void => {
       promptAction.showToast({
-        message: cancelled ? '已请求取消' : '主机未接受取消请求',
+        message: ok ? '已请求取消' : '主机未接受取消请求',
         duration: 2000
       });
     }).catch((e: Error): void => {
@@ -355,6 +429,35 @@ export struct SessionDetailPage {
     .margin({ bottom: SP_1 })
   }
 
+  /** 子代理目录入口区（契约 §5.6 v1.0.5；根会话详情顶部，有子代理才显示）。 */
+  @Builder
+  subagentBar() {
+    Scroll() {
+      Row({ space: SP_2 }) {
+        Text('子代理')
+          .fontSize(FS_SMALL)
+          .fontWeight(FontWeight.Medium)
+          .fontColor($r('app.color.label_secondary'))
+          .alignSelf(ItemAlign.Center)
+        Repeat(this.store.activeSubagents)
+          .each((cell: RepeatItem<SubagentRow>): void => {
+            SubagentChip({
+              row: cell.item,
+              onOpen: (sid: string): void => {
+                openSessionDetail(sid);
+              }
+            })
+          })
+          .key((r: SubagentRow): string => r.sessionId)
+      }
+      .alignItems(VerticalAlign.Center)
+    }
+    .scrollable(ScrollDirection.Horizontal)
+    .scrollBar(BarState.Off)
+    .width('100%')
+    .padding({ left: SP_4, right: SP_4, top: SP_1, bottom: SP_1 })
+  }
+
   @Builder
   emptyState() {
     Column() {
@@ -374,6 +477,9 @@ export struct SessionDetailPage {
     // NavDestination 外壳由 hrouter-compiler 生成的 wrapper 提供。
     Column() {
       this.topBar()
+      if (this.store.activeSubagents.length > 0) {
+        this.subagentBar()
+      }
 
       Scroll(this.scroller) {
         Column() {
@@ -422,8 +528,21 @@ export struct SessionDetailPage {
         .scrollBar(BarState.Off)
       }
 
-      // 输入条
-      Row() {
+      // 输入条：one-shot 子代理只读（契约 §5.6：一次性子代理不能发消息），其余正常
+      if (this.isSubagentView() && this.subagentMode() === 'one-shot') {
+        Row() {
+          Text(' ⓘ 一次性子代理 · 仅查看')
+            .fontSize(FS_SMALL)
+            .fontColor($r('app.color.label_secondary'))
+            .width('100%')
+            .textAlign(TextAlign.Center)
+        }
+        .width('100%')
+        .padding({ left: SP_3, right: SP_3, top: SP_3, bottom: SP_4 })
+        .backgroundColor($r('app.color.bg_layer_1'))
+        .border({ width: HAIRLINE, color: $r('app.color.border_l1') })
+      } else {
+        Row() {
         TextArea({ text: this.draft, placeholder: '输入提示词，Enter 发送…' })
           .onChange((v: string): void => {
             this.draft = v;
@@ -471,6 +590,7 @@ export struct SessionDetailPage {
       .padding({ left: SP_3, right: SP_3, top: SP_3, bottom: SP_4 })
       .backgroundColor($r('app.color.bg_layer_1'))
       .border({ width: HAIRLINE, color: $r('app.color.border_l1') })
+      }
     }
     .width('100%')
     .height('100%')

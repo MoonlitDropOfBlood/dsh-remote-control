@@ -111,8 +111,11 @@ dshrc://pair?r=<encodeURIComponent(relayUrl)>&c=<channel>&s=<secret>[&t=<encodeU
 | type | payload | 响应 value | 说明 |
 |---|---|---|---|
 | `hello` | `{proto:1, clientName, appVersion, pushToken?, sig}` | `{hostName, dshVersion, pluginVersion}` | 连接/重连后首条；`sig` 见 §3.4 |
-| `session.list` | `{includeArchived?:bool}` | `{sessions:[SessionSummary]}` | SessionSummary 见 §5.3 |
-| `session.history` | `{sessionId, beforeSeq?:number, maxMessages?:number}` | `{messages:[ChatMessage], hasMore, oldestSeq}` | **v1.0.4** 向后翻页的历史消息；`beforeSeq` 缺省取最新一页。ChatMessage：`{id, role:"user"\|"assistant", text, ts, seq}` |
+| `session.list` | `{}` | `{sessions:[SessionSummary]}` | SessionSummary 见 §5.3（**v1.0.5 移除 includeArchived**：Host 会话域无归档概念，归档属 Workspace 注册表） |
+| `session.history` | `{sessionId, beforeSeq?:number, maxMessages?:number}` | `{messages:[ChatMessage], hasMore, oldestSeq}` | **v1.0.4** 向后翻页的历史消息；`beforeSeq` 缺省取最新一页。ChatMessage：`{id, role:"user"\|"assistant", text, ts, seq}`。subagent 会话自动走 durable subagent 地址 |
+| `session.subagents` | `{sessionId}` | `{subagents:[SubagentInfo]}` | **v1.0.5** 父会话的直接子代理目录（父会话 `subagentCatalog` 投影 + 运行态）。SubagentInfo 见 §5.6 |
+| `session.subagentPrompt` | `{parentSessionId, childSessionId, text}` | `{accepted:bool}` | **v1.0.5** 向 **continuable** 子代理发消息（delivery:'queue'）；one-shot 子代理返回 `unsupported` 错误。回复走同一事件流（sessionId=child） |
+| `session.subagentCancel` | `{parentSessionId, childSessionId}` | `{accepted:bool}` | **v1.0.5** 取消 continuable 子代理当前 turn（interruptByParent；accepted=信号已受理，非已停止） |
 | `session.create` | `{title?, cwd?}` | `{sessionId}` | cwd 缺省用主机默认工作目录 |
 | `session.prompt` | `{sessionId, text}` | `{accepted:bool}` | 立即返回；实际回复走事件流 |
 | `session.cancel` | `{sessionId}` | `{cancelled:bool}` | 取消当前运行的 turn |
@@ -143,16 +146,25 @@ dshrc://pair?r=<encodeURIComponent(relayUrl)>&c=<channel>&s=<secret>[&t=<encodeU
 
 ```json
 { "sessionId": "…", "title": "…", "cwd": "…",
-  "running": false, "updatedAt": 1760000000000, "archived": false,
+  "running": false, "updatedAt": 1760000000000,
   "origin": "subagent", "parentSessionId": "…", "blank": false }
 ```
 
 **v1.0.4 补充字段**（Host `SessionSummary` 原生字段，插件必须透传）：
-- `origin:"subagent"`：subagent 会话标记。**客户端显示规则**：默认列表隐藏 subagent 会话，
-  放入「子代理」筛选项并加徽标；不得与根会话混排刷屏。
+- `origin:"subagent"`：subagent 会话标记。
 - `parentSessionId`：fork/spawn 血缘（subagent 会话=父会话 id）；根会话缺省。
 - `blank:true`：尚无对话的空会话——**客户端应直接隐藏**（DSH 官方语义：
   clients hide blank Sessions from lists）。
+
+**v1.0.5 移除 `archived` 字段**：Host 会话域没有归档概念（归档是 Workspace
+注册表/dsh-archive-manager 的领域，sessionController.list 永远不回归档标记）。
+客户端会话列表**不再有任何归档筛选**。
+
+**v1.0.5 客户端列表显示规则**（替代 v1.0.4 的「子代理筛选页签」方案）：
+- 列表只显示**根会话**（无 `parentSessionId` 且 `origin!=="subagent"`）且非 blank，
+  updatedAt 降序；subagent 会话**不出现在列表**。
+- subagent 的入口在**会话详情页内**：父会话详情页展示 `session.subagents` 返回的
+  直接子代理目录（见 §5.6），点击进入子代理详情（历史只读/可续聊按 mode 区分）。
 
 ### 5.4 Question（ask_user_question 结构）
 
@@ -174,6 +186,24 @@ dshrc://pair?r=<encodeURIComponent(relayUrl)>&c=<channel>&s=<secret>[&t=<encodeU
 - 参考实现范式：`D:/ai-projects/dsh/dsh-agent-approval/index.js` 中
   `ctx.on("approval/request", (req,next)=>…, {prepend:true})` 的写法（`req.agent` / `req.toolName` /
   `req.reason` / `req.callId` / `req.signal`，返回值为 ApprovalOutcome 字符串）。
+
+### 5.6 SubagentInfo（v1.0.5）
+
+`session.subagents` 响应行（来源：父会话 `subagentCatalog` 投影 + list 运行态组合）：
+
+```json
+{ "sessionId": "…", "label": "fix-login", "mode": "continuable",
+  "running": false, "hasChildren": false, "createdAt": 1760000000000 }
+```
+
+- `mode:"one-shot"`：一次性子代理——**客户端必须隐藏输入条**（仅供查看历史；
+  向其发消息会被宿主拒绝）。
+- `mode:"continuable"`：可持续子代理——可发消息（`session.subagentPrompt`）与取消
+  （`session.subagentCancel`）。
+- `label`：创建时的名称（one-shot 可能缺省 → 客户端用 sessionId 前 8 位兜底）。
+- `running`/`hasChildren`：运行态/是否有孙代（客户端可再下钻）。
+- 事件流（`assistant.delta`/`turn.end`/`session.status` 等）以子代理 sessionId
+  寻址，与普通会话一致——子代理详情页天然可复用流式渲染。
 
 ## 6. Push Kit（华为推送）旁路
 

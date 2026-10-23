@@ -26,6 +26,7 @@ import {
   DshrcMsg,
   DshrcQuestion,
   DshrcSessionSummary,
+  DshrcSubagentInfo,
   DshrcChatMessage,
   DshrcHistoryPage,
   DshrcValue,
@@ -49,7 +50,8 @@ const PREF_NAME: string = 'dshrc_prefs';
 const KEY_PUSH_ENABLED: string = 'pushEnabled';
 const LOG_KEEP: number = 80;
 
-/** 会话列表一行（契约 §5.3 SessionSummary 的可观察形态；v1.0.4 补 subagent/blank 三字段）。 */
+/** 会话列表一行（契约 §5.3 SessionSummary 的可观察形态；v1.0.4 补 subagent/blank，
+ *  v1.0.5 删 archived——列表不再有归档筛选，subagent 不进列表）。 */
 @ObservedV2
 export class SessionRow {
   @Trace sessionId: string = '';
@@ -57,7 +59,6 @@ export class SessionRow {
   @Trace cwd: string = '';
   @Trace running: boolean = false;
   @Trace updatedAt: number = 0;
-  @Trace archived: boolean = false;
   @Trace origin: string = ''; // "subagent" | ""（Host 原生字段透传）
   @Trace parentSessionId: string = ''; // fork/spawn 血缘（subagent 会话=父会话 id）
   @Trace blank: boolean = false; // 尚无对话的空会话（列表一律隐藏，DSH 官方语义）
@@ -73,16 +74,44 @@ export class SessionRow {
     this.cwd = s.cwd;
     this.running = s.running;
     this.updatedAt = s.updatedAt;
-    this.archived = s.archived;
     // v1.0.4 三字段（旧插件不发时按空/false 处理，向后兼容）
     this.origin = s.origin !== undefined ? s.origin : '';
     this.parentSessionId = s.parentSessionId !== undefined ? s.parentSessionId : '';
     this.blank = s.blank === true;
   }
 
-  /** subagent 会话（origin 标记或有父会话血缘）→ 进「子代理」筛选，不与根会话混排。 */
+  /** subagent 会话（origin 标记或有父会话血缘）→ 不进列表，入口在父会话详情页。 */
   isSubagent(): boolean {
     return this.origin === 'subagent' || this.parentSessionId.length > 0;
+  }
+}
+
+/** 父会话详情页的子代理目录一行（契约 §5.6 SubagentInfo，v1.0.5）。 */
+@ObservedV2
+export class SubagentRow {
+  @Trace sessionId: string = '';
+  @Trace label: string = '';
+  @Trace mode: string = ''; // "one-shot" | "continuable"
+  @Trace running: boolean = false;
+  @Trace hasChildren: boolean = false;
+  @Trace createdAt: number = 0;
+
+  constructor(info: DshrcSubagentInfo) {
+    this.sessionId = info.sessionId;
+    this.label = info.label;
+    this.mode = info.mode;
+    this.running = info.running;
+    this.hasChildren = info.hasChildren;
+    this.createdAt = info.createdAt;
+  }
+
+  /** 显示名：label 空时用 sessionId 前 8 位兜底（契约 §5.6）。 */
+  displayName(): string {
+    return this.label.length > 0 ? this.label : this.sessionId.substring(0, 8);
+  }
+
+  isOneShot(): boolean {
+    return this.mode === 'one-shot';
   }
 }
 
@@ -216,6 +245,8 @@ export class SessionStore {
   @Trace historyLoading: boolean = false;
   @Trace historyHasMore: boolean = false;
   @Trace historyLoaded: boolean = false;
+  // ---- 子代理目录（契约 §5.6 v1.0.5；活动会话投影 + 每父会话缓存）----
+  @Trace activeSubagents: SubagentRow[] = [];
   // ---- 审批 / 提问（契约 §5.5）----
   @Trace approvals: ApprovalCard[] = [];
   @Trace questions: QuestionCard[] = [];
@@ -288,7 +319,7 @@ export class SessionStore {
       return Promise.resolve();
     }
     this.refreshing = true;
-    return this.link.sessionList(false).then((list: DshrcSessionSummary[]): void => {
+    return this.link.sessionList().then((list: DshrcSessionSummary[]): void => {
       this.applySessionList(list);
       this.refreshing = false;
     }).catch((e: Error): void => {
@@ -363,6 +394,7 @@ export class SessionStore {
       return;
     }
     this.activeId = sid;
+    this.projectSubagents(sid);
     if (sid.length === 0) {
       this.messages = [];
       this.historyHasMore = false;
@@ -397,6 +429,59 @@ export class SessionStore {
    * prepend=false：详情页打开时拉最新一页；prepend=true：列表顶部「加载更早消息」向前翻页
    * （beforeSeq 回传上一页的 oldestSeq，开区间）。
    */
+  /** session.subagents 结果缓存（key=父会话 id；Map 内部变化不触发 UI，投影走 activeSubagents）。 */
+  private subagentCache: Map<string, SubagentRow[]> = new Map<string, SubagentRow[]>();
+  private subagentLoading: boolean = false;
+
+  /**
+   * session.subagents（§5.1 v1.0.5）：父会话直接子代理目录。
+   * 永不 reject：失败静默（目录区隐藏即可，不打扰聊天）；结果写缓存并在
+   * 目标为当前活动会话时投影到 activeSubagents（详情页子代理入口区直接读）。
+   */
+  loadSubagents(parentSid: string): Promise<void> {
+    if (parentSid.length === 0 || this.link.getState() !== 'online' || this.subagentLoading) {
+      return Promise.resolve();
+    }
+    this.subagentLoading = true;
+    return this.link.sessionSubagents(parentSid).then((list: DshrcSubagentInfo[]): void => {
+      const rows: SubagentRow[] = [];
+      for (let i: number = 0; i < list.length; i++) {
+        rows.push(new SubagentRow(list[i]));
+      }
+      this.subagentCache.set(parentSid, rows);
+      if (parentSid === this.activeId) {
+        this.activeSubagents = rows.slice();
+      }
+      this.subagentLoading = false;
+    }).catch((e: Error): void => {
+      this.subagentLoading = false;
+      logDshrc(TAG, 'warn', 'session.subagents failed: ' + e.message);
+    });
+  }
+
+  /** 打开会话时同步子代理目录投影（openSession 调用；缓存缺失时由页面触发 loadSubagents）。 */
+  private projectSubagents(sid: string): void {
+    const cached: SubagentRow[] | undefined = this.subagentCache.get(sid);
+    this.activeSubagents = cached !== undefined ? cached.slice() : [];
+  }
+
+  /** 查某子代理会话在其父目录里的 mode（详情页判断 one-shot 用；查不到回空串）。 */
+  subagentModeOf(childSid: string): string {
+    for (const rows of this.subagentCache.values()) {
+      for (let i: number = 0; i < rows.length; i++) {
+        if (rows[i].sessionId === childSid) {
+          return rows[i].mode;
+        }
+      }
+    }
+    return '';
+  }
+
+  /** 当前会话行（summaries 里查；subagent 详情页用它拿 parentSessionId）。 */
+  rowOf(sid: string): SessionRow | undefined {
+    return this.findRow(sid);
+  }
+
   loadHistory(sid: string, prepend: boolean): Promise<void> {
     if (sid.length === 0 || this.link.getState() !== 'online' || this.historyLoading) {
       return Promise.resolve();

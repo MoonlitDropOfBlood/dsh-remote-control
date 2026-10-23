@@ -80,3 +80,14 @@ grep -rnE "@State|@Prop|@Link|@ObjectLink|@Observed[^V]|@Provide|@Consume|@Watch
   **禁自写 markdown 解析**（曾经的 InlineChunk/chunksOf 手写实现已删除）。
   签名坑：`setTitleSize` 收 **6 元组**（h1..h6）不收单值；`setTableNormalTextColor` /
   `setTableInterleaveTextColor` **返回 void**（不能链式，单独调）。
+
+## 会话列表与子代理显示规则（契约 §5.3/§5.6 v1.0.5）
+
+- **列表无筛选**：只显示根会话（无 parentSessionId 且 origin!=='subagent'）非 blank，
+  updatedAt 降序。归档概念已从 wire 删除（Host 会话域无归档），勿再加归档 UI。
+- **subagent 不进列表**：入口在父会话详情页顶部的「子代理」目录区
+  （`store.activeSubagents`，SubagentChip 横向滚动；running 圆点 + label + 一次性角标），
+  点击进子代理详情（session.history 已支持 subagent 地址，流式事件按 child id 寻址天然工作）。
+- **one-shot 子代理只读**：详情页输入条整条隐藏，替换为「一次性子代理 · 仅查看」说明行；
+  continuable 正常输入（发送自动走 `session.subagentPrompt`，取消走 `session.subagentCancel`——
+  详情页 send()/cancelTurn() 按 rowOf(sid).parentSessionId 分流，勿绕过）。

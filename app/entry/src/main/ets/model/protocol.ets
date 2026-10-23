@@ -9,7 +9,7 @@
 export const PROTO_VERSION: number = 1;
 
 /** 协议契约文档版本（v1.0.4：§5.1 session.history、§5.3 SessionSummary 补 origin/parentSessionId/blank；关于页展示用）。 */
-export const CONTRACT_VERSION: string = 'v1.0.4';
+export const CONTRACT_VERSION: string = 'v1.0.5';
 
 /** 角色：host = PC 端 DSH 插件；client = 本 App。 */
 export const ROLE_HOST: string = 'host';
@@ -62,6 +62,9 @@ export const TAG_LEN: number = 16;
 export const MSG_HELLO: string = 'hello';
 export const MSG_SESSION_LIST: string = 'session.list';
 export const MSG_SESSION_HISTORY: string = 'session.history'; // v1.0.4：历史消息翻页
+export const MSG_SESSION_SUBAGENTS: string = 'session.subagents'; // v1.0.5：父会话子代理目录
+export const MSG_SESSION_SUBAGENT_PROMPT: string = 'session.subagentPrompt'; // v1.0.5：向 continuable 子代理发消息
+export const MSG_SESSION_SUBAGENT_CANCEL: string = 'session.subagentCancel'; // v1.0.5：取消子代理当前 turn
 export const MSG_SESSION_CREATE: string = 'session.create';
 export const MSG_SESSION_PROMPT: string = 'session.prompt';
 export const MSG_SESSION_CANCEL: string = 'session.cancel';
@@ -119,7 +122,6 @@ export interface DshrcPayload {
   dshVersion?: string;
   pluginVersion?: string;
   // session.*（§5.1）
-  includeArchived?: boolean;
   sessions?: DshrcSessionSummary[];
   sessionId?: string;
   title?: string;
@@ -130,6 +132,10 @@ export interface DshrcPayload {
   // session.history（§5.1 v1.0.4）
   beforeSeq?: number;
   maxMessages?: number;
+  // session.subagents / subagentPrompt / subagentCancel（§5.1 v1.0.5）
+  subagents?: DshrcSubagentInfo[];
+  parentSessionId?: string;
+  childSessionId?: string;
   // approval / question（§5.1）
   askId?: string;
   decision?: string;
@@ -186,6 +192,8 @@ export interface DshrcValue {
   messages?: DshrcChatMessage[];
   hasMore?: boolean;
   oldestSeq?: number;
+  // session.subagents（§5.1 v1.0.5）：子代理目录
+  subagents?: DshrcSubagentInfo[];
 }
 
 /** session.history 的单条历史消息（契约 §5.1 v1.0.4 ChatMessage）。 */
@@ -224,18 +232,28 @@ export interface DshrcQuestion {
   options?: DshrcQuestionOption[];
 }
 
-/** SessionSummary（契约 §5.3；v1.0.4 补充 origin/parentSessionId/blank，Host 原生字段透传）。 */
+/** SessionSummary（契约 §5.3；v1.0.4 补 origin/parentSessionId/blank；
+ *  v1.0.5 删 archived——Host 会话域无归档概念，列表不再有归档筛选）。 */
 export interface DshrcSessionSummary {
   sessionId: string;
   title: string;
   cwd: string;
   running: boolean;
   updatedAt: number;
-  archived: boolean;
   // v1.0.4：subagent 标记 / fork-spawn 血缘 / 空会话（旧插件缺省时按空处理）
   origin?: string; // "subagent" | ""
   parentSessionId?: string;
   blank?: boolean;
+}
+
+/** SubagentInfo（契约 §5.6 v1.0.5）：session.subagents 的目录行。 */
+export interface DshrcSubagentInfo {
+  sessionId: string;
+  label: string; // 创建名（可空串 → UI 用 sessionId 前 8 位兜底）
+  mode: string; // "one-shot" | "continuable"
+  running: boolean;
+  hasChildren: boolean;
+  createdAt: number;
 }
 
 /**

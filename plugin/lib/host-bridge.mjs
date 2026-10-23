@@ -42,8 +42,10 @@ function dshVersion() {
 }
 
 /** 契约 §5.3 SessionSummary ← Host SessionSummary（title 来自投影）。
- * v1.0.4：透传 Host 原生 origin/parentSessionId/blank（§5.3 客户端据此做
- * subagent 分组与 blank 隐藏；wire 字段名与 Host 逐字一致）。 */
+ * v1.0.4：透传 Host 原生 origin/parentSessionId/blank（§5.3 客户端据此隐藏
+ * subagent 行与 blank 会话；wire 字段名与 Host 逐字一致）。
+ * v1.0.5：删 archived——Host 会话域无归档概念（归档属 Workspace 注册表），
+ * 之前的常量 false 是纯误导。 */
 function mapSummary(raw) {
   const values = raw?.projections?.values;
   const title = values && typeof values.title === "string" ? values.title : "";
@@ -53,7 +55,6 @@ function mapSummary(raw) {
     cwd: typeof raw?.cwd === "string" ? raw.cwd : "",
     running: raw?.running === true,
     updatedAt: typeof raw?.updatedAt === "number" ? raw.updatedAt : 0,
-    archived: false,
     origin: raw?.origin === "subagent" ? "subagent" : "",
     parentSessionId: typeof raw?.parentSessionId === "string" ? raw.parentSessionId : "",
     blank: raw?.blank === true,
@@ -365,6 +366,12 @@ export class HostBridge {
           return await this.#rSessionList(m);
         case "session.history":
           return await this.#rSessionHistory(m);
+        case "session.subagents":
+          return await this.#rSessionSubagents(m);
+        case "session.subagentPrompt":
+          return await this.#rSubagentPrompt(m);
+        case "session.subagentCancel":
+          return await this.#rSubagentCancel(m);
         case "session.create":
           return await this.#rSessionCreate(m);
         case "session.prompt":
@@ -523,6 +530,147 @@ export class HostBridge {
       this.#reply(m, resultOf(m, { messages, hasMore: page?.hasMore === true, oldestSeq }));
     } catch (e) {
       this.#reply(m, errorOf(m, "session-history-failed", errText(e)));
+    }
+  }
+
+  /** 契约 §5.1 session.subagents（v1.0.5）：父会话直接子代理目录。
+   *  数据组合：父会话 subagentCatalog 持久投影（mode/label/createdAt/顺序，
+   *  经 sessionController.projections 冷读，无 Agent 激活）+ list 全量行
+   *  （running / hasChildren 血缘推断）。投影缺失/冷会话 → 空目录（不报错）。 */
+  async #rSessionSubagents(m) {
+    const p = m.payload ?? {};
+    const sessionId = typeof p.sessionId === "string" ? p.sessionId : "";
+    if (sessionId === "") {
+      this.#reply(m, errorOf(m, "bad-params", "sessionId required"));
+      return;
+    }
+    try {
+      const sc = this.#sc();
+      const signal = this.#signal(20_000);
+      let entries = [];
+      try {
+        const projections = await sc.projections({ sessionId }, signal);
+        const values = projections?.values;
+        const catalog = values?.subagentCatalog;
+        if (Array.isArray(catalog)) entries = catalog;
+      } catch {
+        entries = []; // 无投影/冷会话 → 空目录
+      }
+      let rowsById = null;
+      let allRows = [];
+      if (entries.length > 0) {
+        try {
+          const listed = await sc.list({}, signal);
+          rowsById = new Map();
+          for (const raw of listed?.items ?? []) {
+            const s = mapSummary(raw);
+            if (!s.sessionId) continue;
+            rowsById.set(s.sessionId, s);
+            allRows.push(s);
+          }
+        } catch {
+          rowsById = null; // list 失败 → running/hasChildren 退化默认值
+          allRows = [];
+        }
+      }
+      const subagents = [];
+      for (const e of entries) {
+        const id = typeof e?.id === "string" ? e.id : "";
+        if (id === "") continue;
+        const mode = e?.mode === "one-shot" ? "one-shot" : "continuable";
+        const row = rowsById !== null ? rowsById.get(id) : undefined;
+        let hasChildren = false;
+        if (row !== undefined) {
+          for (const r of allRows) {
+            if (r.parentSessionId === id) {
+              hasChildren = true;
+              break;
+            }
+          }
+        }
+        subagents.push({
+          sessionId: id,
+          label: typeof e?.label === "string" ? e.label : "",
+          mode,
+          running: row ? row.running === true : false,
+          hasChildren,
+          createdAt: Number.isSafeInteger(e?.createdAt) ? e.createdAt : 0,
+        });
+      }
+      this.#reply(m, resultOf(m, { subagents }));
+    } catch (e) {
+      this.#reply(m, errorOf(m, "session-subagents-failed", errText(e)));
+    }
+  }
+
+  /** 契约 §5.1 session.subagentPrompt（v1.0.5）：向 continuable 子代理发消息。
+   *  走宿主 subagents 服务 prompt（delivery:'queue'）；one-shot/不存在会被
+   *  宿主拒绝 → 包成 unsupported 错误回给手机（不是 500）。 */
+  async #rSubagentPrompt(m) {
+    const p = m.payload ?? {};
+    const parentSessionId = typeof p.parentSessionId === "string" ? p.parentSessionId : "";
+    const childSessionId = typeof p.childSessionId === "string" ? p.childSessionId : "";
+    const text = typeof p.text === "string" ? p.text : "";
+    if (parentSessionId === "" || childSessionId === "" || text === "") {
+      this.#reply(m, errorOf(m, "bad-params", "parentSessionId/childSessionId/text required"));
+      return;
+    }
+    let svc = null;
+    try {
+      svc = this.#ctx.get("subagents");
+    } catch {
+      svc = null;
+    }
+    if (!svc || typeof svc.prompt !== "function") {
+      this.#reply(m, errorOf(m, "service-unavailable", "subagents service unavailable"));
+      return;
+    }
+    try {
+      const req = {
+        requestId: crypto.randomUUID(),
+        parentSessionId,
+        childSessionId,
+        mode: "continuable",
+        delivery: "queue",
+        content: [{ type: "text", text }],
+      };
+      const receipt = await svc.prompt(req, this.#signal(15_000));
+      this.#log("info", "subagent prompt accepted", { childSessionId });
+      this.#reply(m, resultOf(m, { accepted: true }));
+      void receipt;
+    } catch (e) {
+      const msg = errText(e);
+      const unsupported = /one-shot|not continuable|unsupported/i.test(msg);
+      this.#reply(m, errorOf(m, unsupported ? "unsupported" : "subagent-prompt-failed", msg));
+    }
+  }
+
+  /** 契约 §5.1 session.subagentCancel（v1.0.5）：取消 continuable 子代理当前 turn。
+   *  interruptByParent 是 fire-and-return（accepted=信号已受理非已停止）；
+   *  任何失败回 accepted:false + 原因（尽力而为，手机 UI 自行提示）。 */
+  async #rSubagentCancel(m) {
+    const p = m.payload ?? {};
+    const parentSessionId = typeof p.parentSessionId === "string" ? p.parentSessionId : "";
+    const childSessionId = typeof p.childSessionId === "string" ? p.childSessionId : "";
+    if (parentSessionId === "" || childSessionId === "") {
+      this.#reply(m, errorOf(m, "bad-params", "parentSessionId/childSessionId required"));
+      return;
+    }
+    let svc = null;
+    try {
+      svc = this.#ctx.get("subagents");
+    } catch {
+      svc = null;
+    }
+    if (!svc || typeof svc.interruptByParent !== "function") {
+      this.#reply(m, errorOf(m, "service-unavailable", "subagents service unavailable"));
+      return;
+    }
+    try {
+      await svc.interruptByParent(parentSessionId, childSessionId, "continuable");
+      this.#reply(m, resultOf(m, { accepted: true }));
+    } catch (e) {
+      this.#reply(m, resultOf(m, { accepted: false, message: errText(e) }));
     }
   }
 

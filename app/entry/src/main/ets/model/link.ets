@@ -26,6 +26,7 @@ import {
   DshrcAnswers,
   DshrcSessionSummary,
   DshrcHistoryPage,
+  DshrcSubagentInfo,
   DshrcRelayFrame,
   DshrcRelayPeers,
   FRAME_ERROR,
@@ -42,6 +43,9 @@ import {
   MSG_RESULT,
   MSG_SESSION_LIST,
   MSG_SESSION_HISTORY,
+  MSG_SESSION_SUBAGENTS,
+  MSG_SESSION_SUBAGENT_PROMPT,
+  MSG_SESSION_SUBAGENT_CANCEL,
   MSG_SESSION_CREATE,
   MSG_SESSION_PROMPT,
   MSG_SESSION_CANCEL,
@@ -664,9 +668,9 @@ export class DshrcLink {
 
   // ---- 契约 §5.1 client → host 业务请求封装 ----
 
-  /** session.list（§5.1）：value.sessions → SessionSummary[]。 */
-  sessionList(includeArchived: boolean): Promise<DshrcSessionSummary[]> {
-    const p: DshrcPayload = { includeArchived: includeArchived };
+  /** session.list（§5.1 v1.0.5）：value.sessions → SessionSummary[]（归档参数已删）。 */
+  sessionList(): Promise<DshrcSessionSummary[]> {
+    const p: DshrcPayload = {};
     return this.request(MSG_SESSION_LIST, p).then((v: DshrcValue): DshrcSessionSummary[] => {
       return v.sessions !== undefined ? v.sessions : [];
     });
@@ -689,6 +693,34 @@ export class DshrcLink {
         oldestSeq: v.oldestSeq !== undefined ? v.oldestSeq : 0
       };
       return page;
+    });
+  }
+
+  /** session.subagents（§5.1 v1.0.5）：父会话的直接子代理目录。 */
+  sessionSubagents(sessionId: string): Promise<DshrcSubagentInfo[]> {
+    const p: DshrcPayload = { sessionId: sessionId };
+    return this.request(MSG_SESSION_SUBAGENTS, p, 20000).then((v: DshrcValue): DshrcSubagentInfo[] => {
+      return v.subagents !== undefined ? v.subagents : [];
+    });
+  }
+
+  /** session.subagentPrompt（§5.1 v1.0.5）：向 continuable 子代理发消息（delivery:queue）。 */
+  subagentPrompt(parentSessionId: string, childSessionId: string, text: string): Promise<boolean> {
+    const p: DshrcPayload = {
+      parentSessionId: parentSessionId,
+      childSessionId: childSessionId,
+      text: text
+    };
+    return this.request(MSG_SESSION_SUBAGENT_PROMPT, p).then((v: DshrcValue): boolean => {
+      return v.accepted === true;
+    });
+  }
+
+  /** session.subagentCancel（§5.1 v1.0.5）：取消 continuable 子代理当前 turn。 */
+  subagentCancel(parentSessionId: string, childSessionId: string): Promise<boolean> {
+    const p: DshrcPayload = { parentSessionId: parentSessionId, childSessionId: childSessionId };
+    return this.request(MSG_SESSION_SUBAGENT_CANCEL, p).then((v: DshrcValue): boolean => {
+      return v.accepted === true;
     });
   }
 

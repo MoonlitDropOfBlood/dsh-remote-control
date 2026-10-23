@@ -47,7 +47,16 @@ ESM 模块缓存不会重载源码（实测踩坑）。
 - `sessionController.list({}, sig)` → `{items}`（title 走 projections）；
   `prompt` 需 `{requestId, sessionId, mode:'queue', content:[{type:'text',text}]}`；
   `cancel` → `{accepted}`；`create` 无 title 参数（create 后 rename）。
+- `sessionController.projections({sessionId}, sig)` → `values.subagentCatalog`
+  = `[{id, createdAt, mode:'one-shot'|'continuable', label?}]`（父会话子代理目录投影，
+  冷读无激活；v1.0.5 session.subagents 的数据源）。
+- `ctx.get("subagents")`（typert 服务）两方法：
+  `prompt({requestId, parentSessionId, childSessionId, mode:"continuable", delivery:"queue",
+  content:[{type:"text",text}]})` → `{messageId}`（one-shot 会被宿主拒）；
+  `interruptByParent(parent, child, "continuable")`（三位置参数）→ `{accepted:true}`。
 - `approval/request` req：`{agent, toolName, callId?, reason?, signal?}` →
   `'allowed-once'|'rejected'|'cancelled'|'unavailable'`。
 - assistant 文本增量来自 `agent/assistant-stream` 的 `frame.chunk.type==='text-delta'`，
   按 sessionId 合并 125ms 冲刷（≤8 条/秒）。
+- **会话域没有归档概念**（归档属 Workspace 注册表 / dsh-archive-manager）：
+  sessionController.list 永远不回归档标记——wire 无 archived 字段（v1.0.5 移除）。

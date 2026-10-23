@@ -170,3 +170,97 @@ export class RelayLink {
 }
 
 export { msg };
+
+/**
+ * LoopbackLink —— 一对「进程内直连」端点（**不经过中继**）：自测用。
+ *
+ * 与 RelayLink 的差别只有一处：中继转发 → 进程内直投。其余完全一致：
+ * 同样的 §3 密钥派生、同样的 §7 封装（iv||ct||tag）与 AAD（role+seq）绑定、
+ * 同样的信封（{id,type,ts,payload}）与请求-响应关联。
+ *
+ * 用途：auto-test 的 v1.0.6 新链路用例不依赖中继进程、不占用真实 channel，
+ * 也不受「一个 channel 只允许一个 host」的限制（契约 §4）。
+ */
+export class LoopbackLink {
+  #peer = null;
+  #seq = 0;
+  /**
+   * @param {{role:"host"|"client", channel:string, secret:string,
+   *          onMessage:(m:any)=>void, onStatus?:(s:string)=>void}} opts
+   */
+  constructor(opts) {
+    this.opts = opts;
+    this.key = deriveKey(opts.secret, opts.channel);
+    this.corr = new Correlator();
+    this.closed = false;
+    this.opts.onStatus?.("ready");
+  }
+
+  /** 由 createLoopbackPair 内部调用：绑定对端。 */
+  _attach(peer) {
+    this.#peer = peer;
+  }
+
+  /** 发送一条业务消息（自动加密 + seq 计数）。 */
+  send(message, urgent = false) {
+    if (this.closed) return false;
+    this.#seq += 1;
+    // seq 必须在此刻定格：连续多次 send 会把多帧排进微任务队列，
+    // 投递时再读 this.#seq 会拿到更大的值 → AAD 不匹配 → 解密失败。
+    const seq = this.#seq;
+    const data = seal(this.key, this.opts.role, seq, message);
+    const peer = this.#peer;
+    if (peer === null) return false;
+    void urgent;
+    // 异步投递：模拟网络时序（不重入 send 调用栈）
+    queueMicrotask(() => peer._deliver(data, seq, this.opts.role));
+    return true;
+  }
+
+  /** 收到对端的一帧密文：按「发送方 role」解密后交给 correlator。 */
+  _deliver(data, seq, fromRole) {
+    if (this.closed) return;
+    let m;
+    try {
+      m = open(this.key, fromRole, seq, data);
+    } catch (e) {
+      this.opts.onStatus?.("decrypt failed: " + (e?.message ?? String(e)));
+      return;
+    }
+    this.corr.deliver(m, (x) => this.opts.onMessage(x));
+  }
+
+  /** 请求-响应（与 RelayLink 同签名）。 */
+  request(type, payload, timeoutMs = 15000) {
+    return this.corr.request((m) => this.send(m), type, payload, timeoutMs);
+  }
+
+  close() {
+    this.closed = true;
+    this.#peer = null;
+  }
+}
+
+/**
+ * 建一对直连端点（host ↔ client）。
+ * @param {{channel:string, secret:string, onHostMessage?:(m:any)=>void, onClientMessage?:(m:any)=>void}} opts
+ */
+export function createLoopbackPair(opts) {
+  const host = new LoopbackLink({
+    role: "host",
+    channel: opts.channel,
+    secret: opts.secret,
+    onMessage: opts.onHostMessage ?? (() => {}),
+    onStatus: opts.onStatus,
+  });
+  const client = new LoopbackLink({
+    role: "client",
+    channel: opts.channel,
+    secret: opts.secret,
+    onMessage: opts.onClientMessage ?? (() => {}),
+    onStatus: opts.onStatus,
+  });
+  host._attach(client);
+  client._attach(host);
+  return { host, client };
+}

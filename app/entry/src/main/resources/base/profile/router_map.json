@@ -11,14 +11,19 @@
       "buildFunction": "generatedHRouterApprovalQueuePageBuilder"
     },
     {
+      "name": "connections",
+      "pageSourceFile": "src/main/ets/_generated/hrouter/ConnectionsPageGeneratedWrapper.ets",
+      "buildFunction": "generatedHRouterConnectionsPageBuilder"
+    },
+    {
+      "name": "new_session",
+      "pageSourceFile": "src/main/ets/_generated/hrouter/NewSessionPageGeneratedWrapper.ets",
+      "buildFunction": "generatedHRouterNewSessionPageBuilder"
+    },
+    {
       "name": "session_detail",
       "pageSourceFile": "src/main/ets/_generated/hrouter/SessionDetailPageGeneratedWrapper.ets",
       "buildFunction": "generatedHRouterSessionDetailPageBuilder"
-    },
-    {
-      "name": "session_list",
-      "pageSourceFile": "src/main/ets/_generated/hrouter/SessionListPageGeneratedWrapper.ets",
-      "buildFunction": "generatedHRouterSessionListPageBuilder"
     }
   ]
 }

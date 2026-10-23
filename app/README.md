@@ -139,19 +139,23 @@ app/
         ├── ets/
         │   ├── entryability/EntryAbility.ets      # ★ Push token + 通知 intent 解析 + 通知授权
         │   ├── entrybackupability/EntryBackupAbility.ets
-        │   ├── pages/                             # ★ 五页面 UI（全部 @ComponentV2）
-        │   │   ├── Index.ets             # ① 配对/设置页（Navigation 根 + 路由映射 + ★ 扫码配对按钮）
-        │   │   ├── SessionListPage.ets   # ② 会话列表（Refresh 下拉 + Repeat 会话卡）
-        │   │   ├── SessionDetailPage.ets # ③ 会话详情（气泡流 + 输入条 + 取消；含 SessionDetailParam）
-        │   │   ├── AskCards.ets          # ④ 审批卡 / 提问卡组件（倒计时 + 允许/拒绝 + 问答）
-        │   │   ├── ApprovalQueuePage.ets # ④ 审批/提问队列页（NavDestination）
-        │   │   ├── AboutPage.ets         # ⑤ 关于（版本 / 协议 / E2E 说明 / MIT）
+        │   ├── pages/                             # ★ 页面 UI（全部 @ComponentV2）
+        │   │   ├── Index.ets             # ① 会话列表（Navigation 根页 = **主页**；右上角连接信息入口）
+        │   │   ├── ConnectionsPage.ets   # ② 连接管理（多远程：切换/新增/编辑/删除 + 扫码配对）
+        │   │   ├── NewSessionPage.ets    # ③ 新建会话（选「模式」+「权限」）
+        │   │   ├── SessionDetailPage.ets # ④ 会话详情（统一时间线：气泡 + 工作步骤 + 系统消息）
+        │   │   ├── StepCard.ets          # ④ 工作步骤卡（DSH 标准样式，可展开）
+        │   │   ├── TimelineView.ets      # ④ 时间线分组（连续步骤 → 「工作步骤 · N」）
+        │   │   ├── AskCards.ets          # ⑤ 审批卡 / 提问卡组件（倒计时 + 允许/拒绝 + 问答）
+        │   │   ├── ApprovalQueuePage.ets # ⑤ 审批/提问队列页（NavDestination）
+        │   │   ├── AboutPage.ets         # ⑥ 关于（版本 / 协议 / E2E 说明 / MIT）
         │   │   └── FieldInput.ets        # 通用“标签+输入框”字段
         │   └── model/                    # R1 模型层（未改协议/加密逻辑）+ R2 状态层
-        │       ├── protocol.ets          # 常量/消息类型/KAT 向量（契约 v1.0.2，逐字未改）
+        │       ├── protocol.ets          # 常量/消息类型/KAT 向量（契约 v1.0.6，逐字未改）
         │       ├── crypto.ets            # HKDF-SHA256 + AES-256-GCM + assertKat()
         │       ├── link.ets              # WS 链路层（hello/welcome/心跳/重连/sid:seq 去重/Correlator）
-        │       ├── store.ets             # Preferences 配对持久化
+        │       ├── store.ets             # Preferences 配对持久化（兼容旧单条配对）
+        │       ├── connections.ets       # ★ v1.0.6 多远程连接仓（RemoteProfile + ConnectionStore）
         │       ├── pairqr.ets            # ★ R3 配对二维码解析（契约 §3.5：dshrc://pair URI / 裸 query 双形态）
         │       ├── theme.ets             # ★ 设计 token：间距/圆角/字号 + 状态语义映射 + 时间格式化
         │       ├── sessionstore.ets      # ★ @ObservedV2 状态仓：§5.2 全事件 + 消息缓存 + 审批问答
@@ -306,9 +310,10 @@ KAT 字面量与 `docs/PROTOCOL.md` §7 程序化比对：`keyHex / ivHex / ctHe
 
 | 页面 | 文件 | 布局结构与 token 使用 |
 |---|---|---|
-| ① 配对/设置 | `pages/Index.ets`（Navigation 根） | Scroll>Column 单列卡片流：品牌头（`brand_fill` 圆角方标）→ 状态卡（`linkStateColor` 状态灯 + LoadingProgress + 主机在线胶囊 `state_success_tint` + KAT 指示 + 可展开链路日志）→ 配对卡（`FieldInput`×4，`bg_layer_2` 输入面）→ 连接/断开（主按钮 `brand_fill`、断开描边 `state_error`）→ 推送开关卡（Toggle `selectedColor=brand_fill`，token/上报状态行）→ 进入列表/待处理角标（`state_warn_tint`）→ 版本脚注；`hideTitleBar` 后自绘页头 |
-| ② 会话列表 | `pages/SessionListPage.ets` | 自绘顶栏（返回 + 状态灯徽标）→ 待处理审批横幅（`state_warn_tint`）→ **`Refresh{List{Repeat}}` 下拉刷新** → 会话卡（标题 ellipsis + 运行徽标 `brand_tint`/空闲 `bg_layer_2` + cwd + `relTime` + `›`）→ 底部固定 `brand_fill`「新建会话」；空态居中提示按在线与否换文案 |
-| ③ 会话详情 | `pages/SessionDetailPage.ets` | 自绘顶栏（标题 + 主机状态 + 运行胶囊）→ `Scroll{Column{Repeat(messages)}}` 气泡流：**用户右对齐 `brand_fill` 白字**，**assistant 左对齐 `bg_layer_1` 卡片**，围栏代码段切分为正文/等宽段、代码段 `fontFamily('monospace') + bg_layer_2`，流式时尾部 `▍` 光标，下方时间戳；`@Monitor('store.messages')` 新气泡/流式增长自动贴底滚动 → 本会话审批/提问卡片内嵌区（≤46% 高）→ 输入条（TextArea + `取消`描边红 + 发送 `brand_fill`，离线/空文禁用） |
+| ① 会话列表（主页） | `pages/Index.ets`（Navigation 根） | 自绘顶栏：左「会话」标题，**右上角连接信息胶囊**（状态点 `linkStateColor` + `linkStateText` + 当前远程名 → `openConnections()`）→ 待处理审批横幅（`state_warn_tint`）→ **`Refresh{List{Repeat}}` 下拉刷新** → 会话卡（标题 ellipsis + 运行徽标 `brand_tint`/空闲 `bg_layer_2` + cwd + `relTime` + `›`）→ 底部固定 `brand_fill`「新建会话」；空态居中提示按在线与否换文案；根页刷新用 `onVisibleAreaChange` 兜底（`registerLifecycle` 对根页无效） |
+| ② 连接管理（多远程） | `pages/ConnectionsPage.ets` | 自绘顶栏（返回 + 「连接」）→ 当前连接卡（状态灯 + 主机名/DSH 版本/插件版本 + 断开/连接 + KAT）→ 远程列表（名称 + relay 地址 + channel + 「使用中」胶囊 + 编辑/删除；点行 = 切换并连接）→ 「＋ 新增远程」表单（`FieldInput`×5，secret 密码框）+ 扫码配对（`scanBarcode` + `parsePairQr`）→ 推送开关卡 → 关于入口 |
+| ③ 新建会话 | `pages/NewSessionPage.ets` | 自绘顶栏（返回 + 「新建会话」）→ 标题 / 工作目录输入 → **模式**单选组（`sessionStore.presets`）→ **权限**单选组（`sessionStore.permissions`）→ 底部 `brand_fill`「创建会话」；目录为空（宿主不支持）时整块隐藏；创建成功后 `goBack()` + `openSessionDetail(sid)`（hrouter push 同步入栈，先弹表单） |
+| ④ 会话详情（统一时间线） | `pages/SessionDetailPage.ets` + `StepCard.ets` + `TimelineView.ets` | 自绘顶栏（标题 + 主机状态 + 运行胶囊）→ `Scroll{Column{Repeat(store.timeline)}}`：**用户右对齐 `brand_fill` 白字**，**assistant 左对齐 `bg_layer_1` 卡片 + lv-markdown-in**，**工作步骤卡**（状态点 + 工具标题 + chevron；展开后「参数」「输出/错误」等宽块）、**系统消息说明行**；连续步骤归入「工作步骤 · N」可折叠分组 → 审批/提问卡片内嵌区（≤46% 高）→ 输入条（TextArea + `取消` + 发送 `brand_fill`） |
 | ④ 审批/提问 | `pages/AskCards.ets` + `pages/ApprovalQueuePage.ets` | 卡片：`AskCountdownBar`（品牌胶囊标题 + `countdownText` 剩余时间 + Linear Progress 按剩余变色 `brand_fill`/`state_error`）→ 工具名等宽字体 + reason + `argsPreview` 等宽代码块（`bg_layer_2`）→ **允许（`brand_fill` 白字）/ 拒绝（描边 `state_error`）**，超时禁用；提问卡：单选 `Radio` / 多选 `Checkbox`（选中态 @ObservedV2）+ 自由文本 TextArea + 提交，answers 按 §5.4 组装 JSON；队列页 Repeat 全部待答卡并显示会话胶囊 |
 | ⑤ 关于 | `pages/AboutPage.ets` | 品牌头 → 版本与协议卡（App `v1.0.0` / 契约 `v1.0.2` / HKDF salt / KAT 实时自检结果）→ 端到端加密三段说明卡 → MIT License + 仓库链接卡，全部 `bg_layer_1 + border_l1` 卡片节奏 |
 

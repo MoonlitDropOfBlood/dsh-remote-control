@@ -9,10 +9,12 @@
  */
 import { HRouter } from 'hrouter';
 
-/** 会话列表页路由名（@Route name 与本常量必须一致）。 */
-export const ROUTE_SESSION_LIST: string = 'session_list';
 /** 会话详情页路由名。 */
 export const ROUTE_SESSION_DETAIL: string = 'session_detail';
+/** 连接管理页路由名（v1.0.6：多远程管理）。 */
+export const ROUTE_CONNECTIONS: string = 'connections';
+/** 新建会话页路由名（v1.0.6：选模式 + 权限）。 */
+export const ROUTE_NEW_SESSION: string = 'new_session';
 /** 审批/提问队列页路由名。 */
 export const ROUTE_APPROVAL_QUEUE: string = 'approval_queue';
 /** 关于页路由名。 */
@@ -23,11 +25,6 @@ export interface SessionDetailParam {
   sessionId: string;
 }
 
-/** 会话列表页。 */
-export function openSessionList(): void {
-  HRouter.build().push(ROUTE_SESSION_LIST);
-}
-
 /** 会话详情页（带 sessionId 参数；页面内用 HRouter.getParams 读取）。 */
 export function openSessionDetail(sessionId: string): void {
   if (sessionId.length === 0) {
@@ -35,6 +32,16 @@ export function openSessionDetail(sessionId: string): void {
   }
   const param: SessionDetailParam = { sessionId: sessionId };
   HRouter.build().withParam(param).push(ROUTE_SESSION_DETAIL);
+}
+
+/** 连接管理页（管理多个远程连接；v1.0.6）。 */
+export function openConnections(): void {
+  HRouter.build().push(ROUTE_CONNECTIONS);
+}
+
+/** 新建会话页（选模式 + 权限；v1.0.6）。创建成功后自行跳详情。 */
+export function openNewSession(): void {
+  HRouter.build().push(ROUTE_NEW_SESSION);
 }
 
 /** 审批/提问队列页。 */

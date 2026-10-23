@@ -1,17 +1,21 @@
 // lib/host-bridge.mjs — DSH Host 服务桥接（契约 §5 业务层 / §5.5 瀑布语义 /
-// §5.2 事件桥接 / §8.1 模块划分）。
+// §5.2 事件桥接 / §5.7 工作步骤 / §5.8 模式与权限 / §8.1 模块划分）。
 //
-// 三个职责：
-//   1. 业务请求分发：手机 → host 的 10 种请求（§5.1），全部经
+// 四个职责：
+//   1. 业务请求分发：手机 → host 的请求（§5.1），全部经
 //      sessionController / 本机状态处理，每个调用点 try/catch，
 //      错误统一回 result {ok:false, error:{code,message}}。
 //   2. 事件桥接（§5.2）：api-session/*、agent/assistant-stream（按
-//      sessionId 合并节流 ≤8 条/秒）、agent/status、agent/error → 推给手机。
+//      sessionId 合并节流 ≤8 条/秒）、agent/status、agent/error、
+//      session/event 总闸（v1.0.6：tool.call / tool.result / system.message）
+//      → 推给手机。
 //   3. 瀑布答案器（§5.5，安全关键）：approval/request 与
 //      user-questions/request 以 {prepend:true} 抢占在桌面答案器之前；
 //      **仅当**手机在线且开关打开才拦截；超时（默认 120s）/出错/取消
 //      一律 return next() 放行，绝不 fail-closed 卡死任务；
 //      迟到的手机回答回 applied:false。
+//   4. 新建会话的模式与权限（§5.8）：session.capabilities 目录 +
+//      session.create 的 agentPreset / permission 字段。
 import { randomUUID } from "node:crypto";
 import { hostname } from "node:os";
 import { createRequire } from "node:module";
@@ -66,6 +70,29 @@ const HISTORY_DEFAULT_MAX = 50;
 const HISTORY_MAX_LIMIT = 200;
 
 /**
+ * 内容块 → 纯文本（契约 §5.7 / 附录 B）。
+ * text 块取 text 拼接；image/file 给占位符；reasoning/tool-call 等忽略。
+ * @param {unknown} blocks ContentBlock[]
+ * @returns {string}
+ */
+export function contentText(blocks) {
+  if (!Array.isArray(blocks)) return "";
+  let text = "";
+  for (const block of blocks) {
+    if (!block || typeof block !== "object") continue;
+    if (block.type === "text" && typeof block.text === "string") {
+      text += block.text;
+    } else if (block.type === "image") {
+      text += "[图片]";
+    } else if (block.type === "file") {
+      text += "[文件]";
+    }
+    // reasoning / tool-call / tool-addition / tool-removal / 未知块：跳过
+  }
+  return text;
+}
+
+/**
  * 契约 §5.1 ChatMessage 提取：SessionWireEvent → {id,role,text,ts,seq} 或 null。
  *
  * 事件形态（@deepseek-ai/dsh-session 类型实证）：
@@ -103,18 +130,7 @@ export function mapHistoryMessage(sessionId, record) {
   }
   if (!Array.isArray(content)) return null;
 
-  let text = "";
-  for (const block of content) {
-    if (!block || typeof block !== "object") continue;
-    if (block.type === "text" && typeof block.text === "string") {
-      text += block.text;
-    } else if (block.type === "image") {
-      text += "[图片]";
-    } else if (block.type === "file") {
-      text += "[文件]";
-    }
-    // reasoning / tool-call / tool-addition / tool-removal / 未知块：跳过
-  }
+  const text = contentText(content);
   if (text.trim() === "") return null;
   return {
     id: `${sessionId}:${seq}`,
@@ -123,6 +139,274 @@ export function mapHistoryMessage(sessionId, record) {
     ts: Number.isSafeInteger(time) && time > 0 ? time : 0,
     seq,
   };
+}
+
+// ---------------------------------------------------------------------------
+// v1.0.6：工作步骤（§5.7）/ 模式与权限（§5.8）——纯函数映射，便于单测
+// ---------------------------------------------------------------------------
+
+/** 事件里的时间戳（毫秒）；非法给 0。 */
+function eventTime(event) {
+  const time = Number(event?.time);
+  return Number.isSafeInteger(time) && time > 0 ? time : 0;
+}
+
+/** 事件里的持久序号；非法给 -1。 */
+function eventSeq(event) {
+  const seq = Number(event?.seq);
+  return Number.isSafeInteger(seq) && seq >= 0 ? seq : -1;
+}
+
+/**
+ * 契约 §5.2 `tool.call` 事件映射（宿主 session/event 的 tool/call）。
+ * data = { turn, step, callId, name, arguments }（arguments 是原始 JSON 字符串）。
+ * @returns {{sessionId:string,callId:string,name:string,arguments:string,ts:number}|null}
+ */
+export function mapToolCallEvent(sessionId, event) {
+  if (!event || typeof event !== "object" || event.type !== "tool/call") return null;
+  const data = event.data;
+  if (!data || typeof data !== "object") return null;
+  const callId = typeof data.callId === "string" ? data.callId : "";
+  if (callId === "") return null;
+  const rawArgs = data.arguments;
+  const args =
+    typeof rawArgs === "string"
+      ? rawArgs
+      : rawArgs === undefined || rawArgs === null
+        ? ""
+        : JSON.stringify(rawArgs);
+  return {
+    sessionId: String(sessionId ?? ""),
+    callId,
+    name: typeof data.name === "string" ? data.name : "",
+    arguments: args,
+    ts: eventTime(event),
+  };
+}
+
+/**
+ * 契约 §5.2 `tool.result` 事件映射（宿主 session/event 的 tool/result）。
+ * data = { turn, step, message:{ role:'tool', toolCallId, isError?, content:[blocks] }, error? }
+ * @returns {{sessionId:string,callId:string,status:"ok"|"error",resultText:string,errorText:string,ts:number}|null}
+ */
+export function mapToolResultEvent(sessionId, event) {
+  if (!event || typeof event !== "object" || event.type !== "tool/result") return null;
+  const data = event.data;
+  if (!data || typeof data !== "object") return null;
+  const message = data.message && typeof data.message === "object" ? data.message : null;
+  const callId = typeof message?.toolCallId === "string" ? message.toolCallId : "";
+  if (callId === "") return null;
+  const isError = message?.isError === true;
+  const resultText = contentText(message?.content);
+  const reason = data.error?.reason;
+  const errorText =
+    reason === undefined || reason === null ? (isError ? resultText : "") : String(reason);
+  return {
+    sessionId: String(sessionId ?? ""),
+    callId,
+    status: isError ? "error" : "ok",
+    resultText,
+    errorText,
+    ts: eventTime(event),
+  };
+}
+
+/**
+ * 契约 §5.2 `system.message` 事件映射（宿主 session/event 的
+ * system/message 与 developer/message；两者共用一个 topic，用 kind 区分）。
+ * message 可能是 {content:[blocks]}，也可能是字符串——两种都兜住。
+ * @returns {{sessionId:string,kind:"system"|"developer",text:string,ts:number}|null}
+ */
+export function mapSystemMessageEvent(sessionId, event, kind) {
+  if (!event || typeof event !== "object") return null;
+  if (event.type !== "system/message" && event.type !== "developer/message") return null;
+  const data = event.data;
+  if (!data || typeof data !== "object") return null;
+  const message = data.message !== undefined ? data.message : data;
+  let text = "";
+  if (typeof message === "string") {
+    text = message;
+  } else if (message && typeof message === "object") {
+    text = contentText(message.content);
+  }
+  if (text.trim() === "") return null;
+  return {
+    sessionId: String(sessionId ?? ""),
+    kind: kind === "developer" ? "developer" : "system",
+    text,
+    ts: eventTime(event),
+  };
+}
+
+/**
+ * 契约 §5.7 StepRecord 提取：session.history 的 page.records → steps[]。
+ *
+ * 规则：
+ *   - 只看 type==='tool/call' 与 'tool/result' 的记录；
+ *   - 按 callId 配对：一次调用合并成一条（call 的字段 + result 的状态/文本）；
+ *   - seq：优先取 tool/call 事件的 seq；只有 tool/result 时取它的 seq；
+ *   - status：tool/result 的 isError 决定 ok/error；只有 call 没有 result 时 running；
+ *   - turn/step 取事件 data 里的 turn/step；ts 取事件 time（call 优先）。
+ * 任何不认识的形状一律跳过，绝不抛出。
+ * @param {any[]} records page.records
+ * @returns {object[]} StepRecord[]（按 seq 升序）
+ */
+export function mapHistorySteps(records) {
+  const list = Array.isArray(records) ? records : [];
+  /** @type {Map<string, any>} */
+  const byCall = new Map();
+  /** @type {any[]} */
+  const ordered = [];
+
+  for (const record of list) {
+    const event = record?.event ?? record;
+    if (!event || typeof event !== "object") continue;
+    const type = event.type;
+    if (type !== "tool/call" && type !== "tool/result") continue;
+    const data = event.data;
+    if (!data || typeof data !== "object") continue;
+    const ts = eventTime(event);
+    const seq = eventSeq(event);
+    const turn = Number.isSafeInteger(Number(data.turn)) ? Number(data.turn) : 0;
+    const step = Number.isSafeInteger(Number(data.step)) ? Number(data.step) : 0;
+
+    if (type === "tool/call") {
+      const callId = typeof data.callId === "string" ? data.callId : "";
+      if (callId === "") continue;
+      const rawArgs = data.arguments;
+      const args =
+        typeof rawArgs === "string"
+          ? rawArgs
+          : rawArgs === undefined || rawArgs === null
+            ? ""
+            : JSON.stringify(rawArgs);
+      let rec = byCall.get(callId);
+      if (rec === undefined) {
+        rec = {
+          seq: seq < 0 ? 0 : seq,
+          callId,
+          name: "",
+          arguments: "",
+          status: "running",
+          resultText: "",
+          errorText: "",
+          ts: 0,
+          turn: 0,
+          step: 0,
+        };
+        byCall.set(callId, rec);
+        ordered.push(rec);
+      }
+      rec.name = typeof data.name === "string" ? data.name : rec.name;
+      rec.arguments = args;
+      rec.status = "running";
+      if (ts > 0) rec.ts = ts;
+      rec.turn = turn;
+      rec.step = step;
+      // seq 优先取 tool/call 的（result 晚到时不覆盖）
+      if (seq >= 0) rec.seq = seq;
+      continue;
+    }
+
+    // tool/result
+    const message = data.message && typeof data.message === "object" ? data.message : null;
+    const callId = typeof message?.toolCallId === "string" ? message.toolCallId : "";
+    if (callId === "") continue;
+    const isError = message?.isError === true;
+    const resultText = contentText(message?.content);
+    const reason = data.error?.reason;
+    const errorText =
+      reason === undefined || reason === null ? (isError ? resultText : "") : String(reason);
+    let rec = byCall.get(callId);
+    if (rec === undefined) {
+      rec = {
+        seq: seq < 0 ? 0 : seq,
+        callId,
+        name: "",
+        arguments: "",
+        status: "ok",
+        resultText: "",
+        errorText: "",
+        ts: 0,
+        turn: 0,
+        step: 0,
+      };
+      byCall.set(callId, rec);
+      ordered.push(rec);
+    }
+    rec.status = isError ? "error" : "ok";
+    rec.resultText = resultText;
+    rec.errorText = errorText;
+    if (ts > 0 && rec.ts === 0) rec.ts = ts;
+    rec.turn = turn;
+    rec.step = step;
+  }
+
+  ordered.sort((a, b) => a.seq - b.seq);
+  return ordered;
+}
+
+/**
+ * 契约 §5.8 模式目录映射：宿主 AgentPreset[] → wire ModeOption[]。
+ * broken 的预设也列出（name 回退 id）；默认 id 用 svc.defaultId。
+ * @param {any[]} rows
+ * @param {string} defaultId
+ * @returns {{presets:{id:string,name:string,description:string}[],defaultPreset:string}}
+ */
+export function mapAgentPresetOptions(rows, defaultId) {
+  const list = Array.isArray(rows) ? rows : [];
+  const presets = [];
+  for (const row of list) {
+    if (!row || typeof row !== "object") continue;
+    const id = typeof row.id === "string" ? row.id.trim() : "";
+    if (id === "") continue;
+    const name = typeof row.name === "string" && row.name !== "" ? row.name : id;
+    const description = typeof row.description === "string" ? row.description : "";
+    presets.push({ id, name, description });
+  }
+  return { presets, defaultPreset: typeof defaultId === "string" ? defaultId : "" };
+}
+
+/**
+ * 契约 §5.8 权限目录映射：宿主 PermissionCatalog → wire PermissionOption[]。
+ * 宿主 PresetOption 的标识字段是 `value`（契约附录 B 的 `id` 是 wire 字段名），
+ * 两种都兜住；`custom` 只是展示态，永不可选 → 跳过。
+ * @param {any} catalog { options, defaultOptions, defaultPreset }
+ * @returns {{permissions:{id:string,name:string,description:string}[],defaultPermission:string}}
+ */
+export function mapPermissionOptions(catalog) {
+  const options = Array.isArray(catalog?.options) ? catalog.options : [];
+  const permissions = [];
+  for (const option of options) {
+    if (!option || typeof option !== "object") continue;
+    const rawId =
+      typeof option.id === "string" && option.id !== ""
+        ? option.id
+        : typeof option.value === "string"
+          ? option.value
+          : "";
+    const id = rawId.trim();
+    if (id === "") continue;
+    if (id === "custom") continue; // 展示态，不可选
+    const name = typeof option.name === "string" && option.name !== "" ? option.name : id;
+    const description = typeof option.description === "string" ? option.description : "";
+    permissions.push({ id, name, description });
+  }
+  const defaultPreset =
+    typeof catalog?.defaultPreset === "string"
+      ? catalog.defaultPreset
+      : typeof catalog?.defaultPermission === "string"
+        ? catalog.defaultPermission
+        : "";
+  return { permissions, defaultPermission: defaultPreset };
+}
+
+/** 宿主是否因为 agent preset 拒绝了 create（→ unsupported-agent-preset）。 */
+export function isAgentPresetRejection(e) {
+  const code = typeof e?.code === "string" ? e.code : "";
+  if (/agent[-_ ]?preset/i.test(code)) return true;
+  const text = errText(e);
+  return /preset/i.test(text);
 }
 
 /** result / error 信封（契约 §5）。 */
@@ -242,6 +526,33 @@ export class HostBridge {
       } catch (e) {
         this.#log("warn", "agent/error bridge error", { error: errText(e) });
       }
+    });
+
+    // --- v1.0.6（§5.7）：会话事件总闸 → tool.call / tool.result / system.message ---
+    // 宿主每写入一条会话日志事件就触发（覆盖所有会话，含 subagent）。
+    // 按 session.id 寻址即可，**不过滤**子代理；不认识的事件类型直接忽略，
+    // 绝不因为形状不认识而抛错（#on 包装器已兜底）。
+    this.#on("session/event", (session, event) => {
+      const sessionId = String(session?.id ?? "");
+      if (sessionId === "") return;
+      const type = event?.type;
+      if (type === "tool/call") {
+        const mapped = mapToolCallEvent(sessionId, event);
+        if (mapped !== null) this.#sendEvent("tool.call", mapped);
+        return;
+      }
+      if (type === "tool/result") {
+        const mapped = mapToolResultEvent(sessionId, event);
+        if (mapped !== null) this.#sendEvent("tool.result", mapped);
+        return;
+      }
+      if (type === "system/message" || type === "developer/message") {
+        const kind = type === "developer/message" ? "developer" : "system";
+        const mapped = mapSystemMessageEvent(sessionId, event, kind);
+        if (mapped !== null) this.#sendEvent("system.message", mapped);
+        return;
+      }
+      // 其余事件（assistant/message、user/message、turn/*、step/* …）忽略
     });
 
     return () => this.dispose();
@@ -374,6 +685,8 @@ export class HostBridge {
           return await this.#rSubagentCancel(m);
         case "session.create":
           return await this.#rSessionCreate(m);
+        case "session.capabilities":
+          return await this.#rSessionCapabilities(m);
         case "session.prompt":
           return await this.#rSessionPrompt(m);
         case "session.cancel":
@@ -418,6 +731,26 @@ export class HostBridge {
     const sc = this.#ctx.get("sessionController");
     if (!sc) throw new Error("sessionController unavailable");
     return sc;
+  }
+
+  /**
+   * 取一个宿主服务（agentPresets / permissionPresets …）。
+   * ctx.get 对不存在的服务会抛（不同宿主版本行为不一致），故 try/catch + 判空，
+   * 再兜一层 ctx[name] 直取。取不到一律返回 null（能力目录降级为空）。
+   */
+  #service(name) {
+    try {
+      const svc = this.#ctx.get(name);
+      if (svc) return svc;
+    } catch {
+      /* 服务未注册 */
+    }
+    try {
+      const svc = this.#ctx[name];
+      return svc ?? null;
+    } catch {
+      return null;
+    }
   }
 
   /** 带超时的 AbortSignal（Remote 方法都收 signal）。 */
@@ -503,7 +836,7 @@ export class HostBridge {
       }
       if (cursor < 0) {
         // 空会话（无任何事件）：直接回空页，不折腾 page
-        this.#reply(m, resultOf(m, { messages: [], hasMore: false, oldestSeq: 0 }));
+        this.#reply(m, resultOf(m, { messages: [], steps: [], hasMore: false, oldestSeq: 0 }));
         return;
       }
       const request = { address, throughSeq: cursor, maxMessages };
@@ -527,7 +860,9 @@ export class HostBridge {
         // 本页无可聊消息（全被过滤）→ 用页内最老事件 seq 续翻，避免卡页
         oldestSeq = oldestEventSeq === Number.MAX_SAFE_INTEGER ? 0 : oldestEventSeq;
       }
-      this.#reply(m, resultOf(m, { messages, hasMore: page?.hasMore === true, oldestSeq }));
+      // v1.0.6（§5.7）：工作步骤（工具调用）——旧客户端只读 messages，不受影响
+      const steps = mapHistorySteps(page?.records ?? []);
+      this.#reply(m, resultOf(m, { messages, steps, hasMore: page?.hasMore === true, oldestSeq }));
     } catch (e) {
       this.#reply(m, errorOf(m, "session-history-failed", errText(e)));
     }
@@ -676,11 +1011,28 @@ export class HostBridge {
 
   async #rSessionCreate(m) {
     const p = m.payload ?? {};
+    const agentPreset = typeof p.agentPreset === "string" ? p.agentPreset.trim() : "";
+    const permission = typeof p.permission === "string" ? p.permission.trim() : "";
     try {
       const sc = this.#sc();
       const req = {};
       if (typeof p.cwd === "string" && p.cwd !== "") req.cwd = p.cwd;
-      const value = await sc.create(req);
+      if (agentPreset !== "") req.agentPreset = agentPreset;
+      let value;
+      try {
+        value = await sc.create(req);
+      } catch (e) {
+        // 宿主拒绝该模式（preset 不存在等）→ 回 unsupported-agent-preset，
+        // 手机端会回退成「不带选项」重试（契约 §5.8）。
+        if (agentPreset !== "" && isAgentPresetRejection(e)) {
+          this.#log("warn", "host rejected agent preset; phone should retry without it", {
+            agentPreset,
+          });
+          this.#reply(m, errorOf(m, "unsupported-agent-preset", errText(e)));
+          return;
+        }
+        throw e;
+      }
       const sessionId = value?.sessionId;
       if (typeof sessionId !== "string" || sessionId === "") {
         this.#reply(m, errorOf(m, "session-create-failed", "no sessionId returned"));
@@ -693,9 +1045,126 @@ export class HostBridge {
           this.#log("warn", "rename after create failed", { error: errText(e) });
         }
       }
-      this.#reply(m, resultOf(m, { sessionId }));
+      // 权限档位：创建成功后写入（宿主语义：写进「首次发布」前的种子）。
+      // 失败只 warn，不阻断创建（会话照常返回 sessionId）。
+      if (permission !== "") await this.#applyPermissionPreset(sessionId, permission);
+      const out = { sessionId };
+      const echoed =
+        typeof value?.agentPreset === "string" && value.agentPreset !== ""
+          ? value.agentPreset
+          : agentPreset;
+      if (echoed !== "") out.agentPreset = echoed;
+      this.#reply(m, resultOf(m, out));
     } catch (e) {
       this.#reply(m, errorOf(m, "session-create-failed", errText(e)));
+    }
+  }
+
+  /** 契约 §5.8 session.capabilities：新建会话可选的「模式」与「权限」目录。
+   *  宿主没有对应能力 → 对应数组为空（客户端隐藏选择区），不得报错。 */
+  async #rSessionCapabilities(m) {
+    const presets = await this.#loadAgentPresets();
+    const permissions = await this.#loadPermissionPresets();
+    this.#reply(
+      m,
+      resultOf(m, {
+        presets: presets.presets,
+        permissions: permissions.permissions,
+        defaultPreset: presets.defaultPreset,
+        defaultPermission: permissions.defaultPermission,
+      }),
+    );
+  }
+
+  /** 模式目录（宿主 Agent preset 目录）。服务缺失/抛错 → 空目录。 */
+  async #loadAgentPresets() {
+    const svc = this.#service("agentPresets");
+    if (!svc || typeof svc.list !== "function") return { presets: [], defaultPreset: "" };
+    let rows;
+    try {
+      rows = await svc.list();
+    } catch (e) {
+      this.#log("warn", "agent preset list failed; capabilities degrade to empty", {
+        error: errText(e),
+      });
+      return { presets: [], defaultPreset: "" };
+    }
+    const list = Array.isArray(rows) ? rows : Array.isArray(rows?.presets) ? rows.presets : [];
+    let defaultId = "";
+    try {
+      defaultId = typeof svc.defaultId === "string" ? svc.defaultId : "";
+    } catch {
+      defaultId = "";
+    }
+    return mapAgentPresetOptions(list, defaultId);
+  }
+
+  /** 权限目录（宿主 permission preset 目录）。服务缺失/抛错 → 空目录。 */
+  async #loadPermissionPresets() {
+    const svc = this.#service("permissionPresets");
+    if (!svc || typeof svc.catalog !== "function") return { permissions: [], defaultPermission: "" };
+    let catalog;
+    try {
+      catalog = await svc.catalog();
+    } catch (e) {
+      this.#log("warn", "permission preset catalog failed; capabilities degrade to empty", {
+        error: errText(e),
+      });
+      return { permissions: [], defaultPermission: "" };
+    }
+    return mapPermissionOptions(catalog);
+  }
+
+  /** 把权限档位写进一个已创建的会话（契约 §5.8）。
+   *  宿主版本没有 resolveAgent / 没有 permissionPresets 服务 → 只 warn，不阻断。 */
+  async #applyPermissionPreset(sessionId, permission) {
+    const svc = this.#service("permissionPresets");
+    if (!svc || typeof svc.set !== "function") {
+      this.#log("warn", "permissionPresets service unavailable; permission not applied", {
+        sessionId,
+      });
+      return;
+    }
+    let sc = null;
+    try {
+      sc = this.#sc();
+    } catch (e) {
+      this.#log("warn", "sessionController unavailable; permission not applied", {
+        sessionId,
+        error: errText(e),
+      });
+      return;
+    }
+    if (typeof sc.resolveAgent !== "function") {
+      this.#log("warn", "sessionController.resolveAgent unavailable; permission not applied", {
+        sessionId,
+      });
+      return;
+    }
+    let agentRes = null;
+    try {
+      agentRes = await sc.resolveAgent(sessionId);
+    } catch (e) {
+      this.#log("warn", "resolveAgent failed; permission not applied", {
+        sessionId,
+        error: errText(e),
+      });
+      return;
+    }
+    // 宿主两种形状都兜住：{ agent } | { error }（旧版）与直接返回 Agent 的新版
+    const agent = agentRes?.agent ?? agentRes;
+    const session = agent?.session;
+    if (!session) {
+      this.#log("warn", "resolveAgent returned no session; permission not applied", { sessionId });
+      return;
+    }
+    try {
+      svc.set(session, permission);
+    } catch (e) {
+      this.#log("warn", "permission preset set failed; session kept", {
+        sessionId,
+        error: errText(e),
+      });
     }
   }
 

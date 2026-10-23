@@ -7,10 +7,11 @@ DSH 遥控器（ArkTS / ArkUI，DevEco 工程，bundleName=com.dukedsh.remotecon
 
 ```
 entry/src/main/ets/model/    protocol(KAT向量) / crypto(HKDF+AES-GCM+HMAC) / link(WS链路)
-                             store(Preferences) / sessionstore(事件仓) / push / theme / pairqr
-                             logger(@duke/logan-ext 双写日志) / events(eventpost 事件契约)
-                             routes(hrouter 统一跳转)
-entry/src/main/ets/pages/    Index(配对) / SessionListPage / SessionDetailPage
+                             store(Preferences) / connections(多远程配置) / sessionstore(事件仓)
+                             push / theme / pairqr / logger(@duke/logan-ext 双写日志)
+                             events(eventpost 事件契约) / routes(hrouter 统一跳转)
+entry/src/main/ets/pages/    Index(会话列表=**首页**) / ConnectionsPage(多远程连接管理)
+                             NewSessionPage(新建会话: 模式+权限) / SessionDetailPage(统一时间线)
                              AskCards + ApprovalQueuePage(审批提问) / AboutPage / FieldInput
 entry/src/main/ets/_generated/hrouter/   hrouter-compiler 生成的 NavDestination wrapper
                              （构建产物勿手改勿入 git；路由表=resources/base/profile/router_map.json）
@@ -91,3 +92,31 @@ grep -rnE "@State|@Prop|@Link|@ObjectLink|@Observed[^V]|@Provide|@Consume|@Watch
 - **one-shot 子代理只读**：详情页输入条整条隐藏，替换为「一次性子代理 · 仅查看」说明行；
   continuable 正常输入（发送自动走 `session.subagentPrompt`，取消走 `session.subagentCancel`——
   详情页 send()/cancelTurn() 按 rowOf(sid).parentSessionId 分流，勿绕过）。
+
+## v1.0.6：主页 / 多远程 / 时间线 / 模式权限（2026-10-23）
+
+### 主页 = 会话列表（Index 是 Navigation 根页）
+- `Index.ets` 不再是配对页，**就是会话列表主页**：顶栏右上角 = **连接信息**按钮
+  （链路状态点 + 当前远程名）→ `openConnections()`；底部「新建会话」→ `openNewSession()`。
+- 配对表单整体搬进 `ConnectionsPage.ets`（管理**多个**远程），`SessionListPage.ets` 已删除。
+
+### 多远程连接（model/connections.ets）
+- `RemoteProfile`（id/name/relayUrl/channel/secret/relayToken/lastUsedAt）持久化在
+  Preferences `dshrc_prefs` 的 `remotes`（JSON 数组）+ `activeRemoteId`。
+- 旧单条配对键（relayUrl/channel/secret/relayToken）首次启动时**迁移**成一个「默认远程」。
+- 切换远程 = `dshrcLink.stop()` + `dshrcLink.start(toLinkConfig(...))`；链路断开时
+  `sessionStore` 清空 timeline/hostName（避免展示上一台主机的时间线）。
+
+### 统一时间线（契约 §5.7）
+- `sessionstore.timeline: TimelineItem[]` 是详情页**唯一**数据源，取代旧的 `messages`：
+  `kind='message'`（对话）/ `'step'`（工具调用）/ `'system'`（系统消息）。
+- durable 项按 `seq` 升序在前，直播项（`seq=-1`）按到达顺序在末尾；
+  历史页 `steps` 与直播 `tool.call`/`tool.result` 按 `callId` 配对去重。
+- 详情页渲染：**工作步骤卡**（折叠态 = 状态点 + 工具标题 + chevron，展开态 = 参数/输出，
+  等宽字体）+ 连续的步骤归为一个「工作步骤 · N」分组（组头可整体折叠）。
+
+### 新建会话的模式与权限（契约 §5.8）
+- `session.capabilities` → `sessionStore.presets`（模式）/ `permissions`（权限）/
+  `defaultPresetId` / `defaultPermissionId`；宿主不支持时数组为空 → 客户端隐藏选择区。
+- `dshrcLink.sessionCreate(title, agentPreset?, permission?, cwd?)`；宿主拒绝（unsupported）
+  时客户端回退为「不带选项」再创建一次。

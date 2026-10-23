@@ -23,6 +23,7 @@ scripts/verify-*.mjs  dev 验证脚本（jsqr 独立解码 + 命令全路径 moc
 node --check index.js lib/*.mjs scripts/*.mjs          # 语法
 node -e "import('./lib/protocol.mjs').then(m=>m.assertKat())"   # KAT
 node scripts/verify-qr.mjs && node scripts/verify-pairing.mjs   # QR/命令回归（需 devDependencies）
+node scripts/verify-steps.mjs                                # v1.0.6 工作步骤/模式/权限回归（无依赖）
 ```
 
 安装/重载（link 安装，磁盘即运行源码）：plugin_manager `install_bundle` → 本目录。
@@ -60,3 +61,18 @@ ESM 模块缓存不会重载源码（实测踩坑）。
   按 sessionId 合并 125ms 冲刷（≤8 条/秒）。
 - **会话域没有归档概念**（归档属 Workspace 注册表 / dsh-archive-manager）：
   sessionController.list 永远不回归档标记——wire 无 archived 字段（v1.0.5 移除）。
+
+## v1.0.6：工作步骤 / 模式 / 权限（2026-10-23）
+
+- **会话事件总闸**：`ctx.on('session/event', (session, event) => …)` —— 宿主每写一条会话
+  日志事件就触发（`event = { type, data, time, seq }`）。桥接靠它推 `tool.call` /
+  `tool.result` / `system.message` 三个新事件（契约 §5.7）。
+  事件 data 形状：`tool/call = { turn, step, callId, name, arguments }`、
+  `tool/result = { turn, step, message:{ toolCallId, isError?, content:[blocks] }, error? }`。
+- **模式目录**：`ctx.get('agentPresets').list()` → `[{id, name?, description?}]`，
+  默认 id = `agentPresets.defaultId`；创建会话传 `sc.create({ cwd, agentPreset })`。
+- **权限目录**：`ctx.get('permissionPresets').catalog()` → `{ options:[{id,name,description?}],
+  defaultPreset }`（跳过 `custom`）；写入某会话用 `permissionPresets.set(session, name)`，
+  session 从 `sc.resolveAgent(sessionId).agent.session` 取。
+- **服务缺失要降级**：`ctx.get(name)` 对不存在服务会抛；能力目录取不到就回空数组
+  （客户端隐藏选择区），**不得**因此让 session.create 失败。

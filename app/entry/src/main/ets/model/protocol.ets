@@ -8,8 +8,8 @@
 /** 协议版本（契约 §5.1 hello.proto）。 */
 export const PROTO_VERSION: number = 1;
 
-/** 协议契约文档版本（v1.0.4：§5.1 session.history、§5.3 SessionSummary 补 origin/parentSessionId/blank；关于页展示用）。 */
-export const CONTRACT_VERSION: string = 'v1.0.5';
+/** 协议契约文档版本（v1.0.6：§5.7 工作步骤 StepRecord、§5.8 模式/权限目录；关于页展示用）。 */
+export const CONTRACT_VERSION: string = 'v1.0.6';
 
 /** 角色：host = PC 端 DSH 插件；client = 本 App。 */
 export const ROLE_HOST: string = 'host';
@@ -66,6 +66,7 @@ export const MSG_SESSION_SUBAGENTS: string = 'session.subagents'; // v1.0.5：�
 export const MSG_SESSION_SUBAGENT_PROMPT: string = 'session.subagentPrompt'; // v1.0.5：向 continuable 子代理发消息
 export const MSG_SESSION_SUBAGENT_CANCEL: string = 'session.subagentCancel'; // v1.0.5：取消子代理当前 turn
 export const MSG_SESSION_CREATE: string = 'session.create';
+export const MSG_SESSION_CAPABILITIES: string = 'session.capabilities'; // v1.0.6：模式/权限目录
 export const MSG_SESSION_PROMPT: string = 'session.prompt';
 export const MSG_SESSION_CANCEL: string = 'session.cancel';
 export const MSG_SESSION_RENAME: string = 'session.rename';
@@ -84,6 +85,9 @@ export const TOPIC_SESSION_REMOVED: string = 'session.removed';
 export const TOPIC_SESSION_STATUS: string = 'session.status';
 export const TOPIC_SESSION_ACTIVITY: string = 'session.activity';
 export const TOPIC_ASSISTANT_DELTA: string = 'assistant.delta';
+export const TOPIC_TOOL_CALL: string = 'tool.call'; // v1.0.6：工具调用开始
+export const TOPIC_TOOL_RESULT: string = 'tool.result'; // v1.0.6：工具调用结束
+export const TOPIC_SYSTEM_MESSAGE: string = 'system.message'; // v1.0.6：系统/开发者消息
 export const TOPIC_TURN_END: string = 'turn.end';
 export const TOPIC_APPROVAL_REQUEST: string = 'approval.request';
 export const TOPIC_APPROVAL_RESOLVED: string = 'approval.resolved';
@@ -132,6 +136,13 @@ export interface DshrcPayload {
   // session.history（§5.1 v1.0.4）
   beforeSeq?: number;
   maxMessages?: number;
+  // session.create / session.capabilities（§5.1 v1.0.6）
+  agentPreset?: string;
+  permission?: string;
+  presets?: DshrcModeOption[];
+  permissions?: DshrcPermissionOption[];
+  defaultPreset?: string;
+  defaultPermission?: string;
   // session.subagents / subagentPrompt / subagentCancel（§5.1 v1.0.5）
   subagents?: DshrcSubagentInfo[];
   parentSessionId?: string;
@@ -192,6 +203,21 @@ export interface DshrcValue {
   messages?: DshrcChatMessage[];
   hasMore?: boolean;
   oldestSeq?: number;
+  // session.history（§5.1 v1.0.6）：工作步骤（工具调用）列表
+  steps?: DshrcStepRecord[];
+  // tool.call / tool.result / system.message 事件载荷（§5.2 v1.0.6）
+  callId?: string;
+  name?: string;
+  arguments?: string;
+  resultText?: string;
+  errorText?: string;
+  kind?: string; // system.message: "system" | "developer"
+  ts?: number;
+  // session.capabilities（§5.1 v1.0.6）：模式与权限目录
+  presets?: DshrcModeOption[];
+  permissions?: DshrcPermissionOption[];
+  defaultPreset?: string;
+  defaultPermission?: string;
   // session.subagents（§5.1 v1.0.5）：子代理目录
   subagents?: DshrcSubagentInfo[];
 }
@@ -208,8 +234,49 @@ export interface DshrcChatMessage {
 /** session.history 响应 value（契约 §5.1 v1.0.4）。 */
 export interface DshrcHistoryPage {
   messages: DshrcChatMessage[];
+  /** v1.0.6：工作步骤（工具调用）列表——旧插件不返时为空数组。 */
+  steps: DshrcStepRecord[];
   hasMore: boolean;
   oldestSeq: number;
+}
+
+/**
+ * 工作步骤（契约 §5.7 v1.0.6）：会话时间线里的工具调用。
+ * 直播期由 tool.call / tool.result 事件补齐（seq = -1 表示无持久序号）。
+ */
+export interface DshrcStepRecord {
+  seq: number;
+  callId: string;
+  name: string;
+  arguments: string;
+  status: string; // "ok" | "error" | "running"
+  resultText: string;
+  errorText: string;
+  ts: number;
+  turn: number;
+  step: number;
+}
+
+/** 模式选项（契约 §5.8 v1.0.6）：Host 的 Agent preset。 */
+export interface DshrcModeOption {
+  id: string;
+  name: string;
+  description: string;
+}
+
+/** 权限选项（契约 §5.8 v1.0.6）：Host 的 permission preset。 */
+export interface DshrcPermissionOption {
+  id: string;
+  name: string;
+  description: string;
+}
+
+/** session.capabilities 响应 value（契约 §5.8 v1.0.6）。 */
+export interface DshrcCapabilities {
+  presets: DshrcModeOption[];
+  permissions: DshrcPermissionOption[];
+  defaultPreset: string;
+  defaultPermission: string;
 }
 
 /** result.error（契约 §5）。 */

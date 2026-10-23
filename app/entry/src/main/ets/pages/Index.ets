@@ -1,47 +1,27 @@
 /*
  * Copyright (c) 2026 dukedsh.
- * 五页面之①：配对/设置页（Navigation 根页）。
- *  - relayUrl / channel / secret / relayToken 输入 → Preferences 持久化 → 链路启动
- *  - 扫码配对（契约 §3.5）：Scan Kit 默认界面扫码 → 解析 dshrc://pair URI / 裸 query → 自动填参并连接
- *  - 连接状态灯（连接中/已连接/重连中/错误）+ 主机在线徽标 + KAT 自检指示 + 链路日志
- *  - 推送开关（本机 Preferences + push.register 上报状态，契约 §6）
- *  - 「进入会话列表」「待审批」「关于」入口；消费推送点击直达目标（契约 §6 intent）
- * 设计：亮/暗 token 全走 $r('app.color.*')；卡片 bg_layer_1 + 1px border_l1 + 12vp 圆角；
- *      主按钮 brand_fill（DeepSeek 蓝）配 label_on_brand 白字。
+ * 首页：会话列表（Navigation 根页，v1.0.6）。
+ *  - 顶栏：左标题「会话」；**右上角 = 连接信息按钮**（链路状态点 + 状态文案 + 当前远程名）
+ *    → model/routes.openConnections()（连接管理页里可管理多个远程）
+ *  - 待审批横幅：pendingCount() > 0 时显示 → openApprovalQueue()
+ *  - 会话列表：Refresh + List + 会话卡（标题 / 运行徽标 / 工作目录 / 相对时间 / ›）
+ *    → openSessionDetail(sid)；显示规则不变（只显示根会话、非 blank，updatedAt 降序）
+ *  - 底部固定操作区：「新建会话」品牌主按钮 → openNewSession()
+ *  - 推送点击直达（契约 §6 intent）：takePendingNav / EVT_PENDING_NAV 消费逻辑保留
+ * 设计：卡片 bg_layer_1 + 1px border_l1 + 12vp 圆角；主按钮 brand_fill 配 label_on_brand。
  */
 import { promptAction } from '@kit.ArkUI';
 import { common } from '@kit.AbilityKit';
-import { scanBarcode } from '@kit.ScanKit';
-import { BusinessError } from '@kit.BasicServicesKit';
 import { EventPost } from 'eventpost';
 import { HRouter } from 'hrouter';
 import { EVT_PENDING_NAV } from '../model/events';
-import { logDshrc } from '../model/logger';
-import { openAbout, openApprovalQueue, openSessionDetail, openSessionList } from '../model/routes';
-import { dshrcLink } from '../model/link';
-import { PairQrResult, parsePairQr } from '../model/pairqr';
-import { CONTRACT_VERSION, isValidChannel } from '../model/protocol';
-import {
-  APP_NAME,
-  APP_VERSION,
-  PairingConfig,
-  loadPairing,
-  savePairing,
-  toLinkConfig,
-  validatePairing
-} from '../model/store';
-import {
-  PendingNav,
-  SessionStore,
-  loadPushEnabled,
-  savePushEnabled,
-  sessionStore
-} from '../model/sessionstore';
-import { runKatCheck } from '../model/crypto';
+import { ConnectionStore, RemoteProfile, connectionStore } from '../model/connections';
+import { dshrcLink, LinkState } from '../model/link';
+import { openApprovalQueue, openConnections, openNewSession, openSessionDetail } from '../model/routes';
+import { PendingNav, SessionRow, SessionStore, sessionStore } from '../model/sessionstore';
 import {
   FS_BODY,
   FS_CAPTION,
-  FS_HERO,
   FS_SMALL,
   FS_SUBTITLE,
   HAIRLINE,
@@ -52,47 +32,102 @@ import {
   SP_2,
   SP_3,
   SP_4,
-  SP_5,
-  SP_6,
-  linkBusy,
   linkStateColor,
-  linkStateText
+  linkStateText,
+  relTime
 } from '../model/theme';
-import { FieldInput } from './FieldInput';
+
+/** 单张会话卡（列表项；只显示根会话——subagent 入口在父会话详情页，契约 §5.3 v1.0.5）。 */
+@ComponentV2
+export struct SessionCard {
+  @Require @Param row: SessionRow;
+  @Event onOpen: (sessionId: string) => void;
+
+  build() {
+    Column() {
+      Row() {
+        Text(this.row.title.length > 0 ? this.row.title : this.row.sessionId)
+          .fontSize(FS_BODY)
+          .fontWeight(FontWeight.Medium)
+          .fontColor($r('app.color.label_primary'))
+          .layoutWeight(1)
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+        if (this.row.running) {
+          Row() {
+            Circle({ width: 6, height: 6 }).fill($r('app.color.brand_fill'))
+            Text('运行中')
+              .fontSize(FS_CAPTION)
+              .fontColor($r('app.color.brand_label'))
+              .margin({ left: 4 })
+          }
+          .padding({ left: 8, right: 8, top: 3, bottom: 3 })
+          .margin({ left: SP_2 })
+          .borderRadius(RADIUS_PILL)
+          .backgroundColor($r('app.color.brand_tint'))
+          .alignItems(VerticalAlign.Center)
+        } else {
+          Text('空闲')
+            .fontSize(FS_CAPTION)
+            .fontColor($r('app.color.label_secondary'))
+            .padding({ left: 8, right: 8, top: 3, bottom: 3 })
+            .margin({ left: SP_2 })
+            .borderRadius(RADIUS_PILL)
+            .backgroundColor($r('app.color.bg_layer_2'))
+        }
+      }
+      .width('100%')
+      .alignItems(VerticalAlign.Center)
+
+      if (this.row.cwd.length > 0) {
+        Text(this.row.cwd)
+          .fontSize(FS_SMALL)
+          .fontColor($r('app.color.label_secondary'))
+          .width('100%')
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .margin({ top: SP_1 })
+      }
+
+      Row() {
+        Text(relTime(this.row.updatedAt))
+          .fontSize(FS_CAPTION)
+          .fontColor($r('app.color.label_tertiary'))
+          .layoutWeight(1)
+        Text('›')
+          .fontSize(FS_SUBTITLE)
+          .fontColor($r('app.color.label_tertiary'))
+      }
+      .width('100%')
+      .margin({ top: SP_2 })
+      .alignItems(VerticalAlign.Center)
+    }
+    .width('100%')
+    .padding({ left: SP_4, right: SP_4, top: SP_3, bottom: SP_3 })
+    .backgroundColor($r('app.color.bg_layer_1'))
+    .borderRadius(RADIUS_CARD)
+    .border({ width: HAIRLINE, color: $r('app.color.border_l1') })
+    .onClick((): void => {
+      this.onOpen(this.row.sessionId);
+    })
+  }
+}
 
 @Entry
 @ComponentV2
 struct Index {
   @Local navPathStack: NavPathStack = new NavPathStack();
   @Local store: SessionStore = sessionStore;
-  @Local relayUrl: string = '';
-  @Local channel: string = '';
-  @Local secret: string = '';
-  @Local relayToken: string = '';
-  @Local katText: string = 'KAT 自检中…';
-  @Local katOk: boolean = false;
-  @Local pushEnabled: boolean = true;
-  @Local showLog: boolean = false;
-  /** 扫码结果提示行（空 = 不显示）；scanHintOk 决定用 state_success / state_error。 */
-  @Local scanHint: string = '';
-  @Local scanHintOk: boolean = false;
+  @Local conn: ConnectionStore = connectionStore;
+  @Local refreshing: boolean = false;
 
   aboutToAppear(): void {
     // hrouter：把本 Navigation 的栈注册为默认栈；页面跳转统一走 model/routes.ets。
     HRouter.registerNavPathStack('default', this.navPathStack);
     const ctx: common.Context = getContext(this) as common.Context;
-    const cfg: PairingConfig = loadPairing(ctx);
-    this.relayUrl = cfg.relayUrl;
-    this.channel = cfg.channel;
-    this.secret = cfg.secret;
-    this.relayToken = cfg.relayToken;
-    this.pushEnabled = loadPushEnabled(ctx);
-    this.store.pushLocalEnabled = this.pushEnabled;
-    // KAT 自检（契约 §7）：连接前跑一遍，逐字节核对 key/ct/tag/aad。
-    runKatCheck().then((text: string): void => {
-      this.katText = text;
-      this.katOk = text.startsWith('KAT 通过');
-    });
+    this.conn.load(ctx);
+    this.store.refreshSessions();
+    this.autoConnect(ctx);
     // 推送点击直达（EntryAbility onNewWant / onCreate 写入后回调这里）
     this.store.onPendingNav = (): void => {
       this.consumePending();
@@ -103,6 +138,13 @@ struct Index {
     EventPost.getDefault().onFromComponent(EVT_PENDING_NAV, this, (): void => {
       this.consumePending();
     }, true);
+    // 返回本页时刷新（hrouter 生命周期；根页未挂 NavDestination 时注册静默跳过，
+    // 实际兜底是下面 onVisibleAreaChange 的「重新可见」判定）。
+    HRouter.registerLifecycle(this, {
+      onShown: (): void => {
+        this.refreshList();
+      }
+    });
   }
 
   aboutToDisappear(): void {
@@ -121,460 +163,226 @@ struct Index {
     }
   }
 
-  /** 连接：校验 → Preferences 保存 → 启动链路（内部先跑 KAT 再建链）。 */
-  private onConnectClick(): void {
-    const cfg: PairingConfig = {
-      relayUrl: this.relayUrl.trim(),
-      channel: this.channel.trim(),
-      secret: this.secret.trim(),
-      relayToken: this.relayToken.trim()
-    };
-    const invalid: string = validatePairing(cfg);
-    if (invalid.length > 0) {
-      promptAction.showToast({ message: invalid, duration: 3000 });
-      return;
-    }
-    if (!isValidChannel(cfg.channel)) {
-      promptAction.showToast({ message: 'channel 格式不合法（契约 §4：A-Z2-7，16~64 位）', duration: 3000 });
-      return;
-    }
-    const ctx: common.Context = getContext(this) as common.Context;
-    savePairing(ctx, cfg);
-    this.store.lastError = '';
-    dshrcLink.start(toLinkConfig(cfg, APP_NAME, APP_VERSION));
-  }
-
-  /** 断开链路。 */
-  private onStopClick(): void {
-    dshrcLink.stop();
+  /** 刷新会话列表（未连接时 store 内部直接跳过）。 */
+  private refreshList(): void {
+    this.store.refreshSessions();
   }
 
   /**
-   * 扫码配对（契约 §3.5）：Scan Kit 默认界面扫码。
-   * 默认界面自带相机预授权（系统级 UI），无需 CAMERA 权限；
-   * 调用包 try/catch 兜底设备兼容性（PC / 无后置相机设备上调用会同步/异步报错，等价于 canIUse 守卫——
-   * linter-cli 按 compatible SDK 10 解析不到 @since 11 的全局 canIUse，故用等价写法）。
+   * 启动时自动连上「当前远程」：配好远程后冷启动即可用，不必每次手动点连接。
+   * 链路已在跑（连接中/已连接/重连中）时不打断。
    */
-  private onScanClick(): void {
-    const ctx: common.Context = getContext(this) as common.Context;
-    try {
-      scanBarcode.startScanForResult(ctx).then((res: scanBarcode.ScanResult): void => {
-        this.applyScanText(res.originalValue);
-      }).catch((err: BusinessError): void => {
-        // 取消（1000500002）/ 失败均静默回到配对页（不打断输入），只记日志便于排障。
-        logDshrc('dshrc-scan', 'warn',
-          'startScanForResult failed: ' + err.code.toString() + ' ' + err.message);
-      });
-    } catch (e) {
-      const err: BusinessError = e as BusinessError;
-      logDshrc('dshrc-scan', 'warn',
-        'startScanForResult threw: ' + err.code.toString() + ' ' + err.message);
-      promptAction.showToast({ message: '当前设备不支持扫码功能', duration: 3000 });
-    }
-  }
-
-  /**
-   * 处理扫码文本：解析（§3.5 完整 URI / 裸 query 两种形态）→ 回填字段 → 成功即保存+连接；
-   * 失败 Toast 明确原因并停留手动输入（已解析出的字段照常回填，不静默丢弃）。
-   */
-  private applyScanText(raw: string): void {
-    const parsed: PairQrResult = parsePairQr(raw);
-    if (parsed.cfg.relayUrl.length > 0) {
-      this.relayUrl = parsed.cfg.relayUrl;
-    }
-    if (parsed.cfg.channel.length > 0) {
-      this.channel = parsed.cfg.channel;
-    }
-    if (parsed.cfg.secret.length > 0) {
-      this.secret = parsed.cfg.secret;
-    }
-    if (parsed.cfg.relayToken.length > 0) {
-      this.relayToken = parsed.cfg.relayToken;
-    }
-    if (!parsed.ok) {
-      this.scanHintOk = false;
-      this.scanHint = '扫码未采用：' + parsed.reason + '（请核对后手动输入）';
-      promptAction.showToast({ message: parsed.reason, duration: 3000 });
+  private autoConnect(ctx: common.Context): void {
+    const active: RemoteProfile | undefined = this.conn.activeProfile();
+    if (active === undefined) {
       return;
     }
-    this.scanHintOk = true;
-    this.scanHint = '已扫码，正在连接…';
-    promptAction.showToast({ message: '已扫码，正在连接…', duration: 2000 });
-    this.onConnectClick();
-  }
-
-  /** 推送开关：写本地状态 + 持久化 + 联动 token 上报。 */
-  private onPushToggle(on: boolean): void {
-    this.pushEnabled = on;
-    this.store.setPushLocalEnabled(on);
-    savePushEnabled(getContext(this) as common.Context, on);
-  }
-
-  /** 推送状态一行说明。 */
-  private pushStatusText(): string {
-    if (!this.pushEnabled) {
-      return '已关闭 · 不再获取 / 上报推送 token';
+    const st: LinkState = dshrcLink.getState();
+    if (st !== 'idle' && st !== 'stopped') {
+      return;
     }
-    const tk: string = this.store.pushToken;
-    const brief: string = tk.length > 0 ? 'token ' + tk.substring(0, 8) + '…' : '未取到 token';
-    let s: string = brief + (this.store.pushRegistered ? ' · 已上报主机' : ' · 未上报');
-    if (this.store.linkState === 'online' && !this.store.pushRemoteEnabled) {
-      s += ' · 主机侧未开通推送';
-    }
-    return s;
+    this.conn.activate(ctx, active.id);
   }
 
-  /** 卡片容器公共样式（Builder 内联书写，避免样式链过长难读）。 */
-
-  @Builder
-  brandMark() {
-    Stack() {
-      Text('DSH')
-        .fontSize(13)
-        .fontWeight(FontWeight.Bold)
-        .fontColor($r('app.color.label_on_brand'))
+  /** 下拉刷新：拉 session.list，完成后收起刷新态。 */
+  private doRefresh(): void {
+    if (this.store.linkState !== 'online') {
+      promptAction.showToast({ message: '未连接，请先在右上角「连接」里选择远程', duration: 2500 });
+      this.refreshing = false;
+      return;
     }
-    .width(46)
-    .height(46)
-    .borderRadius(RADIUS_CARD)
-    .backgroundColor($r('app.color.brand_fill'))
+    this.refreshing = true;
+    this.store.refreshSessions().then((): void => {
+      this.refreshing = false;
+    });
   }
 
-  @Builder
-  headerBlock() {
-    Row() {
-      this.brandMark()
-      Column() {
-        Text('DSH Remote Control')
-          .fontSize(FS_HERO)
-          .fontWeight(FontWeight.Bold)
-          .fontColor($r('app.color.label_primary'))
-        Text('会话遥控 · 审批应答 · 端到端加密')
-          .fontSize(FS_SMALL)
-          .fontColor($r('app.color.label_secondary'))
-          .margin({ top: SP_1 })
+  /** 新建会话 → 新建会话页（选模式 + 权限）。 */
+  private onCreateSession(): void {
+    if (this.store.linkState !== 'online') {
+      promptAction.showToast({ message: '未连接，请先在右上角「连接」里选择远程', duration: 2500 });
+      return;
+    }
+    openNewSession();
+  }
+
+  /** 打开会话详情。 */
+  private openSession(sid: string): void {
+    openSessionDetail(sid);
+  }
+
+  /** 当前远程名（未配置时兜底「未配置」）。 */
+  private remoteName(): string {
+    const p: RemoteProfile | undefined = this.conn.activeProfile();
+    if (p === undefined) {
+      return '未配置';
+    }
+    const n: string = p.name.trim();
+    return n.length > 0 ? n : '未配置';
+  }
+
+  /** 列表行（store.sessions 的 @Trace 读取会被 V2 追踪，列表随事件实时刷新）。
+   *  显示规则（契约 §5.3 v1.0.5）：只显示根会话（非 subagent）且非 blank；
+   *  subagent 的入口在父会话详情页的子代理目录区；updatedAt 降序。 */
+  private visibleSessions(): SessionRow[] {
+    const out: SessionRow[] = [];
+    for (const row of this.store.sessions) {
+      if (row.blank || row.isSubagent()) {
+        continue;
       }
-      .alignItems(HorizontalAlign.Start)
-      .margin({ left: SP_3 })
-      .layoutWeight(1)
-      Button('关于')
-        .type(ButtonType.Normal)
-        .height(32)
-        .fontSize(FS_SMALL)
+      out.push(row);
+    }
+    out.sort((a: SessionRow, b: SessionRow): number => b.updatedAt - a.updatedAt);
+    return out;
+  }
+
+  /** 顶栏：左标题 + 右上角连接信息胶囊（状态点 + 状态 + 当前远程名）。 */
+  @Builder
+  topBar() {
+    Row() {
+      Text('会话')
+        .fontSize(FS_SUBTITLE)
+        .fontWeight(FontWeight.Bold)
         .fontColor($r('app.color.label_primary'))
-        .backgroundColor($r('app.color.bg_layer_2'))
-        .onClick((): void => {
-          openAbout();
-        })
+        .layoutWeight(1)
+      Row() {
+        Circle({ width: 7, height: 7 }).fill(linkStateColor(this.store.linkState))
+        Text(linkStateText(this.store.linkState))
+          .fontSize(FS_CAPTION)
+          .fontColor($r('app.color.label_secondary'))
+          .margin({ left: 5 })
+        Text(this.remoteName())
+          .fontSize(FS_CAPTION)
+          .fontColor($r('app.color.label_primary'))
+          .margin({ left: 6 })
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .constraintSize({ maxWidth: 96 })
+      }
+      .padding({ left: 8, right: 8, top: 4, bottom: 4 })
+      .borderRadius(RADIUS_PILL)
+      .backgroundColor($r('app.color.bg_layer_2'))
+      .alignItems(VerticalAlign.Center)
+      .onClick((): void => {
+        openConnections();
+      })
     }
     .width('100%')
     .alignItems(VerticalAlign.Center)
-    .margin({ bottom: SP_5 })
+    .padding({ left: SP_4, right: SP_4, top: SP_2, bottom: SP_3 })
   }
 
+  /** 待审批 / 提问横幅。 */
   @Builder
-  statusCard() {
-    Column() {
-      Row() {
-        Circle({ width: 10, height: 10 })
-          .fill(linkStateColor(this.store.linkState))
-        Text(linkStateText(this.store.linkState))
-          .fontSize(FS_BODY)
-          .fontWeight(FontWeight.Medium)
-          .fontColor($r('app.color.label_primary'))
-          .margin({ left: SP_2 })
-        if (linkBusy(this.store.linkState)) {
-          LoadingProgress()
-            .width(16)
-            .height(16)
-            .color($r('app.color.brand_fill'))
-            .margin({ left: SP_2 })
-        }
-        Blank()
-        Row() {
-          Circle({ width: 6, height: 6 })
-            .fill(this.store.hostOnline ? $r('app.color.state_success') : $r('app.color.state_idle'))
-          Text(this.store.hostOnline ? '主机在线' : '主机离线')
-            .fontSize(FS_CAPTION)
-            .fontColor(this.store.hostOnline ? $r('app.color.state_success') :
-              $r('app.color.label_secondary'))
-            .margin({ left: 5 })
-        }
-        .padding({ left: 8, right: 8, top: 4, bottom: 4 })
-        .borderRadius(RADIUS_PILL)
-        .backgroundColor(this.store.hostOnline ? $r('app.color.state_success_tint') :
-          $r('app.color.state_idle_tint'))
-      }
-      .width('100%')
-      .alignItems(VerticalAlign.Center)
-
-      Text(this.katText)
+  pendingBanner() {
+    Row() {
+      Text('⏳ 有 ' + this.store.pendingCount().toString() + ' 个审批 / 提问待处理')
         .fontSize(FS_SMALL)
-        .fontColor(this.katOk ? $r('app.color.state_success') : $r('app.color.state_warn'))
-        .margin({ top: SP_3 })
-
-      if (this.store.lastError.length > 0) {
-        Text(this.store.lastError)
-          .fontSize(FS_SMALL)
-          .fontColor($r('app.color.state_error'))
-          .margin({ top: SP_1 })
-      }
-
-      Row() {
-        Text('链路日志')
-          .fontSize(FS_SMALL)
-          .fontColor($r('app.color.label_tertiary'))
-          .layoutWeight(1)
-        Text(this.showLog ? '收起' : '展开')
-          .fontSize(FS_SMALL)
-          .fontColor($r('app.color.brand_label'))
-          .onClick((): void => {
-            this.showLog = !this.showLog;
-          })
-      }
-      .width('100%')
-      .margin({ top: SP_3 })
-
-      if (this.showLog) {
-        Text(this.store.logLines.slice(0, 5).join('\n'))
-          .fontSize(FS_CAPTION)
-          .fontColor($r('app.color.label_tertiary'))
-          .width('100%')
-          .margin({ top: SP_2 })
-          .padding({ left: SP_2, right: SP_2, top: SP_2, bottom: SP_2 })
-          .backgroundColor($r('app.color.bg_layer_2'))
-          .borderRadius(RADIUS_CTRL)
-      }
-    }
-    .width('100%')
-    .padding(SP_4)
-    .backgroundColor($r('app.color.bg_layer_1'))
-    .borderRadius(RADIUS_CARD)
-    .border({ width: HAIRLINE, color: $r('app.color.border_l1') })
-    .margin({ bottom: SP_3 })
-  }
-
-  @Builder
-  fieldsCard() {
-    Column() {
-      Text('配对信息')
-        .fontSize(FS_SUBTITLE)
+        .fontColor($r('app.color.state_warn'))
+        .layoutWeight(1)
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+      Text('去处理 ›')
+        .fontSize(FS_SMALL)
         .fontWeight(FontWeight.Medium)
-        .fontColor($r('app.color.label_primary'))
-        .margin({ bottom: SP_3 })
-      FieldInput({
-        label: '中继地址',
-        hint: 'wss://relay.example.com/ws',
-        text: this.relayUrl,
-        onInput: (v: string): void => {
-          this.relayUrl = v;
-        }
-      })
-      FieldInput({
-        label: '配对频道 channel',
-        hint: 'A-Z2-7，16~64 位（插件配置页可见）',
-        text: this.channel,
-        onInput: (v: string): void => {
-          this.channel = v;
-        }
-      })
-      FieldInput({
-        label: '配对密钥 secret',
-        hint: '≥32 字符，仅存本地，绝不发给中继',
-        text: this.secret,
-        secret: true,
-        onInput: (v: string): void => {
-          this.secret = v;
-        }
-      })
-      FieldInput({
-        label: '中继令牌（可选）',
-        hint: '中继配置了 RELAY_TOKEN 时填写',
-        text: this.relayToken,
-        secret: true,
-        onInput: (v: string): void => {
-          this.relayToken = v;
-        }
-      })
+        .fontColor($r('app.color.brand_label'))
     }
     .width('100%')
-    .padding(SP_4)
-    .backgroundColor($r('app.color.bg_layer_1'))
-    .borderRadius(RADIUS_CARD)
-    .border({ width: HAIRLINE, color: $r('app.color.border_l1') })
+    .padding({ left: SP_3, right: SP_3, top: SP_2 + 2, bottom: SP_2 + 2 })
+    .backgroundColor($r('app.color.state_warn_tint'))
+    .borderRadius(RADIUS_CTRL)
     .margin({ bottom: SP_3 })
+    .onClick((): void => {
+      openApprovalQueue();
+    })
   }
 
-  /** 扫码配对卡：主按钮（brand_fill）+ 说明 + 扫码结果提示行（成功 state_success / 失败 state_error）。 */
+  /** 空态（在线 / 离线两套文案）。 */
   @Builder
-  scanCard() {
+  emptyState() {
     Column() {
-      Button('扫码配对')
-        .width('100%')
-        .height(46)
+      Text('○')
+        .fontSize(40)
+        .fontColor($r('app.color.label_tertiary'))
+      Text(this.store.linkState === 'online' ? '暂无会话' : '未连接，暂无会话数据')
         .fontSize(FS_BODY)
-        .fontWeight(FontWeight.Medium)
-        .fontColor($r('app.color.label_on_brand'))
-        .backgroundColor($r('app.color.brand_fill'))
-        .borderRadius(RADIUS_CTRL)
-        .onClick((): void => {
-          this.onScanClick();
-        })
-      Text('扫描 PC 端「/remote-pairing」页面出示的配对二维码，自动填入并连接（契约 §3.5）')
-        .fontSize(FS_SMALL)
         .fontColor($r('app.color.label_secondary'))
-        .width('100%')
         .margin({ top: SP_2 })
-      if (this.scanHint.length > 0) {
-        Text(this.scanHint)
-          .fontSize(FS_SMALL)
-          .fontColor(this.scanHintOk ? $r('app.color.state_success') : $r('app.color.state_error'))
-          .width('100%')
-          .margin({ top: SP_1 })
-      }
+      Text(this.store.linkState === 'online' ?
+        '点下方「新建会话」开始遥控' : '在右上角「连接」里选好远程并连接')
+        .fontSize(FS_SMALL)
+        .fontColor($r('app.color.label_tertiary'))
+        .margin({ top: SP_1 })
     }
     .width('100%')
-    .padding(SP_4)
-    .backgroundColor($r('app.color.bg_layer_1'))
-    .borderRadius(RADIUS_CARD)
-    .border({ width: HAIRLINE, color: $r('app.color.border_l1') })
-    .margin({ bottom: SP_3 })
-  }
-
-  @Builder
-  actionRow() {
-    Row() {
-      Button(linkBusy(this.store.linkState) ? '连接中…' :
-        (this.store.linkState === 'online' ? '重新连接' : '连接'))
-        .layoutWeight(1)
-        .height(46)
-        .fontSize(FS_BODY)
-        .fontWeight(FontWeight.Medium)
-        .fontColor($r('app.color.label_on_brand'))
-        .backgroundColor($r('app.color.brand_fill'))
-        .borderRadius(RADIUS_CTRL)
-        .enabled(!linkBusy(this.store.linkState))
-        .onClick((): void => {
-          this.onConnectClick();
-        })
-      Button('断开')
-        .width(92)
-        .height(46)
-        .margin({ left: SP_2 })
-        .fontSize(FS_BODY)
-        .fontColor($r('app.color.state_error'))
-        .backgroundColor($r('app.color.bg_layer_1'))
-        .border({ width: HAIRLINE, color: $r('app.color.border_l2') })
-        .borderRadius(RADIUS_CTRL)
-        .enabled(this.store.linkState !== 'idle' && this.store.linkState !== 'stopped')
-        .onClick((): void => {
-          this.onStopClick();
-        })
-    }
-    .width('100%')
-    .margin({ bottom: SP_3 })
-  }
-
-  @Builder
-  pushCard() {
-    Column() {
-      Row() {
-        Column() {
-          Text('推送通知')
-            .fontSize(FS_BODY)
-            .fontWeight(FontWeight.Medium)
-            .fontColor($r('app.color.label_primary'))
-          Text(this.pushStatusText())
-            .fontSize(FS_SMALL)
-            .fontColor($r('app.color.label_secondary'))
-            .margin({ top: SP_1 })
-        }
-        .alignItems(HorizontalAlign.Start)
-        .layoutWeight(1)
-        Toggle({ type: ToggleType.Switch, isOn: this.pushEnabled })
-          .selectedColor($r('app.color.brand_fill'))
-          .switchPointColor($r('app.color.label_on_brand'))
-          .onChange((on: boolean): void => {
-            this.onPushToggle(on);
-          })
-      }
-      .width('100%')
-      .alignItems(VerticalAlign.Center)
-    }
-    .width('100%')
-    .padding(SP_4)
-    .backgroundColor($r('app.color.bg_layer_1'))
-    .borderRadius(RADIUS_CARD)
-    .border({ width: HAIRLINE, color: $r('app.color.border_l1') })
-    .margin({ bottom: SP_3 })
-  }
-
-  @Builder
-  entryRows() {
-    Row() {
-      Button('进入会话列表')
-        .layoutWeight(1)
-        .height(46)
-        .fontSize(FS_BODY)
-        .fontWeight(FontWeight.Medium)
-        .fontColor($r('app.color.label_on_brand'))
-        .backgroundColor($r('app.color.brand_fill'))
-        .borderRadius(RADIUS_CTRL)
-        .onClick((): void => {
-          openSessionList();
-        })
-      if (this.store.pendingCount() > 0) {
-        Button('待处理 ' + this.store.pendingCount().toString())
-          .height(46)
-          .margin({ left: SP_2 })
-          .padding({ left: SP_3, right: SP_3 })
-          .fontSize(FS_BODY)
-          .fontColor($r('app.color.state_warn'))
-          .backgroundColor($r('app.color.state_warn_tint'))
-          .borderRadius(RADIUS_CTRL)
-          .onClick((): void => {
-            openApprovalQueue();
-          })
-      }
-    }
-    .width('100%')
-    .margin({ bottom: SP_4 })
-
-    Text(APP_NAME + ' v' + APP_VERSION + ' · 协议契约 ' + CONTRACT_VERSION +
-      ' · MIT License')
-      .fontSize(FS_CAPTION)
-      .fontColor($r('app.color.label_tertiary'))
-      .width('100%')
-      .textAlign(TextAlign.Center)
+    .padding({ top: 60, bottom: 60 })
   }
 
   build() {
     Navigation(this.navPathStack) {
-      Scroll() {
-        Column() {
-          this.headerBlock()
-          this.statusCard()
-          this.scanCard()
-          this.fieldsCard()
-          this.actionRow()
-          this.pushCard()
-          this.entryRows()
-          Text('提示：PC 端需先启用 dsh-remote-control 插件（host 角色）并填入同一 channel / secret，' +
-            '连接成功后即可遥控会话、查看流式回复并处理审批与提问。')
-            .fontSize(FS_SMALL)
-            .fontColor($r('app.color.label_tertiary'))
-            .width('100%')
-            .margin({ top: SP_4, bottom: SP_6 })
+      Column() {
+        this.topBar()
+        if (this.store.pendingCount() > 0) {
+          this.pendingBanner()
+        }
+        Refresh({ refreshing: this.refreshing }) {
+          List({ space: SP_2 }) {
+            if (this.visibleSessions().length === 0) {
+              ListItem() {
+                this.emptyState()
+              }
+            } else {
+              Repeat(this.visibleSessions())
+                .each((cell: RepeatItem<SessionRow>): void => {
+                  ListItem() {
+                    SessionCard({
+                      row: cell.item,
+                      onOpen: (sid: string): void => {
+                        this.openSession(sid);
+                      }
+                    })
+                  }
+                })
+                .key((row: SessionRow): string => row.sessionId)
+            }
+          }
+          .width('100%')
+          .height('100%')
+          .scrollBar(BarState.Off)
+          .padding({ left: SP_4, right: SP_4, bottom: SP_2 })
         }
         .width('100%')
-        .padding({ left: SP_4, right: SP_4, top: SP_5, bottom: SP_6 })
+        .layoutWeight(1)
+        .backgroundColor($r('app.color.bg_base'))
+        .onRefreshing((): void => {
+          this.doRefresh();
+        })
+
+        Column() {
+          Button('新建会话')
+            .width('100%')
+            .height(46)
+            .fontSize(FS_BODY)
+            .fontWeight(FontWeight.Medium)
+            .fontColor($r('app.color.label_on_brand'))
+            .backgroundColor($r('app.color.brand_fill'))
+            .borderRadius(RADIUS_CTRL)
+            .onClick((): void => {
+              this.onCreateSession();
+            })
+        }
+        .width('100%')
+        .padding({ left: SP_4, right: SP_4, top: SP_3, bottom: SP_4 })
+        .backgroundColor($r('app.color.bg_layer_1'))
+        .border({ width: HAIRLINE, color: $r('app.color.border_l1') })
       }
       .width('100%')
       .height('100%')
-      .scrollBar(BarState.Off)
-      .align(Alignment.Top)
+      .backgroundColor($r('app.color.bg_base'))
+      // 根页被 NavDestination 盖住 → 可见比例跌到 0；返回时回到 1 → 刷新列表。
       .onVisibleAreaChange([0.0, 1.0], (isExpanding: boolean, currentRatio: number): void => {
         if (isExpanding && currentRatio > 0.9) {
+          this.refreshList();
           this.consumePending();
         }
       })

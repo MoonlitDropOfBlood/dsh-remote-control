@@ -21,7 +21,7 @@ import {
   postQuestionArrived,
   postQuestionResolved
 } from './events';
-import { DshrcLink, LinkPeers, LinkState, dshrcLink } from './link';
+import { DshrcLink, DshrcHostInfo, LinkPeers, LinkState, dshrcLink } from './link';
 import {
   DshrcMsg,
   DshrcQuestion,
@@ -29,6 +29,10 @@ import {
   DshrcSubagentInfo,
   DshrcChatMessage,
   DshrcHistoryPage,
+  DshrcCapabilities,
+  DshrcModeOption,
+  DshrcPermissionOption,
+  DshrcStepRecord,
   DshrcValue,
   MSG_EVENT,
   TOPIC_APPROVAL_REQUEST,
@@ -42,6 +46,9 @@ import {
   TOPIC_SESSION_ADDED,
   TOPIC_SESSION_REMOVED,
   TOPIC_SESSION_STATUS,
+  TOPIC_SYSTEM_MESSAGE,
+  TOPIC_TOOL_CALL,
+  TOPIC_TOOL_RESULT,
   TOPIC_TURN_END
 } from './protocol';
 
@@ -115,24 +122,42 @@ export class SubagentRow {
   }
 }
 
-/** 一条聊天消息（user / assistant；assistant 可处于流式追加中）。
- *  seq：host 日志持久序号（session.history 历史消息）；-1=本地/直播气泡（无持久序号）。 */
+/** 时间线项（契约 §5.7 v1.0.6）：一条消息、一个工作步骤或一条系统消息。
+ *  kind: "message"（对话气泡，role=user/assistant） | "step"（工具调用） | "system"（系统/开发者消息）。
+ *  seq：host 日志持久序号（session.history 的合并排序键）；-1=本地/直播项（永远排在最后）。 */
 @ObservedV2
-export class ChatItem {
+export class TimelineItem {
   @Trace id: string = '';
+  @Trace kind: string = '';
   @Trace role: string = '';
   @Trace text: string = '';
   @Trace streaming: boolean = false;
   @Trace ts: number = 0;
   @Trace errorText: string = '';
   @Trace seq: number = -1;
+  /** 步骤字段（kind="step"）：工具调用。 */
+  @Trace callId: string = '';
+  @Trace toolName: string = '';
+  @Trace argsText: string = '';
+  @Trace status: string = ''; // "running" | "ok" | "error"
+  @Trace resultText: string = '';
+  @Trace turn: number = 0;
+  @Trace step: number = 0;
 
-  constructor(id: string, role: string, text: string, ts: number, streaming: boolean) {
+  constructor(id: string, kind: string, ts: number) {
     this.id = id;
-    this.role = role;
-    this.text = text;
+    this.kind = kind;
     this.ts = ts;
-    this.streaming = streaming;
+  }
+
+  /** 是否工作步骤（工具调用）。 */
+  isStep(): boolean {
+    return this.kind === 'step';
+  }
+
+  /** 是否对话消息。 */
+  isMessage(): boolean {
+    return this.kind === 'message';
   }
 }
 
@@ -240,7 +265,8 @@ export class SessionStore {
   @Trace sessions: SessionRow[] = [];
   @Trace refreshing: boolean = false;
   @Trace activeId: string = '';
-  @Trace messages: ChatItem[] = [];
+  /** 会话时间线（契约 §5.7 v1.0.6）：消息 + 工作步骤 + 系统消息，按 seq 升序、直播项在末尾。 */
+  @Trace timeline: TimelineItem[] = [];
   // ---- 历史消息（契约 §5.1 session.history，v1.0.4；活动会话投影）----
   @Trace historyLoading: boolean = false;
   @Trace historyHasMore: boolean = false;
@@ -260,12 +286,22 @@ export class SessionStore {
   @Trace pendingNavSessionId: string = '';
   @Trace pendingNavAskId: string = '';
   @Trace pendingNavSeq: number = 0;
+  // ---- 主机信息（hello 响应；连接信息页展示）----
+  @Trace hostName: string = '';
+  @Trace hostVersion: string = '';
+  @Trace pluginVersion: string = '';
+  // ---- 新建会话能力目录（契约 §5.8 v1.0.6：模式 / 权限）----
+  @Trace presets: DshrcModeOption[] = [];
+  @Trace permissions: DshrcPermissionOption[] = [];
+  @Trace defaultPresetId: string = '';
+  @Trace defaultPermissionId: string = '';
+  @Trace capabilitiesLoaded: boolean = false;
 
   /** Index 挂载后设置：有待导航目标时立即回调（EntryAbility onNewWant 触发链）。 */
   onPendingNav: (() => void) | null = null;
 
   private link: DshrcLink = dshrcLink;
-  private cache: Map<string, ChatItem[]> = new Map<string, ChatItem[]>();
+  private cache: Map<string, TimelineItem[]> = new Map<string, TimelineItem[]>();
   private histMeta: Map<string, HistMeta> = new Map<string, HistMeta>();
   private chatSeq: number = 0;
 
@@ -281,6 +317,11 @@ export class SessionStore {
     };
     this.link.onLog = (line: string): void => {
       this.appendLog(line);
+    };
+    this.link.onHello = (info: DshrcHostInfo): void => {
+      this.hostName = info.hostName;
+      this.hostVersion = info.dshVersion;
+      this.pluginVersion = info.pluginVersion;
     };
   }
 
@@ -300,6 +341,18 @@ export class SessionStore {
     if (s === 'online') {
       this.refreshSessions();
       this.reportPush();
+      this.loadCapabilities();
+    }
+    if (s === 'stopped' || s === 'idle') {
+      // 断开/切换远程：清掉当前会话的投影，避免展示上一台主机的时间线
+      this.activeId = '';
+      this.timeline = [];
+      this.hostName = '';
+      this.hostVersion = '';
+      this.pluginVersion = '';
+      this.presets = [];
+      this.permissions = [];
+      this.capabilitiesLoaded = false;
     }
     if (s === 'error') {
       this.lastError = '连接错误（详见链路日志）';
@@ -396,7 +449,7 @@ export class SessionStore {
     this.activeId = sid;
     this.projectSubagents(sid);
     if (sid.length === 0) {
-      this.messages = [];
+      this.timeline = [];
       this.historyHasMore = false;
       this.historyLoaded = false;
       return;
@@ -404,12 +457,54 @@ export class SessionStore {
     if (!this.cache.has(sid)) {
       this.cache.set(sid, []);
     }
-    const items: ChatItem[] | undefined = this.cache.get(sid);
-    this.messages = items !== undefined ? items.slice() : [];
+    const items: TimelineItem[] | undefined = this.cache.get(sid);
+    this.timeline = items !== undefined ? items.slice() : [];
     // 投影本会话的历史翻页状态（详情页据此渲染「加载更早消息」）
     const meta: HistMeta | undefined = this.histMeta.get(sid);
     this.historyLoaded = meta !== undefined && meta.loaded;
     this.historyHasMore = meta !== undefined && meta.hasMore;
+  }
+
+  // ---- 新建会话能力目录（契约 §5.8 v1.0.6）----
+
+  /** 拉取主机支持的「模式」与「权限」目录；失败静默（数组保持空 → 客户端隐藏选择区）。 */
+  loadCapabilities(): Promise<void> {
+    if (this.link.getState() !== 'online') {
+      return Promise.resolve();
+    }
+    return this.link.sessionCapabilities().then((caps: DshrcCapabilities): void => {
+      this.presets = caps.presets;
+      this.permissions = caps.permissions;
+      this.defaultPresetId = caps.defaultPreset;
+      this.defaultPermissionId = caps.defaultPermission;
+      this.capabilitiesLoaded = true;
+    }).catch((e: Error): void => {
+      // 旧插件无此请求 → 能力目录为空（客户端隐藏选择区，不报错）
+      this.presets = [];
+      this.permissions = [];
+      this.capabilitiesLoaded = true;
+      logDshrc(TAG, 'info', 'session.capabilities unavailable: ' + e.message);
+    });
+  }
+
+  /** 模式 id（新建会话用；无目录时返回空串）。 */
+  presetNameOf(id: string): string {
+    for (let i: number = 0; i < this.presets.length; i++) {
+      if (this.presets[i].id === id) {
+        return this.presets[i].name;
+      }
+    }
+    return id;
+  }
+
+  /** 权限 id（新建会话用；无目录时返回空串）。 */
+  permissionNameOf(id: string): string {
+    for (let i: number = 0; i < this.permissions.length; i++) {
+      if (this.permissions[i].id === id) {
+        return this.permissions[i].name;
+      }
+    }
+    return id;
   }
 
   // ---- 历史消息（契约 §5.1 session.history，v1.0.4）----
@@ -498,7 +593,7 @@ export class SessionStore {
         meta.oldestSeq = page.oldestSeq;
       }
       meta.loaded = true;
-      this.mergeHistory(sid, page.messages, prepend);
+      this.mergeHistory(sid, page.messages, page.steps, prepend);
       if (sid === this.activeId) {
         this.historyHasMore = meta.hasMore;
         this.historyLoaded = true;
@@ -512,14 +607,16 @@ export class SessionStore {
   }
 
   /**
-   * 历史页并入缓存（历史与直播气泡合并去重，用 seq 对齐）：
-   *  1) durable 消息按页覆盖区间判重——与本页 [pageMin,pageMax] 重叠的旧副本摘除，
+   * 历史页并入缓存（契约 §5.7 v1.0.6：消息 + 工作步骤同轴合并，用 seq 对齐）：
+   *  1) durable 项（消息/步骤）按页覆盖区间判重——与本页 [pageMin,pageMax] 重叠的旧副本摘除，
    *     统一按 seq 升序重排（页内可能含被过滤的非聊天事件，不能只按单点 seq 比对）；
-   *  2) 直播气泡（seq<0）：非 prepend 时若与本页某条历史同 role+text，视为同一句话，丢弃直播副本；
-   *  3) 组装：prepend=旧页在最前；否则历史接在旧 durable 之后；直播气泡永远在最后（时间上最新）。
+   *  2) 直播项（seq<0）：非 prepend 时若与本页某条历史同 role+text 的消息，视为同一句话，丢弃直播副本；
+   *     直播步骤若本页已含同 callId 的持久步骤，同样丢弃（同一调用不显示两遍）；
+   *  3) 组装：prepend=旧页在最前；否则历史接在旧 durable 之后；直播项永远在最后（到达顺序）。
    */
-  private mergeHistory(sid: string, messages: DshrcChatMessage[], prepend: boolean): void {
-    const items: ChatItem[] = this.cacheOf(sid);
+  private mergeHistory(sid: string, messages: DshrcChatMessage[], steps: DshrcStepRecord[],
+    prepend: boolean): void {
+    const items: TimelineItem[] = this.cacheOf(sid);
     let pageMin: number = Number.MAX_SAFE_INTEGER;
     let pageMax: number = -1;
     for (let i: number = 0; i < messages.length; i++) {
@@ -531,39 +628,78 @@ export class SessionStore {
         pageMax = sq;
       }
     }
-    const durable: ChatItem[] = [];
-    const live: ChatItem[] = [];
-    for (let j: number = 0; j < items.length; j++) {
-      const it: ChatItem = items[j];
+    for (let j: number = 0; j < steps.length; j++) {
+      const sq2: number = steps[j].seq;
+      if (sq2 >= 0 && sq2 < pageMin) {
+        pageMin = sq2;
+      }
+      if (sq2 >= 0 && sq2 > pageMax) {
+        pageMax = sq2;
+      }
+    }
+    const durable: TimelineItem[] = [];
+    const live: TimelineItem[] = [];
+    for (let k: number = 0; k < items.length; k++) {
+      const it: TimelineItem = items[k];
       if (it.seq >= 0) {
-        if (messages.length > 0 && it.seq >= pageMin && it.seq <= pageMax) {
+        if (it.seq >= pageMin && it.seq <= pageMax) {
           continue; // 与本页覆盖区间重叠：旧副本摘除，统一用本页副本
         }
         durable.push(it);
         continue;
       }
-      if (!prepend && it.text.length > 0 && this.textCoveredByPage(messages, it)) {
+      if (!prepend && it.isMessage() && it.text.length > 0 && this.textCoveredByPage(messages, it)) {
         continue; // 直播副本已被 durable 历史覆盖，同一句话不显示两遍
+      }
+      if (!prepend && it.isStep() && this.stepCoveredByPage(steps, it)) {
+        continue; // 直播步骤已被本页持久步骤覆盖
       }
       live.push(it);
     }
-    durable.sort((a: ChatItem, b: ChatItem): number => a.seq - b.seq);
-    const pageItems: ChatItem[] = [];
-    for (let k: number = 0; k < messages.length; k++) {
-      const msg: DshrcChatMessage = messages[k];
-      const ci: ChatItem = new ChatItem(msg.id, msg.role, msg.text, msg.ts, false);
-      ci.seq = msg.seq;
-      pageItems.push(ci);
+    durable.sort((a: TimelineItem, b: TimelineItem): number => a.seq - b.seq);
+    const pageItems: TimelineItem[] = [];
+    for (let m: number = 0; m < messages.length; m++) {
+      const msg: DshrcChatMessage = messages[m];
+      const mi: TimelineItem = new TimelineItem(msg.id, 'message', msg.ts);
+      mi.role = msg.role;
+      mi.text = msg.text;
+      mi.seq = msg.seq;
+      pageItems.push(mi);
     }
-    const body: ChatItem[] = prepend ? pageItems.concat(durable) : durable.concat(pageItems);
+    for (let n: number = 0; n < steps.length; n++) {
+      const st: DshrcStepRecord = steps[n];
+      const si: TimelineItem = new TimelineItem('s' + st.callId, 'step', st.ts);
+      si.callId = st.callId;
+      si.toolName = st.name;
+      si.argsText = st.arguments;
+      si.status = st.status;
+      si.resultText = st.resultText;
+      si.errorText = st.errorText;
+      si.turn = st.turn;
+      si.step = st.step;
+      si.seq = st.seq;
+      pageItems.push(si);
+    }
+    pageItems.sort((a: TimelineItem, b: TimelineItem): number => a.seq - b.seq);
+    const body: TimelineItem[] = prepend ? pageItems.concat(durable) : durable.concat(pageItems);
     this.cache.set(sid, body.concat(live));
     this.notifyActive(sid);
   }
 
   /** 直播气泡是否已被本页历史覆盖（存在同 role+text 的 durable 消息）。 */
-  private textCoveredByPage(messages: DshrcChatMessage[], it: ChatItem): boolean {
+  private textCoveredByPage(messages: DshrcChatMessage[], it: TimelineItem): boolean {
     for (let i: number = 0; i < messages.length; i++) {
       if (messages[i].role === it.role && messages[i].text === it.text) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** 直播步骤是否已被本页持久步骤覆盖（同 callId）。 */
+  private stepCoveredByPage(steps: DshrcStepRecord[], it: TimelineItem): boolean {
+    for (let i: number = 0; i < steps.length; i++) {
+      if (steps[i].callId === it.callId) {
         return true;
       }
     }
@@ -575,9 +711,12 @@ export class SessionStore {
     if (sid.length === 0) {
       return;
     }
-    const items: ChatItem[] = this.cacheOf(sid);
+    const items: TimelineItem[] = this.cacheOf(sid);
     this.chatSeq = this.chatSeq + 1;
-    items.push(new ChatItem('u' + this.chatSeq.toString(), 'user', text, Date.now(), false));
+    const mi: TimelineItem = new TimelineItem('u' + this.chatSeq.toString(), 'message', Date.now());
+    mi.role = 'user';
+    mi.text = text;
+    items.push(mi);
     this.notifyActive(sid);
   }
 
@@ -586,14 +725,18 @@ export class SessionStore {
     if (sid.length === 0) {
       return;
     }
-    const items: ChatItem[] = this.cacheOf(sid);
-    const last: ChatItem | undefined = items.length > 0 ? items[items.length - 1] : undefined;
-    if (last !== undefined && last.role === 'assistant' && last.streaming) {
+    const items: TimelineItem[] = this.cacheOf(sid);
+    const last: TimelineItem | undefined = items.length > 0 ? items[items.length - 1] : undefined;
+    if (last !== undefined && last.isMessage() && last.role === 'assistant' && last.streaming) {
       last.text = last.text + text;
       last.ts = Date.now();
     } else {
       this.chatSeq = this.chatSeq + 1;
-      items.push(new ChatItem('a' + this.chatSeq.toString(), 'assistant', text, Date.now(), true));
+      const mi: TimelineItem = new TimelineItem('a' + this.chatSeq.toString(), 'message', Date.now());
+      mi.role = 'assistant';
+      mi.text = text;
+      mi.streaming = true;
+      items.push(mi);
     }
     this.notifyActive(sid);
   }
@@ -603,8 +746,8 @@ export class SessionStore {
     if (sid.length === 0) {
       return;
     }
-    const items: ChatItem[] = this.cacheOf(sid);
-    const last: ChatItem | undefined = items.length > 0 ? items[items.length - 1] : undefined;
+    const items: TimelineItem[] = this.cacheOf(sid);
+    const last: TimelineItem | undefined = items.length > 0 ? items[items.length - 1] : undefined;
     if (last !== undefined && last.streaming) {
       last.streaming = false;
       last.ts = Date.now();
@@ -613,16 +756,73 @@ export class SessionStore {
       }
     } else if (errText.length > 0) {
       this.chatSeq = this.chatSeq + 1;
-      const it: ChatItem = new ChatItem('e' + this.chatSeq.toString(), 'assistant', '',
-        Date.now(), false);
+      const it: TimelineItem = new TimelineItem('e' + this.chatSeq.toString(), 'message', Date.now());
+      it.role = 'assistant';
       it.errorText = errText;
       items.push(it);
     }
     this.notifyActive(sid);
   }
 
-  private cacheOf(sid: string): ChatItem[] {
-    let items: ChatItem[] | undefined = this.cache.get(sid);
+  // ---- 工作步骤（契约 §5.7 v1.0.6）----
+
+  /**
+   * tool.call / tool.result 事件：登记或更新一条工作步骤。
+   * 同 callId 已存在则原地更新（running → ok/error），不新增行。
+   */
+  private upsertStep(sid: string, callId: string, name: string, argsText: string,
+    status: string, resultText: string, errorText: string, ts: number): void {
+    if (sid.length === 0 || callId.length === 0) {
+      return;
+    }
+    const items: TimelineItem[] = this.cacheOf(sid);
+    for (let i: number = 0; i < items.length; i++) {
+      if (items[i].isStep() && items[i].callId === callId) {
+        if (name.length > 0) {
+          items[i].toolName = name;
+        }
+        if (argsText.length > 0) {
+          items[i].argsText = argsText;
+        }
+        items[i].status = status;
+        if (resultText.length > 0) {
+          items[i].resultText = resultText;
+        }
+        if (errorText.length > 0) {
+          items[i].errorText = errorText;
+        }
+        items[i].ts = ts;
+        this.notifyActive(sid);
+        return;
+      }
+    }
+    const si: TimelineItem = new TimelineItem('s' + callId, 'step', ts);
+    si.callId = callId;
+    si.toolName = name;
+    si.argsText = argsText;
+    si.status = status;
+    si.resultText = resultText;
+    si.errorText = errorText;
+    items.push(si);
+    this.notifyActive(sid);
+  }
+
+  /** system.message 事件：追加一条系统/开发者消息（说明行，不占气泡）。 */
+  private appendSystem(sid: string, kind: string, text: string, ts: number): void {
+    if (sid.length === 0 || text.length === 0) {
+      return;
+    }
+    const items: TimelineItem[] = this.cacheOf(sid);
+    this.chatSeq = this.chatSeq + 1;
+    const si: TimelineItem = new TimelineItem('y' + this.chatSeq.toString(), 'system', ts);
+    si.role = kind;
+    si.text = text;
+    items.push(si);
+    this.notifyActive(sid);
+  }
+
+  private cacheOf(sid: string): TimelineItem[] {
+    let items: TimelineItem[] | undefined = this.cache.get(sid);
     if (items === undefined) {
       items = [];
       this.cache.set(sid, items);
@@ -630,13 +830,13 @@ export class SessionStore {
     return items;
   }
 
-  /** 结构性变化后整数组替换（数组快照与 cache 共享 ChatItem 实例）。 */
+  /** 结构性变化后整数组替换（数组快照与 cache 共享 TimelineItem 实例）。 */
   private notifyActive(sid: string): void {
     if (sid !== this.activeId) {
       return;
     }
-    const items: ChatItem[] | undefined = this.cache.get(sid);
-    this.messages = items !== undefined ? items.slice() : [];
+    const items: TimelineItem[] | undefined = this.cache.get(sid);
+    this.timeline = items !== undefined ? items.slice() : [];
   }
 
   /** 会话被移除后清缓存；活动会话被删则退回空。 */
@@ -647,7 +847,7 @@ export class SessionStore {
       alive.set(this.sessions[i].sessionId, true);
     }
     const keys: string[] = [];
-    this.cache.forEach((v: ChatItem[], k: string): void => {
+    this.cache.forEach((v: TimelineItem[], k: string): void => {
       keys.push(k);
     });
     for (let j: number = 0; j < keys.length; j++) {
@@ -658,7 +858,7 @@ export class SessionStore {
     }
     if (this.activeId.length > 0 && !alive.has(this.activeId)) {
       this.activeId = '';
-      this.messages = [];
+      this.timeline = [];
     }
   }
 
@@ -870,6 +1070,39 @@ export class SessionStore {
         if (data.text !== undefined) {
           this.appendDelta(sid4, data.text);
         }
+        break;
+      }
+      case TOPIC_TOOL_CALL: {
+        // 契约 §5.7 v1.0.6：工具调用开始 → 工作步骤（running）
+        const sidT: string = data.sessionId !== undefined ? data.sessionId : '';
+        this.upsertStep(sidT,
+          data.callId !== undefined ? data.callId : '',
+          data.name !== undefined ? data.name : '',
+          data.arguments !== undefined ? data.arguments : '',
+          'running', '', '',
+          data.ts !== undefined ? data.ts : Date.now());
+        break;
+      }
+      case TOPIC_TOOL_RESULT: {
+        // 契约 §5.7 v1.0.6：工具调用结束 → 工作步骤定稿
+        const sidR: string = data.sessionId !== undefined ? data.sessionId : '';
+        const st: string = data.status !== undefined ? data.status : 'ok';
+        this.upsertStep(sidR,
+          data.callId !== undefined ? data.callId : '',
+          '',
+          '',
+          st === 'error' ? 'error' : 'ok',
+          data.resultText !== undefined ? data.resultText : '',
+          data.errorText !== undefined ? data.errorText : '',
+          data.ts !== undefined ? data.ts : Date.now());
+        break;
+      }
+      case TOPIC_SYSTEM_MESSAGE: {
+        // 契约 §5.7 v1.0.6：系统/开发者消息
+        const sidS: string = data.sessionId !== undefined ? data.sessionId : '';
+        const kind: string = data.kind !== undefined ? data.kind : 'system';
+        this.appendSystem(sidS, kind, data.text !== undefined ? data.text : '',
+          data.ts !== undefined ? data.ts : Date.now());
         break;
       }
       case TOPIC_TURN_END: {

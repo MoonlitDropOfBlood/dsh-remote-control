@@ -26,6 +26,7 @@ import {
   DshrcAnswers,
   DshrcSessionSummary,
   DshrcHistoryPage,
+  DshrcCapabilities,
   DshrcSubagentInfo,
   DshrcRelayFrame,
   DshrcRelayPeers,
@@ -43,6 +44,7 @@ import {
   MSG_RESULT,
   MSG_SESSION_LIST,
   MSG_SESSION_HISTORY,
+  MSG_SESSION_CAPABILITIES,
   MSG_SESSION_SUBAGENTS,
   MSG_SESSION_SUBAGENT_PROMPT,
   MSG_SESSION_SUBAGENT_CANCEL,
@@ -86,6 +88,13 @@ export interface LinkConfig {
 export interface LinkPeers {
   host: boolean;
   client: boolean;
+}
+
+/** 主机信息（业务 hello 响应，§5.1）：连接信息页展示。 */
+export interface DshrcHostInfo {
+  hostName: string;
+  dshVersion: string;
+  pluginVersion: string;
 }
 
 /** seen 去重桶（契约 §4 v1.0.2）：按发送端 sid 分桶。 */
@@ -207,6 +216,8 @@ export class DshrcLink {
   onEvent: ((m: DshrcMsg) => void) | null = null;
   onPeers: ((p: LinkPeers) => void) | null = null;
   onLog: ((line: string) => void) | null = null;
+  /** 业务 hello 成功回调（连接信息页展示主机名/版本）。 */
+  onHello: ((info: DshrcHostInfo) => void) | null = null;
 
   getState(): LinkState {
     return this.state;
@@ -644,8 +655,15 @@ export class DshrcLink {
       this.correlator.request((m: DshrcMsg) => {
         this.sealAndSend(m);
       }, MSG_HELLO, payload, HOST_HELLO_TIMEOUT_MS).then((v: DshrcValue) => {
-        this.log('host hello: ' + (v.hostName !== undefined ? v.hostName : '?') + ' ' +
-          (v.dshVersion !== undefined ? v.dshVersion : ''));
+        const info: DshrcHostInfo = {
+          hostName: v.hostName !== undefined ? v.hostName : '',
+          dshVersion: v.dshVersion !== undefined ? v.dshVersion : '',
+          pluginVersion: v.pluginVersion !== undefined ? v.pluginVersion : ''
+        };
+        this.log('host hello: ' + info.hostName + ' ' + info.dshVersion);
+        if (this.onHello !== null) {
+          this.onHello(info);
+        }
       }).catch((e: Error) => {
         // host 离线属正常（中继已缓存该帧），只记录
         this.log('business hello pending/failed: ' + e.message);
@@ -677,7 +695,8 @@ export class DshrcLink {
   }
 
   /** session.history（§5.1 v1.0.4）：向后翻页的历史消息页。
-   *  beforeSeq 缺省取最新一页；向前翻页回传上一页的 oldestSeq。 */
+   *  beforeSeq 缺省取最新一页；向前翻页回传上一页的 oldestSeq。
+   *  v1.0.6：响应额外带 steps（工作步骤，§5.7）。 */
   sessionHistory(sessionId: string, beforeSeq?: number, maxMessages?: number): Promise<DshrcHistoryPage> {
     const p: DshrcPayload = { sessionId: sessionId };
     if (beforeSeq !== undefined && beforeSeq >= 0) {
@@ -689,10 +708,26 @@ export class DshrcLink {
     return this.request(MSG_SESSION_HISTORY, p, 20000).then((v: DshrcValue): DshrcHistoryPage => {
       const page: DshrcHistoryPage = {
         messages: v.messages !== undefined ? v.messages : [],
+        steps: v.steps !== undefined ? v.steps : [],
         hasMore: v.hasMore === true,
         oldestSeq: v.oldestSeq !== undefined ? v.oldestSeq : 0
       };
       return page;
+    });
+  }
+
+  /** session.capabilities（§5.1 v1.0.6）：新建会话可选的「模式」与「权限」目录。
+   *  宿主不支持时返回空目录（客户端隐藏选择区，不报错）。 */
+  sessionCapabilities(): Promise<DshrcCapabilities> {
+    const p: DshrcPayload = {};
+    return this.request(MSG_SESSION_CAPABILITIES, p, 15000).then((v: DshrcValue): DshrcCapabilities => {
+      const caps: DshrcCapabilities = {
+        presets: v.presets !== undefined ? v.presets : [],
+        permissions: v.permissions !== undefined ? v.permissions : [],
+        defaultPreset: v.defaultPreset !== undefined ? v.defaultPreset : '',
+        defaultPermission: v.defaultPermission !== undefined ? v.defaultPermission : ''
+      };
+      return caps;
     });
   }
 
@@ -724,11 +759,21 @@ export class DshrcLink {
     });
   }
 
-  /** session.create（§5.1）：返回新建会话的 sessionId。 */
-  sessionCreate(title: string): Promise<string> {
+  /** session.create（§5.1）：返回新建会话的 sessionId。
+   *  v1.0.6：可带 agentPreset（模式）与 permission（权限档位，§5.8）。 */
+  sessionCreate(title: string, agentPreset?: string, permission?: string, cwd?: string): Promise<string> {
     const p: DshrcPayload = {};
     if (title.length > 0) {
       p.title = title;
+    }
+    if (agentPreset !== undefined && agentPreset.length > 0) {
+      p.agentPreset = agentPreset;
+    }
+    if (permission !== undefined && permission.length > 0) {
+      p.permission = permission;
+    }
+    if (cwd !== undefined && cwd.length > 0) {
+      p.cwd = cwd;
     }
     return this.request(MSG_SESSION_CREATE, p).then((v: DshrcValue): string => {
       return v.sessionId !== undefined ? v.sessionId : '';

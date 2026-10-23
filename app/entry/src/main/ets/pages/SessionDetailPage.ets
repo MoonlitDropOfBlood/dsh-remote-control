@@ -1,23 +1,23 @@
 /*
  * Copyright (c) 2026 dukedsh.
- * 五页面之③：会话详情页（NavDestination，param = SessionDetailParam）。
- *  - 消息气泡流：用户右对齐品牌蓝 / assistant 左对齐浅面卡片；代码片段等宽字体
+ * 会话详情页（NavDestination，param = SessionDetailParam）。
+ *  - 统一时间线：store.timeline 按 kind 分派（消息气泡 / 工作步骤卡 / 系统说明行）→ TimelineView
  *  - assistant.delta 流式追加到当前气泡（带光标），turn.end 定稿
  *  - 底部输入条 + 发送；running 时显示「取消」；顶部标题栏 + 运行状态徽标
  *  - 本会话的审批 / 提问卡片内嵌在输入条上方（AskCards），resolved 后自动消失
  */
-import { Markdown, MarkdownController } from '@luvi/lv-markdown-in';
+import { MarkdownController } from '@luvi/lv-markdown-in';
 import { promptAction } from '@kit.ArkUI';
 import { HRouter } from 'hrouter';
 import { dshrcLink } from '../model/link';
 import { SessionDetailParam, goBack, openSessionDetail } from '../model/routes';
 import {
   ApprovalCard,
-  ChatItem,
   QuestionCard,
   SessionRow,
   SessionStore,
   SubagentRow,
+  TimelineItem,
   sessionStore
 } from '../model/sessionstore';
 import {
@@ -26,17 +26,16 @@ import {
   FS_SMALL,
   FS_SUBTITLE,
   HAIRLINE,
-  RADIUS_BUBBLE,
   RADIUS_CARD,
   RADIUS_CTRL,
   RADIUS_PILL,
   SP_1,
   SP_2,
   SP_3,
-  SP_4,
-  clockTime
+  SP_4
 } from '../model/theme';
 import { ApprovalCardView, QuestionCardView } from './AskCards';
+import { TimelineView } from './TimelineView';
 
 
 /** 子代理目录 chip（契约 §5.6 v1.0.5；点击进入子代理详情）。 */
@@ -77,88 +76,6 @@ struct SubagentChip {
     .onClick((): void => {
       this.onOpen(this.row.sessionId);
     })
-  }
-}
-
-/** 单条消息气泡（agent 消息用 lv-markdown-in 渲染 markdown）。 */
-@ComponentV2
-struct MessageBubble {
-  @Require @Param item: ChatItem;
-  /** 共享的 markdown 渲染控制器（DSH 风格配色，页面级创建后下传）。 */
-  @Require @Param mdController: MarkdownController;
-
-  build() {
-    Column() {
-      if (this.item.role === 'user') {
-        // 用户：右对齐品牌蓝气泡。Text 自身即气泡（padding/bg 挂 Text），
-        // constraintSize 的百分比解析自外层 Row（定宽）——绝不把 width('100%')
-        // 塞进自适应 Column（循环百分比 → 不换行 → 文字甩出气泡，真机实测 bug）。
-        Row() {
-          Text(this.item.text)
-            .fontSize(FS_BODY)
-            .fontColor($r('app.color.label_on_brand'))
-            .padding({ left: 12, right: 12, top: 10, bottom: 10 })
-            .backgroundColor($r('app.color.brand_fill'))
-            .borderRadius(RADIUS_BUBBLE)
-            .constraintSize({ maxWidth: '82%' })
-        }
-        .width('100%')
-        .justifyContent(FlexAlign.End)
-        .margin({ top: SP_1, bottom: SP_1 })
-      } else {
-        // 助手：左对齐浅面卡片 + lv-markdown-in 渲染（标题/列表/表格/代码块/行内代码/
-        // 引用/分割线全支持；text 随流式增量更新，库侧 @Prop 响应）。
-        Row() {
-          Column() {
-            Markdown({
-              text: this.item.text,
-              controller: this.mdController
-            })
-              .width('100%')
-            if (this.item.streaming) {
-              Text('▍')
-                .fontSize(FS_BODY)
-                .fontColor($r('app.color.brand_fill'))
-                .margin({ top: 2 })
-            }
-            if (this.item.errorText.length > 0) {
-              Text(this.item.errorText)
-                .fontSize(FS_SMALL)
-                .fontColor($r('app.color.state_error'))
-                .margin({ top: SP_1 })
-            }
-          }
-          .width('82%')
-          .alignItems(HorizontalAlign.Start)
-          .padding({ left: 12, right: 12, top: 10, bottom: 10 })
-          .backgroundColor($r('app.color.bg_layer_1'))
-          .border({ width: HAIRLINE, color: $r('app.color.border_l1') })
-          .borderRadius(RADIUS_BUBBLE)
-        }
-        .width('100%')
-        .justifyContent(FlexAlign.Start)
-        .margin({ top: SP_1, bottom: SP_1 })
-      }
-
-      Row() {
-        if (this.item.role === 'user') {
-          Blank()
-          Text(clockTime(this.item.ts))
-            .fontSize(FS_CAPTION)
-            .fontColor($r('app.color.label_tertiary'))
-        } else {
-          Text(clockTime(this.item.ts))
-            .fontSize(FS_CAPTION)
-            .fontColor($r('app.color.label_tertiary'))
-          Blank()
-        }
-      }
-      .width('100%')
-      .padding({ left: 2, right: 2 })
-      .margin({ top: 2 })
-    }
-    .width('100%')
-    .margin({ bottom: SP_1 })
   }
 }
 
@@ -274,15 +191,15 @@ export struct SessionDetailPage {
   }
 
   /** 新气泡或流式增长时贴底滚动；顶部加载更早消息（prepend）不打断阅读位置。 */
-  @Monitor('store.messages')
+  @Monitor('store.timeline')
   onMessagesChanged(mon: IMonitor): void {
-    const now: ChatItem[] | undefined = mon.value<ChatItem[]>()?.now;
-    const before: ChatItem[] | undefined = mon.value<ChatItem[]>()?.before;
+    const now: TimelineItem[] | undefined = mon.value<TimelineItem[]>()?.now;
+    const before: TimelineItem[] | undefined = mon.value<TimelineItem[]>()?.before;
     if (now === undefined) {
       return;
     }
-    const lastNow: ChatItem | undefined = now.length > 0 ? now[now.length - 1] : undefined;
-    const lastBefore: ChatItem | undefined =
+    const lastNow: TimelineItem | undefined = now.length > 0 ? now[now.length - 1] : undefined;
+    const lastBefore: TimelineItem | undefined =
       before !== undefined && before.length > 0 ? before[before.length - 1] : undefined;
     const tailChanged: boolean = lastNow !== undefined &&
       (lastBefore === undefined || lastBefore.id !== lastNow.id);
@@ -484,16 +401,15 @@ export struct SessionDetailPage {
       Scroll(this.scroller) {
         Column() {
           this.historyBar()
-          if (this.store.messages.length === 0) {
+          if (this.store.timeline.length === 0) {
             if (!this.store.historyLoading) {
               this.emptyState()
             }
           } else {
-            Repeat(this.store.messages)
-              .each((cell: RepeatItem<ChatItem>): void => {
-                MessageBubble({ item: cell.item, mdController: this.mdCtrl })
-              })
-              .key((m: ChatItem): string => m.id)
+            TimelineView({
+              items: this.store.timeline,
+              mdController: this.mdCtrl
+            })
           }
         }
         .width('100%')

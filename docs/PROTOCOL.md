@@ -1,6 +1,7 @@
 # dsh-remote-control：手机（HarmonyOS）远程控制 DSH —— 架构与协议契约
 
-> 状态：v1 契约（2026-10-20，由 Lead 冻结）。三个实现（DSH 插件 / 中继服务器 / HarmonyOS App）
+> 状态：v1 契约（2026-10-20 由 Lead 冻结；**v1.0.6 于 2026-10-23 增补：会话时间线（工具步骤）
+> 与新建会话的「模式/权限」选择**）。三个实现（DSH 插件 / 中继服务器 / HarmonyOS App）
 > 都必须以本文档为准；任何协议改动必须先改本文档并通知 Lead。
 
 ## 1. 目标与范围（用户已确认）
@@ -112,11 +113,12 @@ dshrc://pair?r=<encodeURIComponent(relayUrl)>&c=<channel>&s=<secret>[&t=<encodeU
 |---|---|---|---|
 | `hello` | `{proto:1, clientName, appVersion, pushToken?, sig}` | `{hostName, dshVersion, pluginVersion}` | 连接/重连后首条；`sig` 见 §3.4 |
 | `session.list` | `{}` | `{sessions:[SessionSummary]}` | SessionSummary 见 §5.3（**v1.0.5 移除 includeArchived**：Host 会话域无归档概念，归档属 Workspace 注册表） |
-| `session.history` | `{sessionId, beforeSeq?:number, maxMessages?:number}` | `{messages:[ChatMessage], hasMore, oldestSeq}` | **v1.0.4** 向后翻页的历史消息；`beforeSeq` 缺省取最新一页。ChatMessage：`{id, role:"user"\|"assistant", text, ts, seq}`。subagent 会话自动走 durable subagent 地址 |
+| `session.history` | `{sessionId, beforeSeq?:number, maxMessages?:number}` | `{messages:[ChatMessage], steps:[StepRecord], hasMore, oldestSeq}` | **v1.0.4** 向后翻页的历史消息；`beforeSeq` 缺省取最新一页。ChatMessage：`{id, role:"user"\|"assistant", text, ts, seq}`。subagent 会话自动走 durable subagent 地址。**v1.0.6**：新增 `steps`（工具步骤，§5.7）——旧插件不返该字段时客户端只显示消息 |
 | `session.subagents` | `{sessionId}` | `{subagents:[SubagentInfo]}` | **v1.0.5** 父会话的直接子代理目录（父会话 `subagentCatalog` 投影 + 运行态）。SubagentInfo 见 §5.6 |
 | `session.subagentPrompt` | `{parentSessionId, childSessionId, text}` | `{accepted:bool}` | **v1.0.5** 向 **continuable** 子代理发消息（delivery:'queue'）；one-shot 子代理返回 `unsupported` 错误。回复走同一事件流（sessionId=child） |
 | `session.subagentCancel` | `{parentSessionId, childSessionId}` | `{accepted:bool}` | **v1.0.5** 取消 continuable 子代理当前 turn（interruptByParent；accepted=信号已受理，非已停止） |
-| `session.create` | `{title?, cwd?}` | `{sessionId}` | cwd 缺省用主机默认工作目录 |
+| `session.create` | `{title?, cwd?, agentPreset?, permission?}` | `{sessionId, agentPreset?}` | cwd 缺省用主机默认工作目录。**v1.0.6**：`agentPreset` = 模式（Host Agent preset id，§5.8）；`permission` = 权限档位 id（§5.8）。两者缺省时由 Host 用自身默认值 |
+| `session.capabilities` | `{}` | `{presets:[ModeOption], permissions:[PermissionOption], defaultPreset?, defaultPermission?}` | **v1.0.6** 新建会话可选的「模式」与「权限」目录（§5.8）。宿主未提供对应能力时对应数组为空——客户端隐藏该选择区，不得报错 |
 | `session.prompt` | `{sessionId, text}` | `{accepted:bool}` | 立即返回；实际回复走事件流 |
 | `session.cancel` | `{sessionId}` | `{cancelled:bool}` | 取消当前运行的 turn |
 | `session.rename` | `{sessionId, title}` | `{title}` | |
@@ -134,6 +136,9 @@ dshrc://pair?r=<encodeURIComponent(relayUrl)>&c=<channel>&s=<secret>[&t=<encodeU
 | `session.status` | `{sessionId, running:bool}` | 事件 `api-session/status` / `agent/status` |
 | `session.activity` | `{sessionId, updatedAt}` | 事件 `api-session/activity` |
 | `assistant.delta` | `{sessionId, text}` | 事件 `agent/assistant-stream`（文本增量；**按 sessionId 合并节流 ≤8 条/秒**） |
+| `tool.call` | `{sessionId, callId, name, arguments, ts}` | **v1.0.6** Host 会话事件 `tool/call`（模型发起一次工具调用） |
+| `tool.result` | `{sessionId, callId, status:"ok"\|"error", resultText, errorText?, ts}` | **v1.0.6** Host 会话事件 `tool/result`（工具调用结束；`resultText` 为结果文本，失败时 `errorText` 为原因） |
+| `system.message` | `{sessionId, kind:"system"\|"developer", text, ts}` | **v1.0.6** Host 会话事件 `system/message` / `developer/message`（系统提示注入等非对话内容） |
 | `turn.end` | `{sessionId, status:"idle"\|"error", error?}` | 事件 `agent/status`(idle) / `agent/error` |
 | `approval.request` | `{askId, sessionId, toolName, reason, argsPreview, timeoutMs}` | 瀑布 `approval/request` |
 | `approval.resolved` | `{askId, decision, source:"phone"\|"timeout"\|"desktop"}` | 瀑布收束时回推（手机 UI 消除卡片用） |
@@ -204,6 +209,63 @@ dshrc://pair?r=<encodeURIComponent(relayUrl)>&c=<channel>&s=<secret>[&t=<encodeU
 - `running`/`hasChildren`：运行态/是否有孙代（客户端可再下钻）。
 - 事件流（`assistant.delta`/`turn.end`/`session.status` 等）以子代理 sessionId
   寻址，与普通会话一致——子代理详情页天然可复用流式渲染。
+
+### 5.7 StepRecord — 会话时间线里的「工作步骤」（v1.0.6）
+
+`session.history` 除 `messages` 外新增 `steps` 数组；直播期由 `tool.call` / `tool.result`
+事件补齐。客户端把 `messages` 与 `steps` 合并成一条按 `seq` 升序的**时间线**渲染
+（消息气泡 + 可展开的工作步骤卡），而不是只显示对话。
+
+```json
+{ "seq": 42, "callId": "call_abc", "name": "bash",
+  "arguments": "{\"command\":\"ls -la\"}",
+  "status": "ok",            // "ok" | "error"（直播期未收到结果时为 "running"）
+  "resultText": "…输出…",     // 可空串
+  "errorText": "",           // status="error" 时的原因
+  "ts": 1760000000000,
+  "turn": 3, "step": 2 }
+```
+
+字段规则：
+
+- `seq`：Host 会话日志中该事件的持久序号（与 `ChatMessage.seq` 同一序列，**合并排序键**）；
+  直播事件（`tool.call`/`tool.result`）无持久序号时客户端按到达顺序追加在末尾。
+- `callId`：配对键——`tool/call` 与 `tool/result` 用它配对；客户端据此把
+  「开始调用」升级为「已完成」。
+- `name`：工具名（wire Tool name，如 `bash` / `read` / `write` / `grep`…）。
+- `arguments`：模型产出的**原始参数字符串**（未解析，JSON 文本）。
+- `resultText`：结果的纯文本摘要（内容块的 text 拼接；图片/文件类内容用占位符）。
+- `turn` / `step`：Host 的轮次与步号（客户端可据此把同一轮内的步骤归为一个「工作步骤」组）。
+
+**降级**：宿主/旧插件不提供步骤（无 `steps` 字段、无 `tool.*` 事件）时，客户端只渲染
+`messages`，功能不受影响——**不得**因此报错或阻断会话。
+
+### 5.8 新建会话的「模式」与「权限」（v1.0.6）
+
+手机端「新建会话」允许在创建前选择 Host 已有的**模式**（Agent preset）与**权限档位**
+（permission preset），与 DSH 桌面端语义一致：
+
+- 模式 = Host 的 Agent preset（Standard / Creator / PTC / Minimal / 自定义…），
+  决定该会话运行哪套插件组合；
+- 权限 = permission preset（`read-only` 仅可查看 / `workspace-write` 工作区内修改 /
+  `danger-full-access` 完全权限 / `auto` 自动审查…），把沙箱模式与审批策略打包。
+
+```json
+// session.capabilities 的响应 value
+{ "presets":    [ { "id": "standard", "name": "Standard", "description": "标准模式" } ],
+  "permissions":[ { "id": "workspace-write", "name": "工作区内修改", "description": "…" } ],
+  "defaultPreset": "standard",
+  "defaultPermission": "workspace-write" }
+```
+
+- `id` 是提交给 `session.create` 的**稳定标识**（Agent preset id / permission preset key）；
+  `name` / `description` 是展示文案（客户端直接显示，**不做本地化映射**——宿主给什么就显示什么）。
+- `defaultPreset` / `defaultPermission` 可缺省；客户端此时默认选中第一项。
+- 宿主没有对应能力时数组为空（客户端隐藏选择区，仍可正常建会话）。
+- `session.create` 携带 `agentPreset` / `permission` 时，宿主按该值创建；宿主拒绝时
+  回 `result{ok:false, error:{code:"unsupported-…"}}`，客户端回退为「不带选项创建」并提示。
+- **权限选择的生效时机**：Host 侧权限档位在新会话「首次发布」前写入（构造种子）；
+  已存在的会话不受后续默认值变更影响（与 Host 语义一致）。
 
 ## 6. Push Kit（华为推送）旁路
 
@@ -327,3 +389,31 @@ AAD     = ""   ← 注意：本 KAT 用空 AAD，便于对齐；AAD 绑定逻辑
   同 URL 的 ESM 缓存无效时需文件更名破缓存。2026-10-20 联调中最终经 remove+install 生效。
 - 中继 v1.0.2 起必须**透传** `sid` 字段（活转发、离线缓存、补发三处都带上），否则接收端
   `sid:seq` 去重退化为裸 seq 误杀新连接（实测 bug：第二个客户端的 hello 被当重复帧丢弃）。
+
+## 附录 B：Host API 事实（v1.0.6 工作步骤 / 模式 / 权限，2026-10-23 实测自 @deepseek-ai/dsh-* 类型定义）
+
+- **会话事件总闸**：`ctx.on('session/event', (session, event) => …)` —— 宿主每写入一条
+  会话日志事件都会触发；`event = { type, data, time, seq }`，`session.id` 为会话 id。
+  事件类型（`@deepseek-ai/dsh-session` 的 `SessionEventMap`）：
+  - `tool/call` → `data = { turn, step, callId, name, arguments }`（arguments 是**原始 JSON 字符串**）
+  - `tool/result` → `data = { turn, step, message: { role:'tool', toolCallId, isError?, content:[ContentBlock] }, error?{name,code,reason?}, meta? }`
+  - `system/message` → `data = { turn, step, message: SystemMessage }`
+  - `developer/message` → `data = { turn, step, message: DeveloperMessage }`
+  - `assistant/message` / `user/message` → 对话（既有 §5.2 口径）
+  插件按 `event.type` 分派到 `tool.call` / `tool.result` / `system.message` 三个新事件即可。
+- **模式目录（Agent preset）**：`ctx.get('agentPresets')` → `AgentPresetRegistry`：
+  - `list(): Promise<AgentPreset[]>`，`AgentPreset = { id, name?, description?, order?, broken? }`
+  - `defaultId: string` —— 默认模式 id
+  - 创建会话时 `sessionController.create({ cwd, agentPreset })` 接受 `agentPreset`（§5.1 SessionCreateRequest）。
+- **权限目录（permission preset）**：`ctx.get('permissionPresets')` → `PermissionPresetService`：
+  - `catalog(): PermissionCatalog` → `{ options: PresetOption[], defaultOptions: PresetOption[], defaultPreset: string }`，
+    `PresetOption = { id, name, description? }`（`id` 即提交用的 key；`custom` 只是展示态，永不可选）。
+    **⚠️ 宿主 0.2.1-rc.2 实测：catalog 的 option 字段名是 `value`（不是 `id`）**——
+    插件两种字段名都要接受，**wire 侧统一输出 `id`**（本契约口径）。
+  - `set(session, name): void` —— 把档位写入**某个已存在的会话**（追加 `permission/preset` 与
+    沙箱/审批 knob 事件）；需拿到 live Session 对象（`sessionController.resolveAgent(sessionId)`
+    → 宿主 0.2.1-rc.2 **直接返回 Agent**（失败时 throw），更早/更晚版本可能返回 `{agent}|{error}`，
+    插件两种形状都要兜住）。
+  - 宿主未装载该插件时 `ctx.get('permissionPresets')` 为空 → 插件回空目录，客户端隐藏权限选择。
+- **内容块**：`ContentBlock` 的 `type` ∈ `text` / `image` / `file` / `reasoning` / `tool-call` …；
+  结果文本只取 `type==='text'` 的 `text` 拼接，image/file 用占位符（`[图片]` / `[文件]`）。

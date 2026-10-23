@@ -25,38 +25,6 @@ import { StepCard } from './StepCard';
 /** 系统说明行：字符数超过该阈值视为可能超过 2 行（折叠 + 可展开）。 */
 const SYSTEM_FOLD_CHARS: number = 80;
 
-/** 【临时调试用，交付前删除】真机视觉验证：注入假的工作步骤分组。 */
-const DEBUG_FAKE_STEPS: boolean = true;
-
-/** 【临时调试用，交付前删除】假的工作步骤（覆盖 description / file_path / 命令 / 兜底四种标题）。 */
-function fakeSteps(): TimelineItem[] {
-  const out: TimelineItem[] = [];
-  const a: TimelineItem = new TimelineItem('dbg1', 'step', Date.now() - 60000);
-  a.toolName = 'bash';
-  a.argsText = '{"description":"列出临时目录内容","command":"ls -la /tmp"}';
-  a.status = 'ok';
-  a.resultText = 'total 8\ndrwxrwxrwt 2 root root 4096 Jan  1 00:00 .\ndrwxr-xr-x 4 root root 4096 Dec 31 23:59 ..';
-  out.push(a);
-  const b: TimelineItem = new TimelineItem('dbg2', 'step', Date.now() - 30000);
-  b.toolName = 'read';
-  b.argsText = '{"file_path":"D:/ai-projects/dsh/dsh-remote-control/app/AGENTS.md"}';
-  b.status = 'ok';
-  b.resultText = '# AGENTS.md — app/（HarmonyOS 手机 App）\n'.repeat(30);
-  out.push(b);
-  const c: TimelineItem = new TimelineItem('dbg3', 'step', Date.now() - 10000);
-  c.toolName = 'shell';
-  c.argsText = '{"command":"cd /d/ai-projects && git status --short"}';
-  c.status = 'error';
-  c.errorText = "fatal: not a git repository (or any of the parent directories): .git";
-  out.push(c);
-  const d: TimelineItem = new TimelineItem('dbg4', 'step', Date.now());
-  d.toolName = 'write';
-  d.argsText = '{"path":"out.txt","content":"hello"}';
-  d.status = 'running';
-  out.push(d);
-  return out;
-}
-
 /** 时间线条目：单条消息 / 系统行，或一组连续的工作步骤。 */
 interface TimelineEntry {
   /** Repeat 的稳定 key（分组用首步 id 前缀）。 */
@@ -273,9 +241,6 @@ export struct TimelineView {
 
   build() {
     Column() {
-      if (DEBUG_FAKE_STEPS) {
-        StepGroup({ steps: fakeSteps() })
-      }
       Repeat(this.timelineEntries())
         .each((cell: RepeatItem<TimelineEntry>): void => {
           if (cell.item.isGroup) {

@@ -100,6 +100,17 @@ export function isLocalHost(host, ifaces = networkInterfaces()) {
   return false;
 }
 
+/** 当前生效的 DNS lookup（N10 门禁注入点；生产恒为 node:dns/promises 的 lookup）。 */
+let dnsLookup = lookup;
+
+/**
+ * 替换/复位 DNS lookup 实现——**仅限单测注入**（生产代码不得调用）。
+ * @param {Function|null} fn 传 null 复位为真实 lookup
+ */
+export function setDnsLookup(fn) {
+  dnsLookup = typeof fn === "function" ? fn : lookup;
+}
+
 /**
  * host 是否指向本机（**含 DNS 解析**：本机名/本机别名也认）。
  * 解析失败一律按「非本机」处理（保守：宁可不管，也不误托管别人的服务）。
@@ -113,7 +124,7 @@ export async function isLocalHostResolved(host) {
   // **N10：DNS 解析必须有超时**——异常 DNS 会让每轮看门狗阻塞数秒。
   try {
     const res = await Promise.race([
-      lookup(h),
+      dnsLookup(h),
       new Promise((_, reject) => {
         const t = setTimeout(() => reject(new Error("dns timeout")), 2000);
         if (typeof t.unref === "function") t.unref();
@@ -229,12 +240,16 @@ export class RelaySupervisor {
     this.status = emptyStatus();
     /** 在途 ensure 的 promise（并发去重锁）。 */
     this.pending = null;
-    /** 在途 ensure 的目标地址（N8：目标不同不能复用旧 promise）。 */
-    this.pendingTarget = null;
     /** 永久停用标志（dispose 后不再启动任何进程）。 */
     this.disposed = false;
-    /** 子进程输出缓冲（启动失败时把原因带给宿主日志）。 */
-    this.output = "";
+    /**
+     * 停止世代号（第三轮审计 #1）：每次 stop() 自增。
+     * 在途的 ensure() 用它判断「我探测端口期间，世界有没有人喊停」——
+     * 有就放弃 spawn，否则设置页刚清空地址、中继却又被拉起来（孤儿）。
+     */
+    this.epoch = 0;
+    /** 当前子进程是否**曾确认过监听**（第三轮审计 #2：区分「还在启动」和「僵尸」）。 */
+    this.childReady = false;
   }
 
   /** 更新状态并通知宿主（宿主据此刷新设置页快照——S2：不能只在 ensure 时拍快照）。 */
@@ -273,23 +288,16 @@ export class RelaySupervisor {
    * @returns {Promise<object>} 状态快照
    */
   async ensure(relayUrl, opts = {}) {
-    // 并发去重：看门狗 tick 与 setRelayUrl 可能同时打进来（S3）
-    // **N8**：目标不同（换地址了）时不能直接复用旧 promise——那会把**陈旧端口**返回给调用方。
-    // 这种情况等前一个跑完，再按新目标跑一次。
-    if (this.pending) {
-      const same = this.pendingTarget === relayUrl;
-      const first = this.pending;
-      await first.catch(() => {});
-      if (same) return await first;
-      this.log("info", "relay target changed while ensure was in flight", {
-        from: this.pendingTarget,
-        to: relayUrl,
-      });
+    // 串行化：等在途的跑完，然后**每次都亲自跑一遍** #ensureInner。
+    // （S3 并发去重 + N8：不能把「别人那一次」的结果当成自己的返回值——
+    //   目标可能不同，也可能在等待期间世界已经变了（比如我们等的那次
+    //   又被第三次 ensure 顶掉）。已托管且一致时 #ensureInner 是廉价的
+    //   （一次端口探测就返回），串行化没有性能问题。）
+    while (this.pending) {
+      await this.pending.catch(() => {});
     }
-    this.pendingTarget = relayUrl;
     this.pending = this.#ensureInner(relayUrl, opts).finally(() => {
       this.pending = null;
-      this.pendingTarget = null;
     });
     return await this.pending;
   }
@@ -335,29 +343,45 @@ export class RelaySupervisor {
       return this.status;
     }
     // 已在托管：端口一致才复用；端口变了必须换进程（S1：原来只判「活着」就 return）
+    let baseEpoch = this.epoch;
     if (this.isChildAlive()) {
       if (this.childPort === target.port) {
         // **N6：不能只看「进程活着」就说 running**——中继可能还没监听
         // （启动慢/端口被占后重试）→ running:true 会让看门狗从此失明。
         // 端口确实在监听才算真的在跑。
         const listening = await isRelayPortBusy(target.port, target.host);
-        this.#publish({
-          managed: true,
-          running: listening,
-          pid: this.child?.pid || 0,
-          port: this.childPort,
-          reason: "managed",
-          detail: listening
-            ? `中继进程由插件托管（pid ${this.child?.pid || 0}，端口 ${this.childPort}）。`
-            : `中继进程已启动（pid ${this.child?.pid || 0}），但端口 ${this.childPort} 尚未监听，稍后重试。`,
+        // **僵尸替换（第三轮审计 #2）**：曾确认过监听、现在探不到了 →
+        // 进程活着但已经不服务（真中继的 wss 'error' 只记日志不退出）→ 换掉它。
+        // 从未确认过监听 → 还在启动等待期，别急着换（8s 内会再探）。
+        if (!listening && this.childReady) {
+          this.log("warn", "managed relay alive but no longer listening; replacing it", {
+            pid: this.child?.pid || 0,
+            port: this.childPort,
+          });
+          await this.stop();
+          baseEpoch = this.epoch;
+          // 落到下面的端口占用检查 / 重新 spawn
+        } else {
+          this.#publish({
+            managed: true,
+            running: listening,
+            pid: this.child?.pid || 0,
+            port: this.childPort,
+            reason: "managed",
+            detail: listening
+              ? `中继进程由插件托管（pid ${this.child?.pid || 0}，端口 ${this.childPort}）。`
+              : `中继进程已启动（pid ${this.child?.pid || 0}），但端口 ${this.childPort} 尚未监听，稍后重试。`,
+          });
+          return this.status;
+        }
+      } else {
+        this.log("info", "relay port changed; restarting managed relay", {
+          from: this.childPort,
+          to: target.port,
         });
-        return this.status;
+        await this.stop();
+        baseEpoch = this.epoch;
       }
-      this.log("info", "relay port changed; restarting managed relay", {
-        from: this.childPort,
-        to: target.port,
-      });
-      await this.stop();
     }
     if (await isRelayPortBusy(target.port, target.host)) {
       // 外部已有中继在监听：不抢、不杀，只如实报告（external → 看门狗**仍会再探一次端口**，
@@ -378,6 +402,18 @@ export class RelaySupervisor {
         port: target.port,
         reason: "not-configured",
         detail: "插件已卸载，不再启动中继进程。",
+      });
+      return this.status;
+    }
+    // **世代号守卫（第三轮审计 #1）**：上面的端口探测是 await——期间可能有人喊停
+    // （设置页清空中继地址走 stop()、插件卸载走 dispose()）。
+    // 世代变了就放弃启动，否则刚清空的地址下中继又被拉起来（孤儿）。
+    if (this.epoch !== baseEpoch) {
+      this.#publish({
+        ...emptyStatus(),
+        port: target.port,
+        reason: "not-configured",
+        detail: "托管在启动前被停止，已取消本次启动。",
       });
       return this.status;
     }
@@ -422,28 +458,33 @@ export class RelaySupervisor {
     }
     this.child = child;
     this.childPort = port;
-    this.output = "";
+    this.childReady = false;
+    // 输出缓冲是**每个子进程一份**（第三轮审计 #6：共用 this.output 会让
+    // 新进程的崩溃日志夹带旧进程的输出）
+    let output = "";
+    // **确认监听之前不报 running**（第三轮审计 #4：spawn 到确认之间有最长 8s 窗口，
+    // 期间谎报「运行中」，启动失败时设置页会先显示运行中再翻转）
     this.#publish({
       managed: true,
-      running: true,
+      running: false,
       pid: child.pid || 0,
       port,
       reason: "managed",
-      detail: `中继进程由插件托管（pid ${child.pid || 0}，端口 ${port}）。`,
+      detail: `正在启动中继进程（pid ${child.pid || 0}，端口 ${port}）…`,
     });
 
     // 收集子进程输出：启动失败/崩溃时把原因带给宿主日志（M2：原来全被吞掉；
     // N3：崩溃时 stderr 也要进日志，否则崩溃循环的根因 100% 不可见）
     const onData = (buf) => {
-      this.output += String(buf);
-      if (this.output.length > 4096) this.output = this.output.slice(-4096);
+      output += String(buf);
+      if (output.length > 4096) output = output.slice(-4096);
     };
     if (child.stdout) child.stdout.on("data", onData);
     if (child.stderr) child.stderr.on("data", onData);
 
     /** 取输出尾部（多行合并成一行，便于日志阅读；不含 base64 之类的大块内容）。 */
     const outputTail = () =>
-      this.output
+      output
         .trim()
         .split("\n")
         .filter((l) => l.trim() !== "")
@@ -520,7 +561,7 @@ export class RelaySupervisor {
     // **N3：启动没确认成功时，输出必须进日志**（原来被下面的早退跳过 →
     // 崩溃循环的根因完全不可见）。早退之前先记日志。
     if (!ready) {
-      const tail = this.output
+      const tail = output
         .trim()
         .split("\n")
         .filter((l) => l.trim() !== "")
@@ -539,6 +580,8 @@ export class RelaySupervisor {
       unrefAll();
       return this.status;
     }
+    // 只有我们**自己确认过监听**才记 childReady（僵尸替换的依据）
+    this.childReady = ready;
     // **N6：running 只在「真的监听着」时为 true**——
     // 活着但没监听（如中继启动慢）时报 running:true 会让看门狗从此失明。
     this.#publish({
@@ -618,6 +661,11 @@ export class RelaySupervisor {
     const child = this.child;
     this.child = null;
     this.childPort = 0;
+    // **世代号自增（第三轮审计 #1）**：任何 stop 都让「在途的 ensure」作废——
+    // 它探测端口回来后发现世代变了，就不会再把中继 spawn 出来
+    // （否则设置页刚清空地址，中继却又被拉起来，成了没人管的孤儿）。
+    this.epoch++;
+    this.childReady = false;
     if (!child) return;
     // 只有「进程真的结束了」才算停完；killed 只说明调过 kill
     if (child.exitCode !== null || child.signalCode !== null) {

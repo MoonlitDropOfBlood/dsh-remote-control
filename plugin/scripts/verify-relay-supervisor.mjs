@@ -15,12 +15,14 @@ import { spawn as realSpawn } from "node:child_process";
 import {
   RelaySupervisor,
   isLocalHost,
+  isLocalHostResolved,
   isPortListening,
   isRelayPortBusy,
   parseRelayTarget,
   resolveRelayEntry,
   shouldRestartRelay,
   shouldTickWatchdog,
+  setDnsLookup,
   PLUGIN_DIR,
 } from "../lib/relay-supervisor.mjs";
 
@@ -498,12 +500,15 @@ function stubEntry() {
   check("bundle：package.json 依赖 ws（中继的唯一依赖）", !!(pkg.dependencies && pkg.dependencies.ws));
 
   // 17c. 模拟 bundle 布局（只有 plugin/ 目录，没有仓库的 relay/）→ 仍能解析到入口
-  const fakePluginDir = mkdtempSync(join(tmpdir(), "dshrc-bundle-"));
+  // **嵌套父目录**（第三轮审计 #5）：直接放 TEMP 根的话，`../relay/server.js` 会撞上
+  // 共享 TEMP 里的残留 relay/（审计遗留过一次 → 全机门禁假红）。嵌套一层就隔离了。
+  const nestDir = mkdtempSync(join(tmpdir(), "dshrc-bundle-nest-"));
+  const fakePluginDir = join(nestDir, "plugin");
   mkdirSync(join(fakePluginDir, "vendor", "relay"), { recursive: true });
   copyFileSync(vendorEntry, join(fakePluginDir, "vendor", "relay", "server.js"));
   const resolvedInBundle = resolveRelayEntry(fakePluginDir, {});
   check("bundle 布局：能解析到中继入口", resolvedInBundle.endsWith(join("vendor", "relay", "server.js")), resolvedInBundle);
-  cleanupDir(fakePluginDir);
+  cleanupDir(nestDir);
 }
 
 // ---------------------------------------------------------------------------
@@ -605,23 +610,86 @@ function stubEntry() {
 }
 
 // ---------------------------------------------------------------------------
-// 22. 回归 N6：进程活着但端口没监听时，不能谎报 running
+// 22. 回归 N6：从未确认过监听的进程（还在启动等待期）——不谎报 running，也不急着换
 // ---------------------------------------------------------------------------
 {
   const dir = mkdtempSync(join(tmpdir(), "dshrc-silent-"));
   const entry = join(dir, "silent.mjs");
-  // 只打印 listening 关键字但**不真的监听**（模拟「进程活着但没服务」）
+  // **什么都不打印**（waitForListening 8s 超时 → 从未确认监听）
+  writeFileSync(entry, ["setInterval(() => {}, 1000);"].join("\n"));
+  const sup = new RelaySupervisor({ entry });
+  const port = await freePort();
+  const s = await sup.ensure("ws://127.0.0.1:" + port, {});
+  check("N6：确认监听后才报 running=true", s.running === false, JSON.stringify(s));
+  // 再 ensure 一次：进程活着但从未确认监听 → 还在启动等待期 → 不换进程、不谎报
+  const s2 = await sup.ensure("ws://127.0.0.1:" + port, {});
+  check("N6：端口没监听时 running=false（不谎报）", s2.running === false, JSON.stringify(s2));
+  check("N6：从未确认监听 → 不替换进程（还在启动期）", s2.pid === s.pid, s2.pid + " vs " + s.pid);
+  check("N6：端口没监听时看门狗仍会重试", shouldRestartRelay(s2) === true);
+  await sup.stop();
+  cleanupDir(dir);
+}
+
+// ---------------------------------------------------------------------------
+// 22b. 第三轮审计 #2：僵尸子进程（曾确认监听、现在不监听）必须被**替换**
+//     （真中继的 wss 'error' 只记日志不退出 → 进程活着但不服务 → 原实现永不换）
+// ---------------------------------------------------------------------------
+{
+  const dir = mkdtempSync(join(tmpdir(), "dshrc-zombie-"));
+  const entry = join(dir, "zombie.mjs");
+  // 打印 listening 关键字（骗过 waitForListening）但**不真的监听**
   writeFileSync(entry, ["console.log('relay listening (pretend)');", "setInterval(() => {}, 1000);"].join("\n"));
   const sup = new RelaySupervisor({ entry });
   const port = await freePort();
   const s = await sup.ensure("ws://127.0.0.1:" + port, {});
-  check("N6：确认监听后才报 running=true", s.running === true, JSON.stringify(s));
-  // 再 ensure 一次：进程还活着但端口其实没监听 → 不能继续报 running
+  check("僵尸：首次 ensure 确认过 listening（骗过）", s.running === true && sup.childReady === true, JSON.stringify(s));
+  const pid1 = s.pid;
   const s2 = await sup.ensure("ws://127.0.0.1:" + port, {});
-  check("N6：端口没监听时 running=false（不谎报）", s2.running === false, JSON.stringify(s2));
-  check("N6：端口没监听时看门狗仍会重试", shouldRestartRelay(s2) === true);
+  check("僵尸：探不到监听 → 替换进程（新 pid）", s2.pid !== pid1, s2.pid + " vs " + pid1);
+  check("僵尸：替换后状态回到 running=true", s2.running === true, JSON.stringify(s2));
   await sup.stop();
   cleanupDir(dir);
+}
+
+// ---------------------------------------------------------------------------
+// 22c. 第三轮审计 #1：stop() 与在途 ensure 竞态 → 不得留下孤儿中继
+//     （设置页清空中继地址走 stop()；若在途 ensure 照常 spawn，中继就成了没人管的孤儿）
+// ---------------------------------------------------------------------------
+{
+  const dir = mkdtempSync(join(tmpdir(), "dshrc-stoprace-"));
+  const entry = join(dir, "slow.mjs");
+  // 延迟 1.2s 才打印 listening → ensure 还在 waitForListening 时我们就喊停
+  writeFileSync(
+    entry,
+    ["setTimeout(() => console.log('relay listening port=' + process.env.PORT), 1200);", "setInterval(() => {}, 1000);"].join("\n"),
+  );
+  const sup = new RelaySupervisor({ entry });
+  const port = await freePort();
+  const inflight = sup.ensure("ws://127.0.0.1:" + port, {});
+  await new Promise((r) => setTimeout(r, 300)); // ensure 已 spawn、正在等 listening
+  await sup.stop(); // 模拟「设置页清空中继地址」
+  const s = await inflight;
+  await new Promise((r) => setTimeout(r, 1600)); // 给「本不该发生的二次 spawn」留时间
+  check("stop 竞态：ensure 返回后没有新进程在跑", sup.child === null, JSON.stringify(sup.status));
+  check("stop 竞态：端口无人监听（无孤儿）", (await isPortListening(port)) === false);
+  check("stop 竞态：世代号已递增", sup.epoch >= 1, String(sup.epoch));
+  cleanupDir(dir);
+}
+
+// ---------------------------------------------------------------------------
+// 22d. 第三轮审计 #3：三路并发 ensure（A→p1, B→p2, C→p1）→ C 不得拿到陈旧端口
+// ---------------------------------------------------------------------------
+{
+  const sup = new RelaySupervisor({ entry: stubEntry() });
+  const p1 = await freePort();
+  const p2 = await freePort();
+  const [r1, r2, r3] = await Promise.all([sup.ensure("ws://127.0.0.1:" + p1, {}), sup.ensure("ws://127.0.0.1:" + p2, {}), sup.ensure("ws://127.0.0.1:" + p1, {})]);
+  check("N8 三路：C 返回自己的目标端口（不是陈旧值）", r3.port === p1, JSON.stringify(r3));
+  check("N8 三路：最终托管在 C 的目标上", sup.status.port === p1, JSON.stringify(sup.status));
+  check("N8 三路：C 的端口真的在监听", (await isPortListening(p1)) === true);
+  check("N8 三路：B 的端口已释放（被 S1 换掉）", (await isPortListening(p2)) === false);
+  check("N8 三路：三路结果各自带各自的端口", r1.port === p1 && r2.port === p2, r1.port + "," + r2.port);
+  await sup.stop();
 }
 
 // ---------------------------------------------------------------------------
@@ -824,6 +892,180 @@ function stubEntry() {
   check("接线：startRemoteHost 会丢弃已 dispose 的旧 state（N2）", /disposed === true/.test(src));
   check("接线：autoStart 折进了 cfg.enabled（N1）", /enabled === true && state\.cfg\.autoStartRelay !== false/.test(src));
   check("接线：看门狗用纯函数判定", /shouldTickWatchdog\(supervisor\.status, state\.cfg\)/.test(src));
+
+  // ---- 第三轮审计：接线断言收紧（M11/M32/M33 变异存活过）----
+  // M11：`HOST_STATES.delete(ctx)` 在 startRemoteHost 里也有一处（ disposed 旧 state 的丢弃），
+  // 松正则会被那处顶替 → 要求「dispose() 之后 200 字符内必须跟着 HOST_STATES.delete」
+  //（即卸载清理块里的那一对）。
+  check(
+    "接线：卸载清理块内 dispose() 与 HOST_STATES.delete 相邻（N2 收紧）",
+    /void supervisor\.dispose\(\);[\s\S]{0,200}?HOST_STATES\.delete\(ctx\);/.test(src),
+  );
+  // M32：卸载走 dispose 而非 stop（S4 语义——stop 后在途 ensure 仍会 spawn）
+  check("接线：卸载清理走 dispose（不是 stop）", /ctx\.effect\(\(\) => \(\) => \{[\s\S]{0,400}?supervisor\.dispose\(\)/.test(src));
+  // M33：看门狗 tick 的**第一条有效语句**就是判定（插了提前 return 也不行）
+  {
+    const mm = src.match(/state\.relayWatchdog = setInterval\(\(\) => \{([\s\S]*?)\}, 15_000\)/);
+    const body = mm
+      ? mm[1].split("\n").filter((l) => !l.trim().startsWith("//")).join("\n").trim()
+      : "";
+    check("接线：看门狗 tick 第一条语句就是判定（无提前 return）", body.startsWith("if (!shouldTickWatchdog"), body.slice(0, 120));
+  }
+  // M16/M31：设置页快照必须透传 external 与 reason
+  check("N11：withRelayProcess 透传 external", /external:\s*snap\?\.external === true/.test(src));
+  check("N11：withRelayProcess 透传 reason", /reason:\s*typeof snap\?\.reason === "string"/.test(src));
+}
+
+// ---------------------------------------------------------------------------
+// 27. 第三轮审计：结构断言 + 行为级补盲（M01/M02/M08/M13/M17/M19/M28/M29/M15）
+// ---------------------------------------------------------------------------
+{
+  // ---- 结构断言（针对「行为测不到、一改就哑」的点）----
+  const supSrc = readFileSync(resolve(PLUGIN_DIR, "lib", "relay-supervisor.mjs"), "utf8");
+  // M02/M28：unref 必须在 waitForListening **之后**才调用；stop() 里要临时 ref 回来
+  const iWait = supSrc.indexOf("await this.waitForListening(child, 8000)");
+  const iFirstUnref = supSrc.indexOf("unrefAll();");
+  check("结构：unref 只出现在启动确认之后（M02）", iWait >= 0 && iFirstUnref > iWait, iWait + " vs " + iFirstUnref);
+  const iStop = supSrc.indexOf("async stop() {");
+  check("结构：stop() 等待期间临时 ref 回来（M28）", iStop >= 0 && /child\.ref\?\.\(\)/.test(supSrc.slice(iStop, iStop + 4000)));
+  // M19：「未确认监听」的输出日志必须在早退**之前**
+  const iNoConfirm = supSrc.indexOf("did not confirm listening");
+  const iEarly = supSrc.indexOf("managed relay was stopped while starting");
+  check("结构：「未确认监听」日志在早退之前（M19）", iNoConfirm >= 0 && iEarly >= 0 && iNoConfirm < iEarly);
+  // 第三轮 #1/#2：世代号守卫要夹在端口探测与 start() 之间
+  const iProbe = supSrc.indexOf("await isRelayPortBusy(target.port, target.host)");
+  const iEpoch = supSrc.indexOf("this.epoch !== baseEpoch");
+  const iStart = supSrc.indexOf("await this.start(target.port, opts.relayToken)");
+  check("结构：世代号守卫夹在探测与 start 之间（stop 竞态）", iProbe >= 0 && iEpoch > iProbe && iStart > iEpoch);
+
+  // M29：isChildAlive 要同时看 exitCode 与 signalCode
+  {
+    const sup2 = new RelaySupervisor({ entry: "" });
+    sup2.child = { exitCode: null, signalCode: "SIGKILL" };
+    check("isChildAlive：signalCode 非空算已死（M29）", sup2.isChildAlive() === false);
+  }
+
+  // M15：DNS 挂起时 2s 超时按「非本机」处理（lookup 可注入）
+  {
+    setDnsLookup(() => new Promise(() => {}));
+    const t0 = Date.now();
+    const r = await isLocalHostResolved("some.host.invalid");
+    const dt = Date.now() - t0;
+    setDnsLookup(null);
+    check("N10：DNS 挂起时超时返回且不拖死看门狗（M15）", r === false && dt < 3500, dt + "ms");
+  }
+
+  // ---- M08 专用：ready 之后才崩溃 → 只有 exit 日志带 output ----
+  {
+    const logs = [];
+    const dir = mkdtempSync(join(tmpdir(), "dshrc-exitlog-"));
+    const entry = join(dir, "crash-after-ready.mjs");
+    writeFileSync(
+      entry,
+      [
+        "console.log('relay listening port=' + process.env.PORT);",
+        "setTimeout(() => { console.error('EXIT_FATAL: crashed after ready'); process.exit(1); }, 300);",
+      ].join("\n"),
+    );
+    const sup = new RelaySupervisor({ entry, log: (level, msg, extra) => logs.push({ level, msg, extra }) });
+    const port = await freePort();
+    await sup.ensure("ws://127.0.0.1:" + port, {});
+    await new Promise((r) => setTimeout(r, 1500));
+    const text = JSON.stringify(logs);
+    check("N3：ready 后崩溃的原因也进日志（M08）", text.includes("EXIT_FATAL"), text.slice(0, 300));
+    cleanupDir(dir);
+  }
+
+  // ---- N7：spawn 失败（'error' 事件，Node 不发 exit）→ 句柄必须被清 ----
+  {
+    const sup = new RelaySupervisor({
+      entry: stubEntry(),
+      nodePath: join(tmpdir(), "definitely-no-such-node-" + Date.now()),
+    });
+    const port = await freePort();
+    const s = await sup.ensure("ws://127.0.0.1:" + port, {});
+    check("N7：spawn 失败后句柄被清（不卡「运行中 pid 0」）", sup.child === null && sup.isChildAlive() === false, JSON.stringify(sup.status));
+    check("N7：状态 running=false（看门狗可重拉）", sup.status.running === false && sup.status.reason === "managed");
+    cleanupDir(join(dirname(sup.entry), "..") === tmpdir() ? dirname(sup.entry) : dirname(sup.entry));
+  }
+
+  // ---- M19 专用：进程活着但从未打印 listening → 只有「未确认监听」日志带 output ----
+  {
+    const logs = [];
+    const dir = mkdtempSync(join(tmpdir(), "dshrc-noready-"));
+    const entry = join(dir, "boot-fail.mjs");
+    // 往 stderr 写启动失败原因，但**永不打印 listening**（8s 超时）→
+    // exit 不发生、exit 日志不触发 →「未确认监听」日志是唯一的输出出口
+    writeFileSync(
+      entry,
+      ["console.error('BOOT_FATAL: bad relay config');", "setInterval(() => {}, 1000);"].join("\n"),
+    );
+    const sup = new RelaySupervisor({ entry, log: (level, msg, extra) => logs.push({ level, msg, extra }) });
+    const port = await freePort();
+    await sup.ensure("ws://127.0.0.1:" + port, {});
+    const text = JSON.stringify(logs);
+    check("N3：启动期失败的原因经「未确认监听」日志可见（M19）", text.includes("BOOT_FATAL"), text.slice(0, 300));
+    await sup.stop();
+    cleanupDir(dir);
+  }
+
+  // ---- M01/M17：exit 归属判断 + superseded 不刷 warn（假子进程，精确控制时序）----
+  {
+    const { EventEmitter } = await import("node:events");
+    const logs = [];
+    const makeFake = (pid) => {
+      const c = new EventEmitter();
+      c.pid = pid;
+      c.exitCode = null;
+      c.signalCode = null;
+      c.killed = false;
+      c.stdin = { write: () => true, destroyed: false, unref: () => {}, ref: () => {} };
+      c.stdout = new EventEmitter();
+      c.stderr = new EventEmitter();
+      // kill 不让它退出（stop 只能等宽限+兜底）——退出由测试**手动**在恰当的时机触发
+      c.kill = () => {
+        c.killed = true;
+        return true;
+      };
+      c.unref = () => {};
+      c.ref = () => {};
+      return c;
+    };
+    const spawned = [];
+    const sup = new RelaySupervisor({
+      entry: stubEntry(), // 入口检查要求文件存在；spawnFn 会把它替换成假子进程
+      spawnFn: () => {
+        const c = makeFake(200 + spawned.length);
+        spawned.push(c);
+        return c;
+      },
+      log: (level, msg) => logs.push({ level, msg }),
+    });
+    const portA = await freePort();
+    const pA = sup.ensure("ws://127.0.0.1:" + portA, {});
+    await new Promise((r) => setTimeout(r, 30));
+    spawned[0].stdout.emit("data", "relay listening port=" + portA);
+    const a = await pA;
+    check("归属：假子进程 A 被确认监听", a.running === true && spawned.length === 1);
+
+    const portB = await freePort();
+    const pB = sup.ensure("ws://127.0.0.1:" + portB, {});
+    // stop(c1) 要等宽限兜底（fake 的 kill 不退出 → 约 5s）后才 spawn B → 轮询等它出现
+    const waitSpawn = async (n) => {
+      for (let i = 0; i < 200 && spawned.length < n; i++) await new Promise((r) => setTimeout(r, 50));
+    };
+    await waitSpawn(2);
+    if (spawned[1]) spawned[1].stdout.emit("data", "relay listening port=" + portB);
+    const b = await pB; // stop(c1) 等宽限兜底后 start(c2)
+    check("归属：换端口后 B 在跑", b.running === true && sup.child === spawned[1], JSON.stringify(b));
+
+    // **关键时序**：A 的 exit 现在（B 已 spawn 之后）才到 —— 归属判断必须保住 B 的句柄
+    spawned[0].exitCode = 0;
+    spawned[0].emit("exit", 0, null);
+    check("归属：A 迟到的 exit 不清掉 B 的句柄（M01）", sup.child === spawned[1]);
+    check("归属：A 的退出按 superseded 记 info，不刷 warn（M17）", logs.some((l) => l.level === "info" && /superseded/.test(l.msg)) && !logs.some((l) => l.level === "warn" && /managed relay exited/.test(l.msg)));
+    await sup.stop();
+  }
 }
 
 console.log("\nverify-relay-supervisor: " + pass + " passed, " + fail + " failed");

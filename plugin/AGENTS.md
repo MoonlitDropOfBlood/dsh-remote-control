@@ -35,7 +35,7 @@ node scripts/verify-qr.mjs && node scripts/verify-pairing.mjs           # QR/配
 node scripts/verify-steps.mjs                                          # v1.0.9 步骤/模式/权限/归档/模型/思考/强度 + 图片回归（无依赖，154 项）
 node scripts/verify-images.mjs                                         # v1.0.9 图片专项：元数据映射/缩略图降级/image.fetch 缓存与报错/帧预算守卫（无依赖，88 项）
 node scripts/verify-settings.mjs                                       # v1.1.x 设置页/manifest/combo/信封自检 + Host 真跑一遍（112 项）
-node scripts/verify-relay-supervisor.mjs                               # v1.1.1 中继进程托管：决策/端口占用不抢/启停/看门狗/跨平台/bundle（无依赖，131 项）
+node scripts/verify-relay-supervisor.mjs                               # v1.1.1 中继进程托管：决策/端口占用不抢/启停/看门狗/跨平台/bundle（无依赖，162 项）
 node scripts/sync-client-icon.mjs                                      # 改了 icon.svg 后同步 client.js 的图标 data-uri
 ```
 
@@ -225,6 +225,23 @@ node scripts/sync-client-icon.mjs                                      # 改了 
   二次 `startRemoteHost(ctx)` 会拿到「已 dispose 的旧 state」→ 中继再也不起、连看门狗都没了。
   故卸载时 `HOST_STATES.delete(ctx)`，且 `startRemoteHost` 遇到 `supervisor.disposed===true`
   的旧 state 要丢弃重建。
+- **世代号守卫（第三轮审计 #1）：stop 与在途 ensure 的竞态**——设置页清空中继地址走 `stop()`，
+  若在途的 ensure 正在探测端口，回来后照常 spawn → 刚清空的地址下中继又被拉起（没人管的孤儿）。
+  故 `stop()` 自增 `this.epoch`；`#ensureInner` 在内部 stop 之后取 `baseEpoch`，
+  spawn 前发现 `this.epoch !== baseEpoch` 就放弃启动（「托管在启动前被停止，已取消本次启动」）。
+- **僵尸替换（第三轮审计 #2）：活着 ≠ 在服务**——真中继的 wss `'error'` 只记日志不退出，
+  进程可能「活着但端口没人听」。`this.childReady` 记录「曾确认过监听」；
+  快路径探测发现 `!listening && childReady` → 判定僵尸 → stop 后重新 spawn。
+  从未确认过监听（还在启动等待期）→ 不替换，只如实报 `running:false`。
+- **ensure() 完全串行（第三轮审计 #3）**：`while (this.pending) await it` 之后**每次都亲自跑一遍**
+  `#ensureInner`——不把「别人那一次」的结果当返回值（目标可能不同、等待期间世界可能已变）。
+  已托管且一致时内层是廉价的（一次端口探测），串行化无性能问题。
+- **确认监听之前不报 running（第三轮审计 #4）**：spawn 到确认之间最长 8s，
+  期间状态报「正在启动中继进程（pid X，端口 Y）…」而不是「运行中」。
+- **输出缓冲每个子进程一份（第三轮审计 #6）**：`start()` 里的 `output` 是局部变量
+  （闭包绑定当前 child）；共用实例字段会让新进程的崩溃日志夹带旧进程的输出。
+- **DNS lookup 可注入（N10 门禁用例的前提）**：`setDnsLookup(fn)` 是单测注入点
+  （生产不调用），配套 2s 超时。
 - **只停自己起的进程**：全程按 child handle，**绝不按进程名/端口批量杀**
   （曾因此误杀 DSH 后端，见全局记忆 process-cleanup-managed-jobs-only）。
 - **跨平台停止语义（实测差异）**：
@@ -258,21 +275,28 @@ node scripts/sync-client-icon.mjs                                      # 改了 
   改完 `relay/server.js` **必须**跑 `node scripts/vendor-relay.mjs` 重新生成。
 - **设置页可见**：`getPairing()` / `setRelayUrl()` 的 value 带 `relayProcess`
   `{managed, running, pid, port, detail, external}`，设置页「中继进程」一行显示「插件托管 · 运行中（pid N）」。
-- 回归：`node scripts/verify-relay-supervisor.mjs` **131 项**（纯函数决策 / 远端不托管 /
+- 回归：`node scripts/verify-relay-supervisor.mjs` **162 项**（纯函数决策 / 远端不托管 /
   autoStart=false / 找不到入口 / 端口占用不抢 / **真 relay/server.js 的看门狗与 shutdown 通道** /
-  手工启动行为不变 / 改端口换进程 / 并发 ensure 只 spawn 一次 / 崩溃后重拉 /
-  dispose 后不拉起 / unref 时机 / 跨平台 env 与停止语义 / 看门狗判定纯函数 /
+  手工启动行为不变 / 改端口换进程 / 崩溃后重拉 / dispose 后不拉起 / unref 时机 /
+  跨平台 env 与停止语义 / 看门狗判定纯函数 /
   **bundle 形态**：vendor 副本同步 + 包内含 vendor + 依赖 ws + bundle 布局能解析到入口 /
   **回归 N1–N8**（禁用插件不拉中继 / dispose 后重载可恢复 / 崩溃输出进日志 / IPv6 探测 /
-  活着未监听不谎报 / 并发不同 URL 不返回陈旧端口 / 外部占用者消失后接管）/
-  **接线层覆盖**（`shouldTickWatchdog` 纯函数 + index.js 源码级断言）/
-  **变异盲区 ①–⑥**（exit 归属 / unref 时机 / shutdown 命令 / 端口双探 / child.killed / 幂等闩锁））。
+  从未确认监听不谎报也不误换 / 外部占用者消失后接管）/
+  **第三轮回归**（stop×ensure 竞态不留孤儿 / 僵尸进程被替换 / N8 三路并发 /
+  ready 后崩溃的日志 / 启动期失败的日志 / N7 spawn 失败清句柄 / N10 DNS 超时 /
+  isChildAlive 认 signalCode / superseded 不刷 warn）/
+  **接线层覆盖**（`shouldTickWatchdog` 纯函数 + index.js 源码级断言：dispose 与
+  HOST_STATES.delete 相邻、tick 首条语句即判定、external/reason 透传）/
+  **结构断言**（unref 只出现在确认后 / stop 里临时 ref / 「未确认监听」日志在早退前 /
+  世代号守卫夹在探测与 start 之间））。
 
-> **这个门禁必须用变异测试自检**：第二轮审计发现 6 处「改坏实现，71 项照样全绿」的盲区
-> （exit 归属判断 / unref 时机 / stop 不写 shutdown / 端口只探 127.0.0.1 / 不记子进程输出 /
-> stop 用 `child.killed`）。现已补 13 个变异点，**全部能被门禁杀死**。
+> **这个门禁必须用变异测试自检，且结论以实测为准**：
+> 第二轮审计发现 6 处「改坏实现，71 项照样全绿」；第三轮审计 35 个变异只杀死 18（存活率 49%），
+> 其中「13 个变异点全部杀死」的自述被实测打脸（3 处实际存活，另发现 bundle 用例被共享
+> TEMP 残留打红的假失败）。现补强后对存活点复验：14 个目标变异 + 2 个真版本变异
+> **全部被门禁杀死**（2 个「存活」经查是变异写法无效——没真的移动代码/删错处）。
 > 新增关键实现点时，请顺手写一条「改坏它就会红」的用例（或自己跑一遍变异）——
-> **项数多 ≠ 门禁强，变异存活率才是里子**。
+> **项数多 ≠ 门禁强，变异存活率才是里子；「全部杀死」要说得出变异脚本在哪**。
 
 ## v1.1.x：配对入口搬进设置面板（2026-10-24）
 

@@ -41,9 +41,11 @@ const STOP_GRACE_MS = 3000;
 
 /**
  * 中继入口的候选位置（按优先级）：
- *  1. 环境变量 DSHRC_RELAY_ENTRY 显式指定（非 link 安装时用这个）
- *  2. <plugin>/../relay/server.js —— 仓库布局（link 安装时是软链，指向真实仓库）
- *  3. <plugin>/node_modules/dsh-remote-control-relay/server.js —— 将来若发布成 npm 包
+ *  1. 环境变量 DSHRC_RELAY_ENTRY 显式指定
+ *  2. <plugin>/../relay/server.js —— 仓库布局（link 安装/开发时是活源码，优先）
+ *  3. <plugin>/vendor/relay/server.js —— **打包进插件的中继副本**（bundle 安装时唯一可用的）
+ *     （由 scripts/vendor-relay.mjs 从 relay/server.js 生成，门禁校验同步）
+ *  4. <plugin>/node_modules/dsh-remote-control-relay/server.js —— 将来若发布成 npm 包
  */
 export function resolveRelayEntry(pluginDir = PLUGIN_DIR, env = process.env) {
   const candidates = [];
@@ -51,6 +53,7 @@ export function resolveRelayEntry(pluginDir = PLUGIN_DIR, env = process.env) {
     candidates.push(resolve(env.DSHRC_RELAY_ENTRY));
   }
   candidates.push(resolve(pluginDir, "..", "relay", "server.js"));
+  candidates.push(resolve(pluginDir, "vendor", "relay", "server.js"));
   candidates.push(resolve(pluginDir, "node_modules", "dsh-remote-control-relay", "server.js"));
   for (const c of candidates) {
     if (existsSync(c)) return c;

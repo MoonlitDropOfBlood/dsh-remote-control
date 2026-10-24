@@ -7,9 +7,9 @@
 //   4. 进程安全：端口占用时不 spawn；stop 只杀自己 handle 起的进程
 //
 // 无外部依赖（不碰真实中继端口，不连真实中继）。
-import { mkdtempSync, writeFileSync, rmSync, readFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, readFileSync, existsSync, mkdirSync, copyFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, dirname } from "node:path";
+import { join, dirname, resolve } from "node:path";
 import { createServer } from "node:net";
 import { spawn as realSpawn } from "node:child_process";
 import {
@@ -20,6 +20,7 @@ import {
   parseRelayTarget,
   resolveRelayEntry,
   shouldRestartRelay,
+  PLUGIN_DIR,
 } from "../lib/relay-supervisor.mjs";
 
 let pass = 0;
@@ -459,6 +460,41 @@ function stubEntry() {
   await sup.stop();
   check("跨平台：stop 后子进程真的退出（不是只调了 kill）", child.exitCode !== null || child.signalCode !== null);
   check("跨平台：stop 后端口释放", (await isPortListening(port)) === false);
+}
+
+// ---------------------------------------------------------------------------
+// 17. bundle 安装形态：包里必须带得动中继（vendor 副本 + ws 依赖）
+// ---------------------------------------------------------------------------
+{
+  // 17a. vendor 副本必须与源文件同步（改了 relay/server.js 忘了重新生成 → 门禁 FAIL）
+  const { execFileSync } = await import("node:child_process");
+  let syncOk = true;
+  let syncMsg = "";
+  try {
+    const out = execFileSync(process.execPath, [join(import.meta.dirname, "vendor-relay.mjs"), "--check"], {
+      encoding: "utf8",
+    });
+    syncMsg = out.trim();
+  } catch (e) {
+    syncOk = false;
+    syncMsg = String((e && e.stderr) || e).slice(0, 300);
+  }
+  check("bundle：vendor 中继副本与源文件同步", syncOk, syncMsg);
+
+  // 17b. 插件包里必须有 vendor 副本（bundle 安装时唯一的入口来源）
+  const vendorEntry = resolve(PLUGIN_DIR, "vendor", "relay", "server.js");
+  check("bundle：插件包内含 vendor/relay/server.js", existsSync(vendorEntry), vendorEntry);
+  const pkg = JSON.parse(readFileSync(join(PLUGIN_DIR, "package.json"), "utf8"));
+  check("bundle：package.json 的 files 含 vendor", Array.isArray(pkg.files) && pkg.files.includes("vendor"));
+  check("bundle：package.json 依赖 ws（中继的唯一依赖）", !!(pkg.dependencies && pkg.dependencies.ws));
+
+  // 17c. 模拟 bundle 布局（只有 plugin/ 目录，没有仓库的 relay/）→ 仍能解析到入口
+  const fakePluginDir = mkdtempSync(join(tmpdir(), "dshrc-bundle-"));
+  mkdirSync(join(fakePluginDir, "vendor", "relay"), { recursive: true });
+  copyFileSync(vendorEntry, join(fakePluginDir, "vendor", "relay", "server.js"));
+  const resolvedInBundle = resolveRelayEntry(fakePluginDir, {});
+  check("bundle 布局：能解析到中继入口", resolvedInBundle.endsWith(join("vendor", "relay", "server.js")), resolvedInBundle);
+  cleanupDir(fakePluginDir);
 }
 
 console.log("\nverify-relay-supervisor: " + pass + " passed, " + fail + " failed");

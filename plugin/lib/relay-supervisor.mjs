@@ -176,8 +176,14 @@ export function emptyStatus() {
     port: 0,
     /** 最近一次状态说明（中文，直接可展示）。 */
     detail: "",
-    /** 端口上是不是**别人**的服务（外部中继）——看门狗据此不重拉。 */
+    /** 端口上是不是**别人**的服务（外部中继）。 */
     external: false,
+    /**
+     * 状态原因（看门狗据此决定要不要再探一次端口）：
+     *   'not-configured' 未配置地址 / 'disabled' 关掉了自动启动 / 'remote' 远端中继 /
+     *   'no-entry' 找不到中继程序 / 'external' 端口上是别人的服务 / 'managed' 我们托管的
+     */
+    reason: "not-configured",
   };
 }
 
@@ -266,17 +272,27 @@ export class RelaySupervisor {
     const autoStart = opts.autoStart !== false;
     const target = parseRelayTarget(relayUrl);
     if (!target) {
-      this.#publish({ ...emptyStatus(), detail: "未配置中继地址，暂不托管中继进程。" });
+      this.#publish({
+        ...emptyStatus(),
+        reason: "not-configured",
+        detail: "未配置中继地址，暂不托管中继进程。",
+      });
       return this.status;
     }
     if (!autoStart) {
-      this.#publish({ ...emptyStatus(), port: target.port, detail: "已关闭「随插件启动中继」。" });
+      this.#publish({
+        ...emptyStatus(),
+        port: target.port,
+        reason: "disabled",
+        detail: "已关闭「随插件启动中继」。",
+      });
       return this.status;
     }
     if (!(await isLocalHostResolved(target.host))) {
       this.#publish({
         ...emptyStatus(),
         port: target.port,
+        reason: "remote",
         detail: "中继地址不在本机（远程中继），插件不托管进程。",
       });
       return this.status;
@@ -285,6 +301,7 @@ export class RelaySupervisor {
       this.#publish({
         ...emptyStatus(),
         port: target.port,
+        reason: "no-entry",
         detail:
           "未找到中继程序（relay/server.js）；非仓库布局的安装请设置 DSHRC_RELAY_ENTRY，" +
           "或把 autoStartRelay 设为 false 自行启动中继。",
@@ -299,6 +316,7 @@ export class RelaySupervisor {
           running: true,
           pid: this.child?.pid || 0,
           port: this.childPort,
+          reason: "managed",
           detail: `中继进程由插件托管（pid ${this.child?.pid || 0}，端口 ${this.childPort}）。`,
         });
         return this.status;
@@ -310,18 +328,25 @@ export class RelaySupervisor {
       await this.stop();
     }
     if (await isRelayPortBusy(target.port, target.host)) {
-      // 外部已有中继在监听：不抢、不杀，只如实报告（external → 看门狗不干预）
+      // 外部已有中继在监听：不抢、不杀，只如实报告（external → 看门狗**仍会再探一次端口**，
+      // 因为占用者随时可能消失——插件热重载时旧实例的中继就是这种情况）
       this.#publish({
         ...emptyStatus(),
         running: true,
         port: target.port,
         external: true,
+        reason: "external",
         detail: `端口 ${target.port} 已有服务监听（中继可能已由外部启动），插件不重复启动。`,
       });
       return this.status;
     }
     if (this.disposed) {
-      this.#publish({ ...emptyStatus(), port: target.port, detail: "插件已卸载，不再启动中继进程。" });
+      this.#publish({
+        ...emptyStatus(),
+        port: target.port,
+        reason: "not-configured",
+        detail: "插件已卸载，不再启动中继进程。",
+      });
       return this.status;
     }
     return await this.start(target.port, opts.relayToken);
@@ -371,6 +396,7 @@ export class RelaySupervisor {
       running: true,
       pid: child.pid || 0,
       port,
+      reason: "managed",
       detail: `中继进程由插件托管（pid ${child.pid || 0}，端口 ${port}）。`,
     });
 
@@ -396,6 +422,7 @@ export class RelaySupervisor {
           pid: 0,
           port,
           external: false,
+          reason: "managed",
           detail: `托管的中继进程已退出（code=${String(code)} signal=${String(signal)}），将自动重拉。`,
         });
       }
@@ -445,6 +472,7 @@ export class RelaySupervisor {
       running: ready,
       pid: child.pid || 0,
       port,
+      reason: "managed",
       detail: ready
         ? `中继进程由插件托管（pid ${child.pid || 0}，端口 ${port}）。`
         : `中继进程已启动（pid ${child.pid || 0}），但暂未确认监听成功，稍后自动重试。`,
@@ -584,21 +612,29 @@ export class RelaySupervisor {
 }
 
 /**
- * 看门狗判定：现在**要不要**重拉中继？（纯函数，便于单测——审计指出接线逻辑零覆盖）
+ * 看门狗判定：现在**要不要**再跑一次 ensure()？（纯函数，便于单测——审计指出接线逻辑零覆盖）
  *
  * 规则：
- *   - 在跑 → 不用管；
- *   - 端口上是**别人**的服务（external）→ 不干预；
- *   - 其余（我们托管的进程崩了/没起来）→ 要重拉。
+ *   - 我们托管的进程在跑 → 不用管；
+ *   - 未配置 / 关了自动启动 / 远端中继 / 找不到中继程序 → 不用管（再探也没意义）；
+ *   - 我们托管的进程崩了 → 要重拉；
+ *   - 端口上是**别人**的服务 → **要再探一次端口**！
+ *     占用者随时可能消失：插件热重载时旧实例的中继就是这样——
+ *     新实例启动时看到端口被占（判 external），随后旧实例被卸载把中继杀了，
+ *     若看门狗被 external 挡住，中继就永远起不来（实测过的设计漏洞）。
  *
  * @param {object} status supervisor 的**实时**状态
  * @returns {boolean}
  */
 export function shouldRestartRelay(status) {
   if (!status || typeof status !== "object") return false;
+  const reason = typeof status.reason === "string" ? status.reason : "";
+  if (reason === "managed") return status.running !== true;
+  if (reason === "external") return true;
+  // 旧版本没有 reason 字段时的兼容判断
   if (status.running === true) return false;
-  if (status.external === true) return false;
-  return true;
+  if (status.external === true) return true;
+  return false;
 }
 
 /** 插件根目录（导出以便测试与其它模块引用）。 */

@@ -441,11 +441,16 @@ function stubEntry() {
 // 15. 看门狗判定（接线的纯函数部分——审计指出 index.js 接线零覆盖）
 // ---------------------------------------------------------------------------
 {
-  check("看门狗：在跑 → 不重拉", shouldRestartRelay({ running: true, managed: true }) === false);
-  check("看门狗：外部中继 → 不重拉", shouldRestartRelay({ running: false, managed: false, external: true }) === false);
-  check("看门狗：我们托管的崩了 → 要重拉", shouldRestartRelay({ running: false, managed: true, external: false }) === true);
+  check("看门狗：在跑 → 不重拉", shouldRestartRelay({ running: true, managed: true, reason: "managed" }) === false);
+  check("看门狗：外部中继 → 要再探一次端口", shouldRestartRelay({ running: true, managed: false, external: true, reason: "external" }) === true);
+  check("看门狗：我们托管的崩了 → 要重拉", shouldRestartRelay({ running: false, managed: true, external: false, reason: "managed" }) === true);
+  check("看门狗：未配置 → 不重拉", shouldRestartRelay({ running: false, reason: "not-configured" }) === false);
+  check("看门狗：远端中继 → 不重拉", shouldRestartRelay({ running: false, reason: "remote" }) === false);
+  check("看门狗：关掉自动启动 → 不重拉", shouldRestartRelay({ running: false, reason: "disabled" }) === false);
+  check("看门狗：找不到中继程序 → 不重拉", shouldRestartRelay({ running: false, reason: "no-entry" }) === false);
   check("看门狗：空状态 → 不重拉", shouldRestartRelay(null) === false);
   check("看门狗：undefined → 不重拉", shouldRestartRelay(undefined) === false);
+  check("看门狗：旧版状态（无 reason）在跑 → 不重拉", shouldRestartRelay({ running: true }) === false);
 }
 
 // ---------------------------------------------------------------------------
@@ -495,6 +500,35 @@ function stubEntry() {
   const resolvedInBundle = resolveRelayEntry(fakePluginDir, {});
   check("bundle 布局：能解析到中继入口", resolvedInBundle.endsWith(join("vendor", "relay", "server.js")), resolvedInBundle);
   cleanupDir(fakePluginDir);
+}
+
+// ---------------------------------------------------------------------------
+// 18. 回归：外部占用者消失后要能接管端口
+//     （插件热重载的真实竞态：新实例启动时旧实例还占着端口 → 判 external；
+//       随后旧实例被卸载把中继杀了 → 若看门狗被 external 挡住，中继就永远起不来）
+// ---------------------------------------------------------------------------
+{
+  const { createServer } = await import("node:net");
+  const sup = new RelaySupervisor({ entry: stubEntry() });
+  const port = await freePort();
+  // 模拟「旧实例的中继」占着端口
+  const squatter = createServer();
+  await new Promise((r) => squatter.listen(port, "127.0.0.1", r));
+
+  const s1 = await sup.ensure("ws://127.0.0.1:" + port, {});
+  check("回归：端口被占时不 spawn（判 external）", s1.external === true && s1.managed === false, JSON.stringify(s1));
+  check("回归：external 状态下看门狗仍会再探端口", shouldRestartRelay(s1) === true);
+
+  // 旧实例被卸载 → 占用者消失
+  await new Promise((r) => squatter.close(r));
+  await new Promise((r) => setTimeout(r, 400));
+  check("回归：占用者消失后端口空闲", (await isPortListening(port)) === false);
+
+  // 看门狗再跑一轮 → 插件接管
+  const s2 = await sup.ensure("ws://127.0.0.1:" + port, {});
+  check("回归：端口空了以后插件能接管（自己起中继）", s2.managed === true && s2.running === true, JSON.stringify(s2));
+  check("回归：接管后端口在监听", (await isPortListening(port)) === true);
+  await sup.stop();
 }
 
 console.log("\nverify-relay-supervisor: " + pass + " passed, " + fail + " failed");

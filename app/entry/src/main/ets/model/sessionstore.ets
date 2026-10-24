@@ -55,6 +55,8 @@ import {
 const TAG: string = 'dshrc-sessionstore';
 const PREF_NAME: string = 'dshrc_prefs';
 const KEY_PUSH_ENABLED: string = 'pushEnabled';
+/** 手机本地归档清单（JSON 字符串数组；仅本机可见，不改 host/wire 协议）。 */
+const KEY_ARCHIVED_SESSIONS: string = 'archivedSessions';
 const LOG_KEEP: number = 80;
 
 /** 会话列表一行（契约 §5.3 SessionSummary 的可观察形态；v1.0.4 补 subagent/blank，
@@ -284,6 +286,27 @@ export function savePushEnabled(context: Context, on: boolean): boolean {
   }
 }
 
+/** 任意 JSON 值 → 字符串（非字符串返回空串；防脏数据）。 */
+function jsonAsString(v: Object): string {
+  if (typeof v === 'string') {
+    return v as string;
+  }
+  return '';
+}
+
+/** 两个字符串数组是否完全一致（顺序也一致）。 */
+function sameIdList(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) {
+    return false;
+  }
+  for (let i: number = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
 /**
  * 全局状态仓（单例）。@Trace 字段被页面读取即自动刷新，无需订阅/取消订阅。
  * 结构性变化（增删会话/卡片/消息）一律整数组替换；字段级变化改 @ObservedV2 实例属性。
@@ -304,6 +327,12 @@ export class SessionStore {
    *  v1.0.6：Repeat 靠 item 引用判断「数据是否变化」，行实例原地复用会被判定为
    *  「没变」→ 列表不刷新；版本号 + 不可变投影（listItems）一起解决。 */
   @Trace listVersion: number = 0;
+  /** 手机本地归档版本号：归档/恢复后自增（页面据此重建列表投影）。 */
+  @Trace archiveVersion: number = 0;
+  /** 归档清单（手机本地；仅存 sessionId，不含任何敏感信息）。 */
+  private archivedSessionIds: string[] = [];
+  /** 归档持久化用的 Context（loadSessionArchive / setSessionArchived 时记下）。 */
+  private archiveContext: Context | null = null;
   @Trace activeId: string = '';
   /** 会话时间线（契约 §5.7 v1.0.6）：消息 + 工作步骤 + 系统消息，按 seq 升序、直播项在末尾。 */
   @Trace timeline: TimelineItem[] = [];
@@ -470,6 +499,95 @@ export class SessionStore {
       out.push(item);
     }
     out.sort((a: SessionListItem, b: SessionListItem): number => b.updatedAt - a.updatedAt);
+    return out;
+  }
+
+  // ---- 手机本地归档（v1.0.6；仅本机 Preferences，不动 host 会话 / wire 协议）----
+
+  /**
+   * 读取本地归档清单（Preferences `archivedSessions`，JSON 字符串数组）。
+   * 幂等：重复调用不会产生额外变化（内容相同则不动 archiveVersion）。
+   */
+  loadSessionArchive(context: Context): void {
+    this.archiveContext = context;
+    let raw: string = '';
+    try {
+      const pref: preferences.Preferences = preferences.getPreferencesSync(context, { name: PREF_NAME });
+      raw = pref.getSync(KEY_ARCHIVED_SESSIONS, '') as string;
+    } catch (e) {
+      const err: BusinessError = e as BusinessError;
+      logDshrc(TAG, 'error', 'load session archive failed: ' + err.message);
+      return;
+    }
+    const ids: string[] = this.parseArchivedIds(raw);
+    if (!sameIdList(this.archivedSessionIds, ids)) {
+      this.archivedSessionIds = ids;
+      this.archiveVersion = this.archiveVersion + 1;
+    }
+  }
+
+  /** 该会话是否已被本机归档。 */
+  isSessionArchived(sid: string): boolean {
+    if (sid.length === 0) {
+      return false;
+    }
+    return this.archivedSessionIds.indexOf(sid) >= 0;
+  }
+
+  /**
+   * 归档 / 恢复一个会话（**仅手机本地**：不删除、不归档 DSH 主机会话）。
+   * 持久化成功才提交内存并自增 archiveVersion；失败返回 false（不假装成功）。
+   */
+  setSessionArchived(sid: string, archived: boolean): boolean {
+    if (sid.length === 0) {
+      return false;
+    }
+    const ctx: Context | null = this.archiveContext;
+    if (ctx === null) {
+      return false;
+    }
+    const next: string[] = [];
+    for (const id of this.archivedSessionIds) {
+      if (id !== sid) {
+        next.push(id);
+      }
+    }
+    if (archived) {
+      next.push(sid);
+    }
+    try {
+      const pref: preferences.Preferences = preferences.getPreferencesSync(ctx, { name: PREF_NAME });
+      pref.putSync(KEY_ARCHIVED_SESSIONS, JSON.stringify(next));
+      pref.flushSync();
+    } catch (e) {
+      const err: BusinessError = e as BusinessError;
+      logDshrc(TAG, 'error', 'save session archive failed: ' + err.message);
+      return false;
+    }
+    this.archivedSessionIds = next;
+    this.archiveVersion = this.archiveVersion + 1;
+    return true;
+  }
+
+  /** 归档清单解析（JSON 字符串数组 → 去空 / 去重）。 */
+  private parseArchivedIds(text: string): string[] {
+    const out: string[] = [];
+    if (text.trim().length === 0) {
+      return out;
+    }
+    try {
+      const raw: Object[] = JSON.parse(text) as Object[];
+      for (const item of raw) {
+        const sid: string = jsonAsString(item);
+        if (sid.length === 0 || out.indexOf(sid) >= 0) {
+          continue;
+        }
+        out.push(sid);
+      }
+    } catch (e) {
+      const err: BusinessError = e as BusinessError;
+      logDshrc(TAG, 'warn', 'parse archived sessions failed: ' + err.message);
+    }
     return out;
   }
 

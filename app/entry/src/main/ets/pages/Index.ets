@@ -1,12 +1,15 @@
 /*
  * Copyright (c) 2026 dukedsh.
  * 首页：会话列表（Navigation 根页，v1.0.6）。
- *  - 顶栏：左标题「会话」；**右上角 = 连接信息按钮**（链路状态点 + 状态文案 + 当前远程名）
- *    → model/routes.openConnections()（连接管理页里可管理多个远程）
+ *  - 顶栏：左标题（会话 / 已归档）+ 归档视图入口；**右上角 = 连接信息按钮**
+ *    （链路状态点 + 状态文案 + 当前远程名）→ model/routes.openConnections()
  *  - 待审批横幅：pendingCount() > 0 时显示 → openApprovalQueue()
  *  - 会话列表：Refresh + List + 会话卡（标题 / 运行徽标 / 工作目录 / 相对时间 / ›）
  *    → openSessionDetail(sid)；显示规则不变（只显示根会话、非 blank，updatedAt 降序）
- *  - 底部固定操作区：「新建会话」品牌主按钮 → openNewSession()
+ *  - **手机本地归档（v1.0.6）**：左滑 = 归档 / 恢复；归档后从普通列表隐藏，
+ *    顶栏可切到「已归档」视图。仅存本机 Preferences，不删/不归档 DSH 主机会话，
+ *    不改 host/wire 协议。
+ *  - 底部固定操作区：「新建会话」品牌主按钮 → openNewSession()（已归档视图隐藏）
  *  - 推送点击直达（契约 §6 intent）：takePendingNav / EVT_PENDING_NAV 消费逻辑保留
  * 设计：卡片 bg_layer_1 + 1px border_l1 + 12vp 圆角；主按钮 brand_fill 配 label_on_brand。
  */
@@ -36,6 +39,16 @@ import {
   linkStateText,
   relTime
 } from '../model/theme';
+
+/**
+ * 侧滑操作参数（@Builder 单对象传参：状态按引用传递；类型必须显式声明）。
+ */
+interface SessionSwipeParam {
+  /** 目标会话 id。 */
+  sessionId: string;
+  /** 该会话当前是否处于「已归档」状态（决定按钮文案与动作）。 */
+  archived: boolean;
+}
 
 /**
  * 单张会话卡（列表项；只显示根会话——subagent 入口在父会话详情页，契约 §5.3 v1.0.5）。
@@ -134,8 +147,10 @@ struct Index {
   @Local store: SessionStore = sessionStore;
   @Local conn: ConnectionStore = connectionStore;
   @Local refreshing: boolean = false;
-  /** 列表投影缓存的版本（对应 store.listVersion；-1 = 尚未构建）。 */
-  private projVersion: number = -1;
+  /** 是否处于「已归档」视图（v1.0.6 手机本地归档）。 */
+  @Local showArchived: boolean = false;
+  /** 列表投影缓存键（listVersion + archiveVersion + 视图；变了才重建投影）。 */
+  private projKey: string = '';
   /** 列表投影缓存（不可变 items；数据没变时复用同一数组 → Repeat 不做无谓 diff）。 */
   private projItems: SessionListItem[] = [];
 
@@ -144,6 +159,8 @@ struct Index {
     HRouter.registerNavPathStack('default', this.navPathStack);
     const ctx: common.Context = getContext(this) as common.Context;
     this.conn.load(ctx);
+    // 手机本地归档清单（Preferences；必须在刷新前读入，列表投影才能正确过滤）
+    this.store.loadSessionArchive(ctx);
     this.store.refreshSessions();
     this.autoConnect(ctx);
     // 推送点击直达（EntryAbility onNewWant / onCreate 写入后回调这里）
@@ -208,16 +225,53 @@ struct Index {
    * v1.0.6 修复「刷新后数据没有变化」：
    *  - 数据源是 store.listItems() 产出的**新实例**（纯原始字段）——Repeat 以
    *    item 引用判断「数据是否变化」，复用可变实例会被判定为「没变」；
-   *  - 按 store.listVersion 缓存：数据没变就不重建（数组身份稳定 → Repeat 不做无谓 diff），
-   *    数据一变就整体重建（排序 / blank / subagent 过滤随之重算）。
+   *  - 按 (listVersion, archiveVersion, 视图) 缓存：数据没变就不重建
+   *    （数组身份稳定 → Repeat 不做无谓 diff），数据一变就整体重建
+   *    （排序 / blank / subagent 过滤 / 归档过滤随之重算）。
    */
   private listItems(): SessionListItem[] {
-    const v: number = this.store.listVersion;
-    if (v !== this.projVersion) {
-      this.projVersion = v;
-      this.projItems = this.store.listItems();
+    const key: string = this.store.listVersion.toString() + ':' +
+      this.store.archiveVersion.toString() + ':' + (this.showArchived ? '1' : '0');
+    if (key !== this.projKey) {
+      this.projKey = key;
+      this.projItems = this.buildItems();
     }
     return this.projItems;
+  }
+
+  /**
+   * 按当前视图构建列表项（普通视图 = 未归档；已归档视图 = 已归档）。
+   * 顺序沿用 store.listItems() 的 updatedAt 降序（过滤不改变相对顺序）。
+   */
+  private buildItems(): SessionListItem[] {
+    const all: SessionListItem[] = this.store.listItems();
+    const out: SessionListItem[] = [];
+    for (const item of all) {
+      const archived: boolean = this.store.isSessionArchived(item.sessionId);
+      if (archived !== this.showArchived) {
+        continue;
+      }
+      out.push(item);
+    }
+    return out;
+  }
+
+  /** 切换「会话 / 已归档」视图。 */
+  private toggleArchiveView(): void {
+    this.showArchived = !this.showArchived;
+  }
+
+  /**
+   * 侧滑动作：普通列表 = 归档；已归档列表 = 恢复。
+   * 成功后由 store.archiveVersion 驱动列表重建（无需手工改数组）。
+   */
+  private onSwipeArchive(sessionId: string, archived: boolean): void {
+    const ok: boolean = this.store.setSessionArchived(sessionId, !archived);
+    if (!ok) {
+      promptAction.showToast({ message: '归档失败（本地存储写入失败）', duration: 2500 });
+      return;
+    }
+    promptAction.showToast({ message: archived ? '已恢复到会话列表' : '已归档（仅本机）', duration: 1800 });
   }
 
   /** 下拉刷新：拉 session.list，完成后收起刷新态；失败明确提示（不假装已刷新）。 */
@@ -261,15 +315,24 @@ struct Index {
     return n.length > 0 ? n : '未配置';
   }
 
-  /** 顶栏：左标题 + 右上角连接信息胶囊（状态点 + 状态 + 当前远程名）。 */
+  /** 顶栏：左标题（会话 / 已归档）+ 归档视图入口 + 右上角连接信息胶囊。 */
   @Builder
   topBar() {
     Row() {
-      Text('会话')
+      Text(this.showArchived ? '已归档' : '会话')
         .fontSize(FS_SUBTITLE)
         .fontWeight(FontWeight.Bold)
         .fontColor($r('app.color.label_primary'))
-        .layoutWeight(1)
+      Text(this.showArchived ? '返回' : '已归档')
+        .fontSize(FS_SMALL)
+        .fontWeight(FontWeight.Medium)
+        .fontColor($r('app.color.brand_label'))
+        .margin({ left: SP_2 })
+        .padding({ top: 4, bottom: 4, left: 4, right: 4 })
+        .onClick((): void => {
+          this.toggleArchiveView();
+        })
+      Blank()
       Row() {
         Circle({ width: 7, height: 7 }).fill(linkStateColor(this.store.linkState))
         Text(linkStateText(this.store.linkState))
@@ -340,25 +403,48 @@ struct Index {
     .margin({ bottom: SP_3 })
   }
 
-  /** 空态（在线 / 离线两套文案）。 */
+  /** 空态（在线 / 离线两套文案；已归档视图单独一套）。 */
   @Builder
   emptyState() {
     Column() {
       Text('○')
         .fontSize(40)
         .fontColor($r('app.color.label_tertiary'))
-      Text(this.store.linkState === 'online' ? '暂无会话' : '未连接，暂无会话数据')
+      Text(this.showArchived ? '暂无已归档会话' :
+        (this.store.linkState === 'online' ? '暂无会话' : '未连接，暂无会话数据'))
         .fontSize(FS_BODY)
         .fontColor($r('app.color.label_secondary'))
         .margin({ top: SP_2 })
-      Text(this.store.linkState === 'online' ?
-        '点下方「新建会话」开始遥控' : '在右上角「连接」里选好远程并连接')
+      Text(this.showArchived ? '在会话列表左滑可归档会话，已归档的会话会出现在这里' :
+        (this.store.linkState === 'online' ?
+          '点下方「新建会话」开始遥控' : '在右上角「连接」里选好远程并连接'))
         .fontSize(FS_SMALL)
         .fontColor($r('app.color.label_tertiary'))
         .margin({ top: SP_1 })
     }
     .width('100%')
     .padding({ top: 60, bottom: 60 })
+  }
+
+  /**
+   * 左滑操作按钮（官方写法：`ListItem(){...}.swipeAction({end:{builder:()=>{…}}})`）。
+   *  普通列表 = 「归档」；已归档列表 = 「恢复」。宽度 72vp、全高、品牌色底。
+   */
+  @Builder
+  sessionSwipeAction(param: SessionSwipeParam) {
+    Column() {
+      Text(param.archived ? '恢复' : '归档')
+        .fontSize(FS_SMALL)
+        .fontWeight(FontWeight.Medium)
+        .fontColor($r('app.color.label_on_brand'))
+    }
+    .width(72)
+    .height('100%')
+    .justifyContent(FlexAlign.Center)
+    .backgroundColor($r('app.color.brand_fill'))
+    .onClick((): void => {
+      this.onSwipeArchive(param.sessionId, param.archived);
+    })
   }
 
   build() {
@@ -398,6 +484,17 @@ struct Index {
                       }
                     })
                   }
+                  // 左滑：普通列表 = 归档；已归档列表 = 恢复（手机本地，不动主机会话）
+                  .swipeAction({
+                    end: {
+                      builder: (): void => {
+                        this.sessionSwipeAction({
+                          sessionId: cell.item.sessionId,
+                          archived: this.showArchived
+                        });
+                      }
+                    }
+                  })
                 })
                 .key((item: SessionListItem): string => item.sessionId)
                 .virtualScroll({ totalCount: this.listItems().length })
@@ -415,23 +512,26 @@ struct Index {
           this.doRefresh();
         })
 
-        Column() {
-          Button('新建会话')
-            .width('100%')
-            .height(46)
-            .fontSize(FS_BODY)
-            .fontWeight(FontWeight.Medium)
-            .fontColor($r('app.color.label_on_brand'))
-            .backgroundColor($r('app.color.brand_fill'))
-            .borderRadius(RADIUS_CTRL)
-            .onClick((): void => {
-              this.onCreateSession();
-            })
+        // 底部固定操作区：已归档视图不显示「新建会话」（归档视图只做恢复）
+        if (!this.showArchived) {
+          Column() {
+            Button('新建会话')
+              .width('100%')
+              .height(46)
+              .fontSize(FS_BODY)
+              .fontWeight(FontWeight.Medium)
+              .fontColor($r('app.color.label_on_brand'))
+              .backgroundColor($r('app.color.brand_fill'))
+              .borderRadius(RADIUS_CTRL)
+              .onClick((): void => {
+                this.onCreateSession();
+              })
+          }
+          .width('100%')
+          .padding({ left: SP_4, right: SP_4, top: SP_3, bottom: SP_4 })
+          .backgroundColor($r('app.color.bg_layer_1'))
+          .border({ width: HAIRLINE, color: $r('app.color.border_l1') })
         }
-        .width('100%')
-        .padding({ left: SP_4, right: SP_4, top: SP_3, bottom: SP_4 })
-        .backgroundColor($r('app.color.bg_layer_1'))
-        .border({ width: HAIRLINE, color: $r('app.color.border_l1') })
       }
       .width('100%')
       .height('100%')

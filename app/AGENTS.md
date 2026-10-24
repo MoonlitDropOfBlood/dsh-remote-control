@@ -84,8 +84,11 @@ grep -rnE "@State|@Prop|@Link|@ObjectLink|@Observed[^V]|@Provide|@Consume|@Watch
 
 ## 会话列表与子代理显示规则（契约 §5.3/§5.6 v1.0.5）
 
-- **列表无筛选**：只显示根会话（无 parentSessionId 且 origin!=='subagent'）非 blank，
-  updatedAt 降序。归档概念已从 wire 删除（Host 会话域无归档），勿再加归档 UI。
+- **列表数据源**：只显示根会话（无 parentSessionId 且 origin!=='subagent'）非 blank，
+  updatedAt 降序。Host 会话域没有归档字段，wire 不增加 archived。
+- **本机归档**：普通列表左滑「归档」，顶栏进入「已归档」后左滑「恢复」；只把 sessionId
+  存进 Preferences `dshrc_prefs.archivedSessions`（archiveVersion 驱动列表投影），重启保留。
+  这是**手机本地 UI 状态**，不得调用/伪造成 Host 归档，也不影响详情与主机会话。
 - **subagent 不进列表**：入口在父会话详情页顶部的「子代理」目录区
   （`store.activeSubagents`，SubagentChip 横向滚动；running 圆点 + label + 一次性角标），
   点击进子代理详情（session.history 已支持 subagent 地址，流式事件按 child id 寻址天然工作）。
@@ -120,3 +123,6 @@ grep -rnE "@State|@Prop|@Link|@ObjectLink|@Observed[^V]|@Provide|@Consume|@Watch
   `defaultPresetId` / `defaultPermissionId`；宿主不支持时数组为空 → 客户端隐藏选择区。
 - `dshrcLink.sessionCreate(title, agentPreset?, permission?, cwd?)`；宿主拒绝（unsupported）
   时客户端回退为「不带选项」再创建一次。
+- 新建页**不填标题**：首屏输入首条任务，工作目录/模式/权限都用 Select；目录候选为
+  「默认目录」+ 现有会话 cwd 去重。`sessionCreate('', …)` 成功后必须 `sessionPrompt`
+  发送首条内容；create 成功但 prompt 失败也要进详情提示重试，不能留在表单重复创建。

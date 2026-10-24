@@ -26,9 +26,12 @@ import { msg, sanitizeEnvelope } from "./protocol.mjs";
 import { ASSISTANT_THROTTLE_PER_SEC } from "./config.mjs";
 import {
   LARGE_MAX_BASE64,
+  REPLY_PLAIN_MAX_BYTES,
   THUMB_DATA_URI_PREFIX,
+  THUMB_PAGE_BUDGET,
   attachmentRefOf,
   clampMaxEdge,
+  fitReplyBudget,
   imageBlocksOf,
   imageRefMeta,
   makeLarge,
@@ -318,7 +321,8 @@ function toBuffer(input) {
  *
  * 预算（重要）：一页历史可能有几十张图，每张 96KB 内联会**顶爆中继的 1MiB 帧**
  * （帧里还有 base64 密文的 4/3 放大）。所以整页缩略图有**总预算**
- * （默认 LARGE_MAX_BASE64）；超预算的后续图片只发元数据（thumb 留空）。
+ * （默认 THUMB_PAGE_BUDGET）；超预算的后续图片只发元数据（thumb 留空）。
+ * 回包发出去前还有一道**帧预算守卫**（fitReplyBudget）兜底。
  *
  * @param {object[]} messages ChatMessage[]
  * @param {any} ctx Cordis ctx（用来取 attachments 服务）
@@ -330,7 +334,7 @@ export async function attachThumbs(messages, ctx, options) {
   if (list.length === 0) return list;
   const attachments = attachmentsOf(ctx);
   if (!attachments) return list;
-  const budget = Number.isSafeInteger(options?.budgetBytes) ? options.budgetBytes : LARGE_MAX_BASE64;
+  const budget = Number.isSafeInteger(options?.budgetBytes) ? options.budgetBytes : THUMB_PAGE_BUDGET;
   let used = 0;
   for (const message of list) {
     const images = Array.isArray(message?.images) ? message.images : [];
@@ -1157,6 +1161,14 @@ export class HostBridge {
         height: out.height,
         data: out.data,
       };
+      // 帧预算守卫：中继 1MiB 是 ws 单帧上限（超了断链）——大图回包必须自己守住
+      if (JSON.stringify(value).length > REPLY_PLAIN_MAX_BYTES) {
+        this.#reply(
+          m,
+          errorOf(m, "image-too-large", "原图过大，仅可看缩略图（请以更小的尺寸重试）。"),
+        );
+        return;
+      }
       this.#imageCache.set(cacheKey, value);
       this.#pruneImageCache();
       // 日志只打 imageId/尺寸/字节数——**绝不**输出 data URI / base64
@@ -1459,7 +1471,31 @@ export class HostBridge {
       await attachThumbs(messages, this.#ctx);
       // v1.0.6（§5.7）：工作步骤（工具调用）——旧客户端只读 messages，不受影响
       const steps = mapHistorySteps(page?.records ?? []);
-      this.#reply(m, resultOf(m, { messages, steps, hasMore: page?.hasMore === true, oldestSeq }));
+      // v1.0.9：帧预算守卫——中继的 1MiB 是 **ws 单帧**上限，超了 ws 直接断链
+      //（不是丢一帧）。先剥缩略图、再丢 images[]；实在装不下（只剩文字就超了）
+      // → 回 error，宁可这一页失败也不能把整条链路顶爆。
+      const value = { messages, steps, hasMore: page?.hasMore === true, oldestSeq };
+      const fit = fitReplyBudget(value);
+      if (fit.strippedThumbs > 0 || fit.strippedImages > 0) {
+        this.#log("warn", "history reply trimmed to fit the relay frame budget", {
+          sessionId,
+          strippedThumbs: fit.strippedThumbs,
+          strippedImages: fit.strippedImages,
+          bytes: fit.bytes,
+        });
+      }
+      if (fit.overflow) {
+        this.#reply(
+          m,
+          errorOf(
+            m,
+            "history-too-large",
+            "这一页会话内容过大，无法在一帧内传输（请缩小每页条数后重试）。",
+          ),
+        );
+        return;
+      }
+      this.#reply(m, resultOf(m, fit.value));
     } catch (e) {
       this.#reply(m, errorOf(m, "session-history-failed", errText(e)));
     }

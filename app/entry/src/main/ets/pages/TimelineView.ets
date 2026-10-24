@@ -227,13 +227,16 @@ struct MessageBubble {
         // 塞进自适应 Column（循环百分比 → 不换行 → 文字甩出气泡，真机实测 bug）。
         Column() {
           Row() {
-            Text(this.item.text)
-              .fontSize(FS_BODY)
-              .fontColor($r('app.color.label_on_brand'))
-              .padding({ left: 12, right: 12, top: 10, bottom: 10 })
-              .backgroundColor($r('app.color.brand_fill'))
-              .borderRadius(RADIUS_BUBBLE)
-              .constraintSize({ maxWidth: '82%' })
+            // v1.0.9：纯图片消息（无正文）不画空气泡——否则会留一个空的蓝色药丸
+            if (this.item.text.length > 0) {
+              Text(this.item.text)
+                .fontSize(FS_BODY)
+                .fontColor($r('app.color.label_on_brand'))
+                .padding({ left: 12, right: 12, top: 10, bottom: 10 })
+                .backgroundColor($r('app.color.brand_fill'))
+                .borderRadius(RADIUS_BUBBLE)
+                .constraintSize({ maxWidth: '82%' })
+            }
           }
           .width('100%')
           .justifyContent(FlexAlign.End)

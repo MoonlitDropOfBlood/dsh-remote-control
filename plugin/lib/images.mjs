@@ -17,7 +17,7 @@
 // thumb 留空），绝不抛异常崩掉插件。
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 /** 宿主接受的图片类型（dsh-attachment 的 ImageMediaType）。 */
 export const IMAGE_MEDIA_TYPES = Object.freeze(["image/png", "image/jpeg", "image/webp", "image/gif"]);
@@ -39,12 +39,34 @@ export const LARGE_MAX_EDGE = 4096;
  *
  * 契约写的是「单张回包 ≤ 1MiB（中继硬上限）」，但中继的 1MiB 限制落在 **密文帧**上
  * （relay/server.js 的 RELAY_MAX_PAYLOAD=1048576，ws maxPayload，收发两个方向都算），
- * 而密文帧 = base64url(iv+ct+tag)，明文 JSON 会被放大约 4/3 倍。所以这里给 base64
- * 留 750KB 预算：750KB base64 → 明文 ≈750KB → 密文 ≈750KB → base64url ≈1.02MB
- * < 1MiB（还留 2.4% 余量给信封/sid/seq 开销），**绝不会**把中继连接顶爆。
- * 取 750KB 也满足契约「≤1MiB」（更保守）。
+ * 而密文帧 = base64url(iv+ct+tag)，明文 JSON 会被放大约 4/3 倍。
+ * 这里给 base64 留 600KB 预算：600KB base64 → 明文 ≈600KB → 密文 ≈600KB →
+ * base64url ≈800KB < 1MiB（余量留给信封/sid/seq 与 JSON 转义），**绝不会**把中继连接顶爆。
+ * 取 600KB 也满足契约「≤1MiB」（更保守）。
  */
-export const LARGE_MAX_BASE64 = 750 * 1024;
+export const LARGE_MAX_BASE64 = 600 * 1024;
+
+/**
+ * 中继单帧上限（relay/server.js RELAY_MAX_PAYLOAD = 1MiB，ws maxPayload）。
+ * 超了 ws 直接**断开连接**（1009），不是「丢一帧」——所以回包必须自己守住。
+ */
+export const RELAY_MAX_FRAME_BYTES = 1024 * 1024;
+
+/**
+ * 回包明文 JSON 预算（帧预算守卫用）。
+ *
+ * 帧里装的是 base64url(iv||密文||tag)，密文长度 = 明文长度 → 帧 ≈ 明文 × 4/3。
+ * 640KB 明文 → 帧 ≈ 853KB < 1MiB（留 18% 余量给信封/sid/seq 与 JSON 转义）。
+ */
+export const REPLY_PLAIN_MAX_BYTES = 640 * 1024;
+
+/**
+ * 一页历史里**所有缩略图**的总预算（base64 字节）。
+ *
+ * 页里几十张图 × 96KB 会把回包顶到中继上限之外 → 整条链路被 ws 断开。
+ * 故缩略图总量单独设预算（512KB），超出的图片只发元数据（thumb 留空）。
+ */
+export const THUMB_PAGE_BUDGET = 512 * 1024;
 
 /** 缩略图 data URI 前缀（缩略图统一转 JPEG）。 */
 export const THUMB_DATA_URI_PREFIX = "data:image/jpeg;base64,";
@@ -100,6 +122,20 @@ function deployRoots() {
   const roots = [];
   const env = process.env ?? {};
   if (typeof env.DSH_DEPLOY_DIR === "string" && env.DSH_DEPLOY_DIR !== "") roots.push(env.DSH_DEPLOY_DIR);
+  // ① 宿主包位置反推：<deploy>/node_modules/@deepseek-ai/dsh/package.json → <deploy>
+  try {
+    const req = createRequire(import.meta.url);
+    const pkg = req.resolve("@deepseek-ai/dsh/package.json");
+    roots.push(dirname(dirname(dirname(pkg))));
+  } catch {
+    /* 宿主包不可见（插件单独跑时） */
+  }
+  // ② 宿主进程入口反推：<deploy>/node_modules/@deepseek-ai/dsh/lib/bin.js → <deploy>
+  if (typeof process.argv?.[1] === "string" && process.argv[1] !== "") {
+    const entry = process.argv[1];
+    roots.push(dirname(entry));
+    roots.push(dirname(dirname(dirname(entry))));
+  }
   const appdata = typeof env.APPDATA === "string" ? env.APPDATA : "";
   if (appdata !== "") roots.push(join(appdata, "DeepSeek Harness Desktop", "dsh"));
   // 同一台机器上的其它常见部署路径（Windows / Linux / macOS）
@@ -311,4 +347,71 @@ export function clampMaxEdge(value) {
   const i = Math.round(n);
   if (i <= 0) return LARGE_DEFAULT_MAX_EDGE;
   return Math.min(LARGE_MAX_EDGE, i);
+}
+
+/**
+ * 回包**帧预算守卫**（纯函数，就地修改 value）。
+ *
+ * 中继的 1MiB 限制是 **ws 单帧**上限：超了 ws 直接断开连接（1009），
+ * 不是「丢一帧」——所以回包必须自己守住，否则一页多图历史就能把整条链路顶死。
+ *
+ * 降级顺序（先丢像素、后丢条目，尽量保住信息）：
+ *   1. 明文 JSON 超过预算 → 按 thumb 从大到小**剥掉缩略图**（保留元数据：imageId/尺寸）；
+ *   2. 还超 → 整条 `images[]` **丢掉**（客户端按无图消息处理）；
+ *   3. 还超（只剩文字就超了）→ 返回 overflow=true，由调用方回 error
+ *      （宁可这一页失败，也不能发一帧把链路顶爆）。
+ *
+ * @param {any} value 回包 value（会被就地修改）
+ * @param {number} [maxPlainBytes] 明文 JSON 预算
+ * @returns {{value:any,bytes:number,strippedThumbs:number,strippedImages:number,overflow:boolean}}
+ */
+export function fitReplyBudget(value, maxPlainBytes = REPLY_PLAIN_MAX_BYTES) {
+  const limit =
+    Number.isSafeInteger(maxPlainBytes) && maxPlainBytes > 0 ? maxPlainBytes : REPLY_PLAIN_MAX_BYTES;
+  const size = () => {
+    try {
+      return JSON.stringify(value)?.length ?? 0;
+    } catch {
+      return 0;
+    }
+  };
+  const done = (strippedThumbs, strippedImages) => ({
+    value,
+    bytes: size(),
+    strippedThumbs,
+    strippedImages,
+    overflow: size() > limit,
+  });
+  if (size() <= limit) return done(0, 0);
+
+  // 1) 剥缩略图（大 → 小）
+  const messages = Array.isArray(value?.messages) ? value.messages : [];
+  /** @type {any[]} */
+  const withThumb = [];
+  for (const message of messages) {
+    const images = Array.isArray(message?.images) ? message.images : [];
+    for (const image of images) {
+      if (image && typeof image === "object" && typeof image.thumb === "string" && image.thumb !== "") {
+        withThumb.push(image);
+      }
+    }
+  }
+  withThumb.sort((a, b) => b.thumb.length - a.thumb.length);
+  let strippedThumbs = 0;
+  for (const image of withThumb) {
+    image.thumb = "";
+    strippedThumbs += 1;
+    if (size() <= limit) return done(strippedThumbs, 0);
+  }
+
+  // 2) 丢整条 images[]
+  let strippedImages = 0;
+  for (const message of messages) {
+    if (Array.isArray(message?.images) && message.images.length > 0) {
+      strippedImages += message.images.length;
+      delete message.images;
+    }
+  }
+  if (size() <= limit) return done(strippedThumbs, strippedImages);
+  return done(strippedThumbs, strippedImages);
 }

@@ -32,7 +32,7 @@ node --check index.js client.js typert.host.js lib/*.mjs scripts/*.mjs   # 语�
 node -e "import('./lib/protocol.mjs').then(m=>m.assertKat())"           # KAT
 node scripts/verify-qr.mjs && node scripts/verify-pairing.mjs           # QR/配对 API 回归（需 devDependencies）
 node scripts/verify-steps.mjs                                          # v1.0.9 步骤/模式/权限/归档/模型/思考/强度 + 图片回归（无依赖，154 项）
-node scripts/verify-images.mjs                                         # v1.0.9 图片专项：元数据映射/缩略图降级/image.fetch 缓存与报错（无依赖，77 项）
+node scripts/verify-images.mjs                                         # v1.0.9 图片专项：元数据映射/缩略图降级/image.fetch 缓存与报错/帧预算守卫（无依赖，88 项）
 node scripts/verify-settings.mjs                                       # v1.1.x 设置页/manifest/combo/信封自检 + Host 真跑一遍（112 项）
 node scripts/sync-client-icon.mjs                                      # 改了 icon.svg 后同步 client.js 的图标 data-uri
 ```
@@ -158,10 +158,17 @@ ESM 模块缓存不会重载源码（实测踩坑）。
   插件内部能读字节，**绝不进 wire JSON**。
 - **缩略图**：长边 ≤480、JPEG q75，base64 **必须 ≤96KB**；超限沿阶梯降质/降尺寸，
   仍超限 → **thumb 留空只发元数据**（客户端画占位框）。PNG/GIF 统一转 JPEG
-  （GIF 只取首帧）。**整页历史有总预算**（`LARGE_MAX_BASE64`），否则一页几十张图会顶爆中继帧。
+  （GIF 只取首帧）。**整页历史有总预算**（`THUMB_PAGE_BUDGET` = 512KB），
+  否则一页几十张图会顶爆中继帧。
 - **大图**：`image.fetch {imageId, maxEdge?}` → `{imageId, mediaType, width, height, data}`；
-  `maxEdge` 缺省 1600、上限 4096；等比缩放 + JPEG q85，base64 预算 750KB
+  `maxEdge` 缺省 1600、上限 4096；等比缩放 + JPEG q85，base64 预算 600KB
   （契约说 ≤1MiB，但 1MiB 是**密文帧**上限，明文要留 4/3 余量）；压不进去回 `error`。
+- **帧预算守卫（v1.0.9 补）**：中继的 1MiB 是 **ws 单帧**上限，超了 ws 直接**断链**
+  （不是丢一帧）！故回包发出去前一律过 `fitReplyBudget(value)`：
+  明文 JSON 预算 `REPLY_PLAIN_MAX_BYTES` = 640KB（帧 ≈ 明文 ×4/3 ≈ 853KB < 1MiB）；
+  超了先**剥缩略图**（保留 imageId/尺寸元数据），再**丢整条 images[]**，
+  连文字都装不下时回 `history-too-large` error——宁可这一页失败也不能把链路顶爆。
+  `image.fetch` 回包同样过这道守卫（超了回 `image-too-large`）。
 - **sharp 不在插件自己的 node_modules 里**（link 安装 + 依赖不打包）：用 `createRequire`
   从 **DSH 部署目录**（`<APPDATA>/DeepSeek Harness Desktop/dsh/node_modules/sharp`）动态解析；
   解析不到就**降级**（只发元数据、thumb 留空），**绝不抛异常崩掉插件**。
@@ -174,8 +181,9 @@ ESM 模块缓存不会重载源码（实测踩坑）。
 - **日志绝不输出 data URI / base64**（可能含敏感图）：只打 imageId、字节数、尺寸。
 - 回归：`node scripts/verify-steps.mjs` 目前 **154 项**（新增 image 块识别、ImageRef 形状、
   无 "[图片]" 占位符、缩略图超限降级/整页预算、image.fetch 校验与缓存、assistant.image 广播）
-  + `node scripts/verify-images.mjs` **77 项**（图片专项：元数据映射、缩略图降级阶梯、
-  image.fetch 缓存命中/重启后报错、日志无 base64）。
+  + `node scripts/verify-images.mjs` **88 项**（图片专项：元数据映射、缩略图降级阶梯、
+  image.fetch 缓存命中/重启后报错、日志无 base64、**帧预算守卫**：剥缩略图 → 丢 images[] →
+  overflow 回 error、预算常量关系、多图历史回包不超明文预算）。
 
 ## v1.1.x：配对入口搬进设置面板（2026-10-24）
 

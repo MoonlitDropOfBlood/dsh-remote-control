@@ -24,9 +24,13 @@ import {
   LARGE_DEFAULT_MAX_EDGE,
   LARGE_MAX_BASE64,
   LARGE_MAX_EDGE,
+  REPLY_PLAIN_MAX_BYTES,
+  RELAY_MAX_FRAME_BYTES,
   THUMB_MAX_BASE64,
+  THUMB_PAGE_BUDGET,
   attachmentRefOf,
   clampMaxEdge,
+  fitReplyBudget,
   imageBlocksOf,
   imageRefMeta,
   loadSharp,
@@ -489,6 +493,121 @@ function eventsOf(sent, topic) {
   ctx.emit("session/event", { id: "sess-9" }, replaceEvent);
   await new Promise((resolve) => setTimeout(resolve, 20));
   check("直播图片：replace 副本不广播", eventsOf(relay.sent, "assistant.image").length === before, String(before));
+}
+
+setSharpResolver(null);
+
+// ===========================================================================
+// 场景 6：帧预算守卫（中继 1MiB 是 ws **单帧**上限，超了直接断链）
+// ===========================================================================
+{
+  // 纯函数：超预算 → 先剥缩略图（保留元数据）
+  const one = {
+    messages: [
+      {
+        id: "m1",
+        role: "assistant",
+        text: "看图",
+        ts: 1,
+        seq: 1,
+        images: [
+          {
+            imageId: "a1",
+            mediaType: "image/jpeg",
+            width: 800,
+            height: 600,
+            bytes: 123,
+            thumb: "data:image/jpeg;base64," + "A".repeat(200_000),
+          },
+        ],
+      },
+    ],
+  };
+  const fit1 = fitReplyBudget(one, 10_000);
+  check("帧预算：超预算时剥掉缩略图", fit1.strippedThumbs === 1 && one.messages[0].images[0].thumb === "", JSON.stringify(fit1));
+  check("帧预算：剥缩略图后保留元数据", one.messages[0].images[0].imageId === "a1" && one.messages[0].images[0].width === 800);
+  check("帧预算：剥完落在预算内", fit1.bytes <= 10_000 && fit1.overflow === false, String(fit1.bytes));
+
+  // 纯函数：剥完缩略图还超 → 整条 images[] 丢掉
+  const two = {
+    messages: [
+      {
+        id: "m2",
+        role: "assistant",
+        text: "C".repeat(30_000),
+        ts: 1,
+        seq: 1,
+        images: [{ imageId: "a2", mediaType: "image/jpeg", width: 1, height: 1, bytes: 1, thumb: "" }],
+      },
+    ],
+  };
+  const fit2 = fitReplyBudget(two, 10_000);
+  check("帧预算：剥完缩略图还超 → 丢 images[]", fit2.strippedImages === 1 && two.messages[0].images === undefined, JSON.stringify(fit2));
+
+  // 纯函数：只剩文字还超 → overflow（调用方回 error，绝不发爆帧）
+  const three = { messages: [{ id: "m3", role: "assistant", text: "D".repeat(50_000), ts: 1, seq: 1 }] };
+  const fit3 = fitReplyBudget(three, 10_000);
+  check("帧预算：只剩文字仍超 → overflow", fit3.overflow === true, String(fit3.bytes));
+
+  // 纯函数：不超预算 → 不动数据
+  const four = { messages: [{ id: "m4", role: "assistant", text: "ok", ts: 1, seq: 1 }] };
+  const fit4 = fitReplyBudget(four, 10_000);
+  check("帧预算：不超预算不动数据", fit4.strippedThumbs === 0 && fit4.strippedImages === 0 && fit4.overflow === false);
+
+  // 常量关系：明文预算 ×4/3（base64 密文）必须 < 中继单帧上限
+  check("大图预算 ≤ 明文预算", LARGE_MAX_BASE64 <= REPLY_PLAIN_MAX_BYTES, String(LARGE_MAX_BASE64));
+  check("页缩略图预算 ≤ 明文预算", THUMB_PAGE_BUDGET <= REPLY_PLAIN_MAX_BYTES, String(THUMB_PAGE_BUDGET));
+  check(
+    "明文预算 ×4/3 < 中继单帧上限",
+    Math.ceil((REPLY_PLAIN_MAX_BYTES * 4) / 3) < RELAY_MAX_FRAME_BYTES,
+    `${Math.ceil((REPLY_PLAIN_MAX_BYTES * 4) / 3)} vs ${RELAY_MAX_FRAME_BYTES}`,
+  );
+
+  // 端到端：一页 10 张图（每张缩略图 ~95KB）→ 回包必须落在明文预算内
+  const fake = makeFakeSharp();
+  setSharpResolver(() => {
+    const wrapped = (input) => {
+      const chain = fake(input);
+      const orig = chain.toBuffer;
+      chain.toBuffer = async () => {
+        const out = await orig.call(chain);
+        return { data: Buffer.alloc(70 * 1024, 9), info: out.info };
+      };
+      return chain;
+    };
+    wrapped.calls = fake.calls;
+    return wrapped;
+  });
+  const manyEvents = [];
+  for (let i = 1; i <= 10; i++) manyEvents.push(assistantImageEvent(i, "att-" + i));
+  const sc = {
+    async inspect() {
+      return { events: manyEvents };
+    },
+    async page() {
+      return { records: manyEvents.map((e) => ({ event: e })), hasMore: false };
+    },
+  };
+  const ctx = makeCtx({ sessionController: sc, attachments: makeAttachments() });
+  const relay = makeRelay();
+  const bridge = new HostBridge({
+    ctx,
+    relay,
+    push: { configured: false, notify: async () => ({ ok: true }) },
+    config: CFG,
+    log,
+  });
+  bridge.attach();
+  const histId = "req-hist-big";
+  await bridge.dispatch({ id: histId, type: "session.history", ts: Date.now(), payload: { sessionId: "sess-big" } });
+  const hist = lastResult(relay.sent, histId);
+  const replyBytes = JSON.stringify(hist?.value ?? {}).length;
+  check("多图历史：回包落在明文预算内", replyBytes <= REPLY_PLAIN_MAX_BYTES, String(replyBytes));
+  const thumbs = (hist?.value?.messages ?? []).reduce(
+    (n, m) => n + (m?.images ?? []).filter((i) => typeof i?.thumb === "string" && i.thumb !== "").length,
+    0,
+  );
+  check("多图历史：缩略图总量受页预算约束", thumbs <= 10 && replyBytes <= REPLY_PLAIN_MAX_BYTES, `${thumbs} 张缩略图`);
 }
 
 setSharpResolver(null);

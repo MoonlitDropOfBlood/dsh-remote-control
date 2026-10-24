@@ -142,3 +142,17 @@ grep -rnE "@State|@Prop|@Link|@ObjectLink|@Observed[^V]|@Provide|@Consume|@Watch
   foreground/full/plugin 图标 + 留档 whale-orig.svg）→ `node tools/icon/render-icons.mjs`（resvg 渲
   染 layered background/foreground 1024 + startIcon 288）。改图标只改脚本再重跑，勿手改 PNG；
   plugin/icon.svg 由 compose 脚本生成，勿手改。
+
+### 会话消息里的图片（契约 §5.10 v1.0.9）
+- 手机端**没有**浏览器的图片 URL 通路（`ctx.uiConversation.imageUrl` 是 Web 专属），
+  图片一律走 wire：插件压缩好的**缩略图 data URI 内联**在 `ChatMessage.images[]` /
+  `assistant.image` 事件里，**大图按需 `image.fetch`** 拉（`maxEdge` 缺省 1600、上限 4096）。
+- 类型：`protocol.ets` 的 `DshrcImageRef{imageId, mediaType, width, height, bytes, thumb}`、
+  `DshrcChatMessage.images?`；常量 `MSG_IMAGE_FETCH` / `TOPIC_ASSISTANT_IMAGE`。
+- 渲染（`TimelineView.ets`）：缩略图按 width/height 等比（最大宽撑满气泡、最大高 ≤320vp）；
+  `thumb` 为空（插件降质后仍超限）→ **灰色占位框**；点击进 `ImageViewerPage`
+  （全屏大图 + 双指缩放/拖动/关闭）。**纯图片消息（正文为空）不画空气泡**。
+- 直播 `assistant.image`：挂到**当前正在流式的 assistant 消息**；没有流式消息就单独成一条
+  图片消息（`text` 为空串）。同一 imageId 重复到达幂等。
+- `store.fetchImage(imageId, maxEdge?)` 带内存缓存（key = imageId@maxEdge）；
+  失败**只提示**（契约：图片可选，不阻塞会话其余功能）。

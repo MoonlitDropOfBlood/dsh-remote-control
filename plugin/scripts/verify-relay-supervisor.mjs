@@ -20,6 +20,7 @@ import {
   parseRelayTarget,
   resolveRelayEntry,
   shouldRestartRelay,
+  shouldTickWatchdog,
   PLUGIN_DIR,
 } from "../lib/relay-supervisor.mjs";
 
@@ -62,8 +63,11 @@ async function freePort() {
 
 /** 桩中继：行为对齐真中继的关键约定（打印 listening、支持 shutdown 命令、stdin EOF 退出）。 */
 let stubCounter = 0;
+/** 所有桩目录登记在册，退出时统一清理（N9：每次门禁泄漏 8 个临时目录）。 */
+const stubDirs = [];
 function stubEntry() {
   const dir = mkdtempSync(join(tmpdir(), "dshrc-stub-relay-"));
+  stubDirs.push(dir);
   stubCounter++;
   const file = join(dir, "stub-" + stubCounter + ".mjs");
   writeFileSync(
@@ -531,5 +535,298 @@ function stubEntry() {
   await sup.stop();
 }
 
+// ---------------------------------------------------------------------------
+// 19. 回归 N1：插件被禁用 / 未配置时，看门狗绝不能把中继拉起来
+//     （审计实测：enabled=false 时看门狗 34s 后照样起了 0.0.0.0 的中继）
+// ---------------------------------------------------------------------------
+{
+  const sup = new RelaySupervisor({ entry: stubEntry() });
+  const port = await freePort();
+  const s = await sup.ensure("ws://127.0.0.1:" + port, { autoStart: false });
+  check("N1：autoStart=false → 不托管", s.managed === false && s.running === false, JSON.stringify(s));
+  check("N1：autoStart=false → 看门狗不重拉", shouldRestartRelay(s) === false, JSON.stringify(s));
+  check("N1：autoStart=false → 端口没人监听", (await isPortListening(port)) === false);
+  check("N1：未配置地址 → 看门狗不重拉", shouldRestartRelay({ running: false, reason: "not-configured" }) === false);
+  check("N1：远端中继 → 看门狗不重拉", shouldRestartRelay({ running: false, reason: "remote" }) === false);
+  check("N1：找不到入口 → 看门狗不重拉", shouldRestartRelay({ running: false, reason: "no-entry" }) === false);
+  // 旧状态（无 reason 字段）也必须靠 managed 判定挡住
+  check("N1：无 reason 且 managed=false → 不重拉", shouldRestartRelay({ running: false, managed: false }) === false);
+  check("N1：无 reason 且 managed=true 且没跑 → 要重拉", shouldRestartRelay({ running: false, managed: true }) === true);
+  await sup.stop();
+}
+
+// ---------------------------------------------------------------------------
+// 20. 回归 N2：dispose 后「重新加载」要能重新托管（否则 set_plugin 关→开就废了）
+// ---------------------------------------------------------------------------
+{
+  const sup = new RelaySupervisor({ entry: stubEntry() });
+  const port = await freePort();
+  const first = await sup.ensure("ws://127.0.0.1:" + port, {});
+  check("N2 前置：首次托管成功", first.running === true, JSON.stringify(first));
+  await sup.dispose();
+  check("N2：dispose 后 disposed=true", sup.disposed === true);
+  // 重新加载 = 新实例（index.js 卸载时会 HOST_STATES.delete(ctx) → 重建）
+  const sup2 = new RelaySupervisor({ entry: stubEntry() });
+  const again = await sup2.ensure("ws://127.0.0.1:" + port, {});
+  check("N2：新实例能重新托管（端口已释放）", again.managed === true && again.running === true, JSON.stringify(again));
+  check("N2：新实例后端口在监听", (await isPortListening(port)) === true);
+  await sup2.stop();
+  await sup.dispose();
+}
+
+// ---------------------------------------------------------------------------
+// 21. 回归 N3：崩溃时子进程输出必须进日志（否则崩溃循环无痕）
+// ---------------------------------------------------------------------------
+{
+  const logs = [];
+  const dir = mkdtempSync(join(tmpdir(), "dshrc-crash-"));
+  const entry = join(dir, "crasher.mjs");
+  writeFileSync(
+    entry,
+    [
+      "console.error('FATAL: EADDRINUSE port already in use');",
+      "process.exit(3);",
+    ].join("\n"),
+  );
+  const sup = new RelaySupervisor({
+    entry,
+    log: (level, msg, extra) => logs.push({ level, msg, extra }),
+  });
+  const port = await freePort();
+  await sup.ensure("ws://127.0.0.1:" + port, {});
+  await new Promise((r) => setTimeout(r, 1500));
+  const text = JSON.stringify(logs);
+  check("N3：崩溃原因进了日志", text.includes("EADDRINUSE"), text.slice(0, 300));
+  check("N3：崩溃后状态 running=false（可重拉）", sup.status.running === false, JSON.stringify(sup.status));
+  check("N3：崩溃后状态 reason=managed（看门狗会重拉）", sup.status.reason === "managed");
+  check("N3：崩溃后看门狗判定要重拉", shouldRestartRelay(sup.status) === true);
+  await sup.stop();
+  cleanupDir(dir);
+}
+
+// ---------------------------------------------------------------------------
+// 22. 回归 N6：进程活着但端口没监听时，不能谎报 running
+// ---------------------------------------------------------------------------
+{
+  const dir = mkdtempSync(join(tmpdir(), "dshrc-silent-"));
+  const entry = join(dir, "silent.mjs");
+  // 只打印 listening 关键字但**不真的监听**（模拟「进程活着但没服务」）
+  writeFileSync(entry, ["console.log('relay listening (pretend)');", "setInterval(() => {}, 1000);"].join("\n"));
+  const sup = new RelaySupervisor({ entry });
+  const port = await freePort();
+  const s = await sup.ensure("ws://127.0.0.1:" + port, {});
+  check("N6：确认监听后才报 running=true", s.running === true, JSON.stringify(s));
+  // 再 ensure 一次：进程还活着但端口其实没监听 → 不能继续报 running
+  const s2 = await sup.ensure("ws://127.0.0.1:" + port, {});
+  check("N6：端口没监听时 running=false（不谎报）", s2.running === false, JSON.stringify(s2));
+  check("N6：端口没监听时看门狗仍会重试", shouldRestartRelay(s2) === true);
+  await sup.stop();
+  cleanupDir(dir);
+}
+
+// ---------------------------------------------------------------------------
+// 23. 回归 N4：IPv6 端口探测不能漏判
+// ---------------------------------------------------------------------------
+{
+  const { createServer } = await import("node:net");
+  const server = createServer();
+  let bound = false;
+  try {
+    await new Promise((r, j) => {
+      server.once("error", j);
+      server.listen(0, "::1", () => {
+        bound = true;
+        r();
+      });
+    });
+  } catch {
+    // 设备不支持 IPv6 → 跳过（不算失败）
+    bound = false;
+  }
+  if (bound) {
+    const p6 = server.address().port;
+    check("N4：只绑 [::1] 的端口也判为占用", (await isRelayPortBusy(p6, "::1")) === true, String(p6));
+  } else {
+    check("N4：本机不支持 IPv6（跳过 IPv6 探测断言）", true);
+  }
+  await new Promise((r) => server.close(r));
+}
+
+// ---------------------------------------------------------------------------
+// 24. 回归 N8：并发 ensure 不同目标地址 → 不能返回陈旧端口
+// ---------------------------------------------------------------------------
+{
+  const sup = new RelaySupervisor({ entry: stubEntry() });
+  const portA = await freePort();
+  const portB = await freePort();
+  const [ra, rb] = await Promise.all([
+    sup.ensure("ws://127.0.0.1:" + portA, {}),
+    sup.ensure("ws://127.0.0.1:" + portB, {}),
+  ]);
+  check("N8：并发不同目标不会都返回同一个端口", ra.port !== rb.port, ra.port + " vs " + rb.port);
+  check("N8：最终状态端口 = 后一个目标", sup.status.port === portB, JSON.stringify(sup.status));
+  await sup.stop();
+}
+
+// ---------------------------------------------------------------------------
+// 25. 变异级盲区补齐（第二轮审计用变异测试找出：这些点改了代码，71 项照样全绿）
+// ---------------------------------------------------------------------------
+{
+  // 盲区①：exit 回调的**归属判断**（S3）——去掉 `this.child === child` 就会把
+  // 胜者的句柄清掉变成孤儿。用「先起 A、再 ensure 到 B（端口变了→A 被 stop）」验证。
+  const sup = new RelaySupervisor({ entry: stubEntry() });
+  const portA = await freePort();
+  const portB = await freePort();
+  const a = await sup.ensure("ws://127.0.0.1:" + portA, {});
+  const pidA = a.pid;
+  check("变异盲区①：先起了 A", pidA > 0 && (await isPortListening(portA)) === true);
+  await sup.ensure("ws://127.0.0.1:" + portB, {});
+  await new Promise((r) => setTimeout(r, 600));
+  check("变异盲区①：换端口后旧进程真的退出了", (await isPortListening(portA)) === false);
+  check("变异盲区①：句柄指向新进程（不是被清空的旧句柄）", sup.child !== null && sup.child.pid !== pidA);
+  check("变异盲区①：新端口在监听", (await isPortListening(portB)) === true);
+  await sup.stop();
+}
+{
+  // 盲区②：unref 时机（S5）——提前 unref 会让父进程事件循环空掉、await 永不落定。
+  // 这里直接检查「启动确认前句柄是 ref 的、确认后是 unref 的」。
+  const sup = new RelaySupervisor({ entry: stubEntry() });
+  const port = await freePort();
+  await sup.ensure("ws://127.0.0.1:" + port, {});
+  const child = sup.child;
+  const hasRef = typeof child._handle?.hasRef === "function" ? child._handle.hasRef() : null;
+  check("变异盲区②：启动确认后子进程已 unref（不吊住宿主事件循环）", hasRef === false, String(hasRef));
+  await sup.stop();
+}
+{
+  // 盲区③：stop 走 stdin 的 shutdown 命令（Windows 上 SIGTERM 是硬杀，这条是唯一的优雅路径）
+  // —— 断言「子进程是被命令停掉的」：桩中继在收到 shutdown 时才打印一行。
+  const dir = mkdtempSync(join(tmpdir(), "dshrc-shutdown-"));
+  const entry = join(dir, "shut.mjs");
+  writeFileSync(
+    entry,
+    [
+      "import { createServer } from 'node:net';",
+      "const srv = createServer();",
+      "srv.listen(Number(process.env.PORT || 0), '0.0.0.0', () => console.log('relay listening port=' + srv.address().port));",
+      "let buf = '';",
+      "process.stdin.on('data', (c) => {",
+      "  buf += String(c);",
+      "  const i = buf.indexOf('\\n');",
+      "  if (i >= 0 && buf.slice(0, i).trim() === 'shutdown') {",
+      "    console.log('GOT_SHUTDOWN_COMMAND');",
+      "    srv.close(() => process.exit(0));",
+      "  }",
+      "});",
+      "process.stdin.resume();",
+    ].join("\n"),
+  );
+  const sup = new RelaySupervisor({ entry });
+  const port = await freePort();
+  await sup.ensure("ws://127.0.0.1:" + port, {});
+  const child = sup.child;
+  let sawCommand = false;
+  child.stdout.on("data", (b) => {
+    if (String(b).includes("GOT_SHUTDOWN_COMMAND")) sawCommand = true;
+  });
+  await sup.stop();
+  await new Promise((r) => setTimeout(r, 300));
+  check("变异盲区③：stop 真的下了 shutdown 命令（不是靠 SIGTERM 硬杀）", sawCommand === true);
+  cleanupDir(dir);
+}
+{
+  // 盲区④：端口探测要同时看 127.0.0.1 与目标 host（M1）
+  // —— 用一个**只绑 192.168.3.2** 的服务验证（127.0.0.1 连不上，但 LAN IP 连得上）。
+  const { createServer } = await import("node:net");
+  const { networkInterfaces } = await import("node:os");
+  const lanAddr = Object.values(networkInterfaces())
+    .flat()
+    .find((n) => n && n.family === "IPv4" && !n.internal);
+  if (lanAddr) {
+    const server = createServer();
+    await new Promise((r) => server.listen(0, lanAddr.address, r));
+    const p = server.address().port;
+    const localOnly = await isPortListening(p, "127.0.0.1");
+    const lanOnly = await isPortListening(p, lanAddr.address);
+    check("变异盲区④：只绑 LAN IP 的服务在 127.0.0.1 上连不上", localOnly === false, String(localOnly));
+    check("变异盲区④：只绑 LAN IP 的服务在 LAN IP 上连得上", lanOnly === true, String(lanOnly));
+    check("变异盲区④：isRelayPortBusy 能识别它（不漏判）", (await isRelayPortBusy(p, lanAddr.address)) === true);
+    await new Promise((r) => server.close(r));
+  } else {
+    check("变异盲区④：本机没有非内网 IPv4（跳过该断言）", true);
+  }
+}
+{
+  // 盲区⑤：stop 的早退条件要用 exitCode/signalCode（不是 child.killed）
+  // —— 「调过 kill 但没死透」的进程第二次 stop 仍应被继续处理，而不是丢句柄。
+  const sup = new RelaySupervisor({ entry: stubEntry() });
+  const port = await freePort();
+  await sup.ensure("ws://127.0.0.1:" + port, {});
+  const child = sup.child;
+  child.killed = true; // 模拟「曾经调过 kill 但进程还活着」
+  await sup.stop();
+  check("变异盲区⑤：child.killed=true 但进程仍活时，stop 仍会真停它", child.exitCode !== null || child.signalCode !== null);
+  check("变异盲区⑤：端口已释放", (await isPortListening(port)) === false);
+}
+{
+  // 盲区⑥：relay 侧停止的幂等闩锁（SIGTERM 与 stdin 命令可能同时到）
+  const realEntry = resolveRelayEntry();
+  const { spawn } = await import("node:child_process");
+  const port = await freePort();
+  const child = spawn(process.execPath, [realEntry], {
+    cwd: dirname(realEntry),
+    env: { ...process.env, PORT: String(port), DSHRC_RELAY_PARENT_WATCHDOG: "1" },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  await new Promise((r) => setTimeout(r, 2500));
+  // **按平台镜像真实 stop() 的行为**：
+  // Windows 上 child.kill('SIGTERM') 是**硬杀**（不走 handler）→ 只能发命令；
+  // POSIX 上命令 + 信号都发（信号是优雅路径，命令是冗余保险）。
+  child.stdin.write("shutdown\n");
+  if (process.platform !== "win32") {
+    try {
+      child.kill("SIGTERM");
+    } catch {
+      /* ignore */
+    }
+  }
+  const exited = await new Promise((resolve) => {
+    const t = setTimeout(() => resolve(null), 5000);
+    child.once("exit", (code, signal) => {
+      clearTimeout(t);
+      resolve({ code, signal });
+    });
+  });
+  check(
+    "变异盲区⑥：命令(+POSIX 信号)只停一次且优雅退出（exit code 0）",
+    exited !== null && exited.code === 0,
+    JSON.stringify(exited),
+  );
+  check("变异盲区⑥：优雅退出后端口释放", (await isPortListening(port)) === false);
+}
+
+// ---------------------------------------------------------------------------
+// 26. 接线层覆盖（审计：index.js 的接线是唯一没被测到、又已经出事的部分）
+// ---------------------------------------------------------------------------
+{
+  const { shouldTickWatchdog } = await import("../lib/relay-supervisor.mjs");
+  // N1 的实际接线：插件被禁用时看门狗不得动
+  check("接线：enabled=false → 看门狗不动", shouldTickWatchdog({ running: false, reason: "managed", managed: true }, { enabled: false }) === false);
+  check("接线：enabled 缺失 → 看门狗不动", shouldTickWatchdog({ running: false, reason: "managed" }, {}) === false);
+  check("接线：autoStartRelay=false → 看门狗不动", shouldTickWatchdog({ running: false, reason: "managed" }, { enabled: true, autoStartRelay: false }) === false);
+  check("接线：enabled=true 且托管的崩了 → 看门狗要动", shouldTickWatchdog({ running: false, reason: "managed", managed: true }, { enabled: true }) === true);
+  check("接线：enabled=true 且在跑 → 看门狗不动", shouldTickWatchdog({ running: true, reason: "managed", managed: true }, { enabled: true }) === false);
+  check("接线：enabled=true 且外部占用 → 看门狗要重探", shouldTickWatchdog({ running: true, reason: "external", external: true }, { enabled: true }) === true);
+
+  // N2 的实际接线：卸载必须清 HOST_STATES（源码级断言——接线路径要真实 ctx，成本高）
+  const src = readFileSync(join(PLUGIN_DIR, "index.js"), "utf8");
+  check("接线：卸载时清理 HOST_STATES（N2）", /HOST_STATES\.delete\(ctx\)/.test(src));
+  check("接线：startRemoteHost 会丢弃已 dispose 的旧 state（N2）", /disposed === true/.test(src));
+  check("接线：autoStart 折进了 cfg.enabled（N1）", /enabled === true && state\.cfg\.autoStartRelay !== false/.test(src));
+  check("接线：看门狗用纯函数判定", /shouldTickWatchdog\(supervisor\.status, state\.cfg\)/.test(src));
+}
+
 console.log("\nverify-relay-supervisor: " + pass + " passed, " + fail + " failed");
+// N9：清理所有桩目录（门禁不该在系统临时目录里留垃圾）
+for (const dir of stubDirs) cleanupDir(dir);
 process.exit(fail === 0 ? 0 : 1);

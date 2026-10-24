@@ -110,8 +110,15 @@ export async function isLocalHostResolved(host) {
   if (typeof host !== "string" || host === "") return false;
   const h = host.toLowerCase().replace(/^\[|\]$/g, "");
   if (isLocalHost(h)) return true;
+  // **N10：DNS 解析必须有超时**——异常 DNS 会让每轮看门狗阻塞数秒。
   try {
-    const res = await lookup(h);
+    const res = await Promise.race([
+      lookup(h),
+      new Promise((_, reject) => {
+        const t = setTimeout(() => reject(new Error("dns timeout")), 2000);
+        if (typeof t.unref === "function") t.unref();
+      }),
+    ]);
     const addrs = Array.isArray(res) ? res : [res];
     return addrs.some((a) => isLocalHost(a.address));
   } catch {
@@ -157,7 +164,11 @@ export function isPortListening(port, host = "127.0.0.1", timeoutMs = 400) {
 export async function isRelayPortBusy(port, host) {
   if (await isPortListening(port, "127.0.0.1")) return true;
   const h = (host || "").toLowerCase().replace(/^\[|\]$/g, "");
-  if (h !== "" && h !== "127.0.0.1" && h !== "localhost" && h !== "::1" && h !== "0.0.0.0" && h !== "::") {
+  // **N4：IPv6 也要探**——原来把 "::1" 跳过了，但只绑 [::1]:P 的服务是真实存在的
+  // → 漏判 → 起一个影子中继 → EADDRINUSE → 崩溃循环。
+  if (h === "::1") {
+    if (await isPortListening(port, "::1")) return true;
+  } else if (h !== "" && h !== "127.0.0.1" && h !== "localhost" && h !== "0.0.0.0" && h !== "::") {
     if (await isPortListening(port, h)) return true;
   }
   return false;
@@ -218,6 +229,8 @@ export class RelaySupervisor {
     this.status = emptyStatus();
     /** 在途 ensure 的 promise（并发去重锁）。 */
     this.pending = null;
+    /** 在途 ensure 的目标地址（N8：目标不同不能复用旧 promise）。 */
+    this.pendingTarget = null;
     /** 永久停用标志（dispose 后不再启动任何进程）。 */
     this.disposed = false;
     /** 子进程输出缓冲（启动失败时把原因带给宿主日志）。 */
@@ -261,9 +274,22 @@ export class RelaySupervisor {
    */
   async ensure(relayUrl, opts = {}) {
     // 并发去重：看门狗 tick 与 setRelayUrl 可能同时打进来（S3）
-    if (this.pending) return await this.pending;
+    // **N8**：目标不同（换地址了）时不能直接复用旧 promise——那会把**陈旧端口**返回给调用方。
+    // 这种情况等前一个跑完，再按新目标跑一次。
+    if (this.pending) {
+      const same = this.pendingTarget === relayUrl;
+      const first = this.pending;
+      await first.catch(() => {});
+      if (same) return await first;
+      this.log("info", "relay target changed while ensure was in flight", {
+        from: this.pendingTarget,
+        to: relayUrl,
+      });
+    }
+    this.pendingTarget = relayUrl;
     this.pending = this.#ensureInner(relayUrl, opts).finally(() => {
       this.pending = null;
+      this.pendingTarget = null;
     });
     return await this.pending;
   }
@@ -311,13 +337,19 @@ export class RelaySupervisor {
     // 已在托管：端口一致才复用；端口变了必须换进程（S1：原来只判「活着」就 return）
     if (this.isChildAlive()) {
       if (this.childPort === target.port) {
+        // **N6：不能只看「进程活着」就说 running**——中继可能还没监听
+        // （启动慢/端口被占后重试）→ running:true 会让看门狗从此失明。
+        // 端口确实在监听才算真的在跑。
+        const listening = await isRelayPortBusy(target.port, target.host);
         this.#publish({
           managed: true,
-          running: true,
+          running: listening,
           pid: this.child?.pid || 0,
           port: this.childPort,
           reason: "managed",
-          detail: `中继进程由插件托管（pid ${this.child?.pid || 0}，端口 ${this.childPort}）。`,
+          detail: listening
+            ? `中继进程由插件托管（pid ${this.child?.pid || 0}，端口 ${this.childPort}）。`
+            : `中继进程已启动（pid ${this.child?.pid || 0}），但端口 ${this.childPort} 尚未监听，稍后重试。`,
         });
         return this.status;
       }
@@ -400,13 +432,24 @@ export class RelaySupervisor {
       detail: `中继进程由插件托管（pid ${child.pid || 0}，端口 ${port}）。`,
     });
 
-    // 收集子进程输出：启动失败时把原因带给宿主日志（M2：原来全被吞掉）
+    // 收集子进程输出：启动失败/崩溃时把原因带给宿主日志（M2：原来全被吞掉；
+    // N3：崩溃时 stderr 也要进日志，否则崩溃循环的根因 100% 不可见）
     const onData = (buf) => {
       this.output += String(buf);
       if (this.output.length > 4096) this.output = this.output.slice(-4096);
     };
     if (child.stdout) child.stdout.on("data", onData);
     if (child.stderr) child.stderr.on("data", onData);
+
+    /** 取输出尾部（多行合并成一行，便于日志阅读；不含 base64 之类的大块内容）。 */
+    const outputTail = () =>
+      this.output
+        .trim()
+        .split("\n")
+        .filter((l) => l.trim() !== "")
+        .slice(-6)
+        .join(" | ")
+        .slice(0, 600);
 
     child.on("exit", (code, signal) => {
       // 归属判断：只有「当前持有的那个」退出才清句柄（S3：败者的 exit 回调
@@ -425,13 +468,35 @@ export class RelaySupervisor {
           reason: "managed",
           detail: `托管的中继进程已退出（code=${String(code)} signal=${String(signal)}），将自动重拉。`,
         });
+        // **N3：崩溃原因必须进日志**（原来只在 output 缓冲里，没人读 → 崩溃循环无痕）
+        const tail = outputTail();
+        this.log("error", "managed relay exited", {
+          code,
+          signal,
+          port,
+          output: tail || undefined,
+        });
+        return;
       }
-      this.log("warn", "managed relay exited", { code, signal, port });
+      // 已被取代的子进程（N12）：只记 info，不刷 warn 噪声
+      this.log("info", "superseded relay process exited", { code, signal, port });
     });
     child.on("error", (e) => {
       if (this.child !== child) return;
-      this.#publish({ ...emptyStatus(), port, detail: "中继进程出错：" + String(e && e.message) });
-      this.log("error", "managed relay error", { error: String(e && e.message) });
+      // **N7**：spawn 失败时 Node **不发 exit**（exitCode 恒 null）→ 必须自己清句柄，
+      // 否则 isChildAlive() 恒为 true → 状态永远卡在「运行中（pid 0）」。
+      this.child = null;
+      this.childPort = 0;
+      this.#publish({
+        ...emptyStatus(),
+        port,
+        reason: "managed",
+        detail: "中继进程出错：" + String(e && e.message),
+      });
+      this.log("error", "managed relay error", {
+        error: String(e && e.message),
+        output: outputTail() || undefined,
+      });
     });
 
     // S5：子进程的三条 stdio 管道 + child 本身都是 ref 句柄，会吊住 DSH 事件循环
@@ -452,21 +517,30 @@ export class RelaySupervisor {
 
     // 等「listening」确认真的起来了（最多 8s）
     const ready = await this.waitForListening(child, 8000);
+    // **N3：启动没确认成功时，输出必须进日志**（原来被下面的早退跳过 →
+    // 崩溃循环的根因完全不可见）。早退之前先记日志。
+    if (!ready) {
+      const tail = this.output
+        .trim()
+        .split("\n")
+        .filter((l) => l.trim() !== "")
+        .slice(-6)
+        .join(" | ")
+        .slice(0, 600);
+      this.log("error", "managed relay did not confirm listening", {
+        pid: child.pid || 0,
+        port,
+        output: tail || undefined,
+      });
+    }
     // 等待期间可能已被 stop()/dispose() 收掉 → 句柄不再属于我们，别再发布「运行中」
     if (this.child !== child) {
       this.log("info", "managed relay was stopped while starting", { pid: child.pid || 0, port });
       unrefAll();
       return this.status;
     }
-    if (!ready) {
-      // 启动失败：把子进程输出带给宿主日志（M2）
-      const tail = this.output.trim().split("\n").slice(-6).join(" | ").slice(0, 600);
-      this.log("error", "managed relay did not confirm listening", {
-        pid: child.pid || 0,
-        port,
-        output: tail,
-      });
-    }
+    // **N6：running 只在「真的监听着」时为 true**——
+    // 活着但没监听（如中继启动慢）时报 running:true 会让看门狗从此失明。
     this.#publish({
       managed: true,
       running: ready,
@@ -614,7 +688,7 @@ export class RelaySupervisor {
 /**
  * 看门狗判定：现在**要不要**再跑一次 ensure()？（纯函数，便于单测——审计指出接线逻辑零覆盖）
  *
- * 规则：
+ * 规则（**N1：丢了 managed 判定会让「已关插件」反而把中继拉起来**，务必保留）：
  *   - 我们托管的进程在跑 → 不用管；
  *   - 未配置 / 关了自动启动 / 远端中继 / 找不到中继程序 → 不用管（再探也没意义）；
  *   - 我们托管的进程崩了 → 要重拉；
@@ -631,10 +705,29 @@ export function shouldRestartRelay(status) {
   const reason = typeof status.reason === "string" ? status.reason : "";
   if (reason === "managed") return status.running !== true;
   if (reason === "external") return true;
-  // 旧版本没有 reason 字段时的兼容判断
+  // 其余原因（not-configured / disabled / remote / no-entry）一律**不重拉**：
+  // 否则「用户关了插件」会被看门狗反复 ensure → 反而把中继拉起来（审计 N1 实测复现）。
+  if (reason !== "") return false;
+  // 旧版本没有 reason 字段时的兼容判断（与 b6adbd2 的行为一致）
+  if (status.managed !== true) return false;
   if (status.running === true) return false;
-  if (status.external === true) return true;
-  return false;
+  return true;
+}
+
+/**
+ * 看门狗**接线**判定：这一轮要不要动？（纯函数——审计指出 index.js 的接线
+ * 是唯一没被测到、又已经出过事的地方：丢了 enabled 判定时，
+ * 「用户把插件关掉」反而会把中继拉起来。）
+ *
+ * @param {object} status supervisor 的实时状态
+ * @param {{enabled?:boolean, autoStartRelay?:boolean}} cfg 插件配置
+ * @returns {boolean}
+ */
+export function shouldTickWatchdog(status, cfg) {
+  // 插件被禁用 → 一律不碰中继（N1）
+  if (!cfg || cfg.enabled !== true) return false;
+  if (cfg.autoStartRelay === false) return false;
+  return shouldRestartRelay(status);
 }
 
 /** 插件根目录（导出以便测试与其它模块引用）。 */

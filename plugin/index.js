@@ -37,7 +37,7 @@ import { Remote, TypertRemoteService } from "@deepseek-ai/dsh-typert-protocol";
 import { assertKat } from "./lib/protocol.mjs";
 import { loadConfig, saveConfig, dataDir } from "./lib/config.mjs";
 import { RelayClient } from "./lib/relay-client.mjs";
-import { RelaySupervisor, shouldRestartRelay } from "./lib/relay-supervisor.mjs";
+import { RelaySupervisor, shouldTickWatchdog } from "./lib/relay-supervisor.mjs";
 import { PushSender, pushConfigured, pushUnavailableReason } from "./lib/push.mjs";
 import { HostBridge } from "./lib/host-bridge.mjs";
 import {
@@ -91,7 +91,13 @@ export function startRemoteHost(ctx, rowConfig) {
   // 幂等：同一个 ctx 只启动一次（类插件的 [Service.init] 与函数式 apply 共存时
   // 不会起两条中继链路、不会重复注册监听）。
   const existing = HOST_STATES.get(ctx);
-  if (existing) return existing;
+  // **N2**：已 dispose 的旧 state 不能复用——插件二次加载时若拿到它，
+  // 托管会永久失效（supervisor 的 disposed 是单向闩锁）。丢掉重建。
+  if (existing && existing.supervisor && existing.supervisor.disposed === true) {
+    HOST_STATES.delete(ctx);
+  } else if (existing) {
+    return existing;
+  }
 
   const log = (level, message, extra) => {
     const line = "[dsh-remote-control] " + message + (extra ? " " + JSON.stringify(extra) : "");
@@ -204,7 +210,9 @@ export function startRemoteHost(ctx, rowConfig) {
   async function ensureRelayProcess() {
     try {
       const snapshot = await supervisor.ensure(state.cfg.relayUrl, {
-        autoStart: state.cfg.autoStartRelay !== false,
+        // **N1：`cfg.enabled` 必须折进 autoStart**——插件被禁用时绝不能拉起中继
+        // （审计实测：enabled=false 时看门狗仍把 0.0.0.0 的中继拉了起来）。
+        autoStart: state.cfg.enabled === true && state.cfg.autoStartRelay !== false,
         relayToken: state.cfg.relayToken,
       });
       state.relayProcess = snapshot;
@@ -223,7 +231,10 @@ export function startRemoteHost(ctx, rowConfig) {
   // 审计指出：原来读 ensure() 时刻的静态快照 → 子进程退出后快照仍是 running=true
   // → 永不重拉，设置页还显示「运行中（已死的 pid）」。
   state.relayWatchdog = setInterval(() => {
-    if (!shouldRestartRelay(supervisor.status)) return;
+    // 判定走纯函数 shouldTickWatchdog()（有单测覆盖）：
+    // ① 插件被禁用 → 一律不碰中继（N1：否则「用户关了插件」反而把中继拉起来）；
+    // ② 其余按 supervisor 的实时状态决定（含 external 重探、崩溃重拉）。
+    if (!shouldTickWatchdog(supervisor.status, state.cfg)) return;
     void ensureRelayProcess();
   }, 15_000);
   if (typeof state.relayWatchdog.unref === "function") state.relayWatchdog.unref();
@@ -306,6 +317,10 @@ export function startRemoteHost(ctx, rowConfig) {
     // **dispose 而非 stop**（审计 S4）：dispose 置位「永久停用」，
     // 在途的 ensure 完成后不会再把中继拉起来（原来 stop 后在途 ensure 仍会 spawn → 孤儿）。
     void supervisor.dispose();
+    // **N2：必须把 ctx 的状态从 HOST_STATES 里摘掉**——
+    // 否则插件二次加载（DSH `set_plugin` 关→开走 cordis `Fiber.restart()`，**复用同一个 ctx**）
+    // 会拿到这份「已 dispose 的旧 state」→ 托管永久失效（实测：端口再也不监听、看门狗也没了）。
+    HOST_STATES.delete(ctx);
     log("info", "unloaded");
   });
 
@@ -626,6 +641,10 @@ function withRelayProcess(value, host) {
     port: typeof snap?.port === "number" ? snap.port : 0,
     /** 人类可读的一句话状态。 */
     detail: typeof snap?.detail === "string" ? snap.detail : "",
+    /** 端口上是不是**别人**的服务（N11：不透传的话设置页无法区分「外部中继」）。 */
+    external: snap?.external === true,
+    /** 状态原因（not-configured/disabled/remote/no-entry/external/managed）。 */
+    reason: typeof snap?.reason === "string" ? snap.reason : "",
   };
   return value;
 }

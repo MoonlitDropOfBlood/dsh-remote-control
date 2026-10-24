@@ -293,6 +293,22 @@ export class DshrcLink {
     this.setState('stopped');
   }
 
+  /**
+   * 回前台立即重连（v1.0.9）：App 在后台时系统可能冻结定时器/挂起套接字，
+   * 退避重连最长要等 60s；回前台时若正处于重连等待，跳过剩余退避立即试一次，
+   * 并重置退避档位（真机场景：扫码后一直「重连中」，切几次前后台才连上）。
+   * 仅在「应该运行且正在重连等待」时生效，不打扰正常在线/终局状态。
+   */
+  kickReconnect(): void {
+    if (!this.shouldRun || this.state !== 'reconnecting') {
+      return;
+    }
+    this.clearReconnectTimer();
+    this.reconnectAttempts = 0;
+    this.log('foreground kick: reconnect now');
+    this.connectOnce();
+  }
+
   private stopInternal(reason: string): void {
     this.clearHeartbeatTimer();
     this.clearHelloTimer();

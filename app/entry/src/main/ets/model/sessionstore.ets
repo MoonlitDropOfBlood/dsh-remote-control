@@ -898,8 +898,29 @@ export class SessionStore {
     }
     pageItems.sort((a: TimelineItem, b: TimelineItem): number => a.seq - b.seq);
     const body: TimelineItem[] = prepend ? pageItems.concat(durable) : durable.concat(pageItems);
-    this.cache.set(sid, body.concat(live));
+    const merged: TimelineItem[] = body.concat(live);
+    this.cache.set(sid, merged);
+    // v1.0.9 自愈：turn.end 事件若在断线窗口丢失，流式光标（▍）会残留在已结束的
+    // 消息上。宿主侧该会话已不在运行（running=false）时不可能存在进行中的流——
+    // 拉到历史后一律定稿所有 streaming 块，下次打开/刷新即自愈。
+    if (!this.runningOf(sid)) {
+      this.finalizeStaleStreaming(sid, merged);
+    }
     this.notifyActive(sid);
+  }
+
+  /** 静默清掉残留的流式标志（不自增 ts / 不加错误文案——只是光标回收）。 */
+  private finalizeStaleStreaming(sid: string, items: TimelineItem[]): void {
+    let touched: boolean = false;
+    for (let i: number = 0; i < items.length; i++) {
+      if (items[i].streaming) {
+        items[i].streaming = false;
+        touched = true;
+      }
+    }
+    if (touched) {
+      logDshrc(TAG, 'info', 'finalized stale streaming blocks after history load (turn.end likely lost)');
+    }
   }
 
   /** 直播气泡是否已被本页历史覆盖（存在同 role+text 的 durable 消息）。 */

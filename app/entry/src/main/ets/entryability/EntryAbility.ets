@@ -14,6 +14,7 @@ import { HRouter } from 'hrouter';
 import { flushLogs, initLogger, logDshrc } from '../model/logger';
 import { parsePushIntent, PushIntentTarget, pushKit } from '../model/push';
 import { sessionStore } from '../model/sessionstore';
+import { dshrcLink } from '../model/link';
 
 const TAG = 'dshrc-ability';
 
@@ -91,6 +92,9 @@ export default class EntryAbility extends UIAbility {
 
   onForeground(): void {
     logDshrc(TAG, 'info', 'Ability onForeground');
+    // v1.0.9：回前台若正在退避重连等待，跳过剩余退避立即试一次
+    //（真机场景：扫码后一直「重连中」，切几次前后台才连上）。
+    dshrcLink.kickReconnect();
   }
 
   onBackground(): void {

@@ -79,6 +79,9 @@ struct SubagentChip {
   }
 }
 
+/** 「接近底部」判定阈值（vp）：距底部不超过该值即视为用户仍在底部（可继续跟随）。 */
+const NEAR_BOTTOM_VP: number = 32;
+
 // hrouter 编译期扫描标记（注释形式：ArkTS 不允许 struct 上挂非框架装饰器）。
 // @Route({ name: 'session_detail' })
 @ComponentV2
@@ -86,7 +89,15 @@ export struct SessionDetailPage {
   @Local store: SessionStore = sessionStore;
   @Local sessionId: string = '';
   @Local draft: string = '';
+  /** 用户是否仍在底部（自动贴底开关）：上翻历史即暂停，滑回底部即恢复跟随。 */
+  @Local followBottom: boolean = true;
   private scroller: Scroller = new Scroller();
+  /** 首次进入是否已完成贴底（timeline 有缓存 / 历史异步到达两种都要滚到底）。 */
+  private pendingInitialScroll: boolean = true;
+  /** Scroll 视口高度（vp）：onAreaChange 维护，用于判断「接近底部」。 */
+  private viewportVp: number = 0;
+  /** 是否有一次自动贴底待执行（内容变化后布局未完成时补一次；用户滚动即取消）。 */
+  private autoScrollPending: boolean = false;
   /** markdown 渲染控制器（DSH 风格配色，深浅色随系统资源自动适配）。 */
   private mdCtrl: MarkdownController = new MarkdownController();
 
@@ -162,6 +173,17 @@ export struct SessionDetailPage {
         }
       }
     });
+    // 首次进入贴底：等首屏内容布局完成后再滚到底（timeline 有缓存 / 历史异步到达都走这里兜底）。
+    // 用户已主动上翻历史（followBottom=false）时不强制贴底。
+    setTimeout((): void => {
+      if (!this.followBottom) {
+        return;
+      }
+      this.scrollToBottom();
+      if (this.store.timeline.length > 0) {
+        this.pendingInitialScroll = false;
+      }
+    }, 120);
   }
 
   /** 当前会话是否 subagent（父目录 mode 判断用）。 */
@@ -190,7 +212,70 @@ export struct SessionDetailPage {
     }
   }
 
-  /** 新气泡或流式增长时贴底滚动；顶部加载更早消息（prepend）不打断阅读位置。 */
+  /**
+   * 用户是否「接近底部」（距底部 ≤ NEAR_BOTTOM_VP 即算仍在底部，可继续跟随）。
+   * contentSize / currentOffset 单位都是 vp，可直接相减。
+   */
+  private nearBottom(): boolean {
+    try {
+      if (this.scroller.isAtEnd()) {
+        return true;
+      }
+      if (this.viewportVp <= 0) {
+        return this.followBottom;
+      }
+      const size: SizeResult = this.scroller.contentSize();
+      const offset: OffsetResult = this.scroller.currentOffset();
+      const maxOffset: number = size.height - this.viewportVp;
+      return (maxOffset - offset.yOffset) <= NEAR_BOTTOM_VP;
+    } catch (e) {
+      return this.followBottom;
+    }
+  }
+
+  /**
+   * 用户滚动时更新跟随状态：只有手指拖动 / 滚轮（ScrollState.Scroll）才代表「用户主动离开底部」；
+   * 程序化动画滚动（Fling）不动跟随状态，避免自动贴底把自己判成「离开底部」。
+   */
+  private handleUserScroll(state: ScrollState): void {
+    if (state === ScrollState.Scroll) {
+      // 用户接管：放弃尚未执行的补贴底，并按当前位置决定是否继续跟随
+      this.autoScrollPending = false;
+      this.followBottom = this.nearBottom();
+    }
+  }
+
+  /**
+   * 贴底：内容变化后布局可能尚未完成，先同步贴一次、再异步补一次（落到真正的新底部）。
+   * 用户主动滚动会取消待执行的补贴底（autoScrollPending）。
+   */
+  private scrollToBottom(): void {
+    this.autoScrollPending = true;
+    try {
+      this.scroller.scrollEdge(Edge.Bottom);
+    } catch (e) {
+      // scroller 尚未绑定组件（首次 build 前）时忽略
+    }
+    setTimeout((): void => {
+      if (!this.autoScrollPending) {
+        return;
+      }
+      this.autoScrollPending = false;
+      this.followBottom = true;
+      try {
+        this.scroller.scrollEdge(Edge.Bottom);
+      } catch (e) {
+        // 同上
+      }
+    }, 100);
+  }
+
+  /**
+   * 时间线变化 → 贴底策略：
+   *  - 加载更早消息（前插）不动用户位置；
+   *  - 首次进入（缓存已有内容 / 历史异步到达）强制贴底；
+   *  - 其余（新 delta / 新步骤）仅在用户仍在底部时跟随。
+   */
   @Monitor('store.timeline')
   onMessagesChanged(mon: IMonitor): void {
     const now: TimelineItem[] | undefined = mon.value<TimelineItem[]>()?.now;
@@ -198,14 +283,22 @@ export struct SessionDetailPage {
     if (now === undefined) {
       return;
     }
-    const lastNow: TimelineItem | undefined = now.length > 0 ? now[now.length - 1] : undefined;
-    const lastBefore: TimelineItem | undefined =
-      before !== undefined && before.length > 0 ? before[before.length - 1] : undefined;
-    const tailChanged: boolean = lastNow !== undefined &&
-      (lastBefore === undefined || lastBefore.id !== lastNow.id);
-    const streaming: boolean = lastNow !== undefined && lastNow.streaming;
-    if ((tailChanged && (before === undefined || now.length > before.length)) || streaming) {
-      this.scroller.scrollEdge(Edge.Bottom);
+    // 前插判定：更早的消息插到最前（首条 id 变化）→ 加载更早消息不把用户拽到底
+    if (before !== undefined && before.length > 0 && now.length > 0 && now[0].id !== before[0].id) {
+      return;
+    }
+    if (this.pendingInitialScroll) {
+      if (now.length > 0) {
+        this.pendingInitialScroll = false;
+        // 首屏到达 → 强制贴底（用户已主动上翻历史则尊重用户位置）
+        if (this.followBottom) {
+          this.scrollToBottom();
+        }
+      }
+      return;
+    }
+    if (this.followBottom) {
+      this.scrollToBottom();
     }
   }
 
@@ -233,7 +326,9 @@ export struct SessionDetailPage {
     }).catch((e: Error): void => {
       promptAction.showToast({ message: '发送失败：' + e.message, duration: 3000 });
     });
-    this.scroller.scrollEdge(Edge.Bottom);
+    // 自己发的消息一定看得到：贴底并恢复跟随（不再受「用户已上翻历史」影响）
+    this.followBottom = true;
+    this.scrollToBottom();
   }
 
   /** 取消当前 turn（subagent 走 session.subagentCancel §5.1 v1.0.5）。 */
@@ -419,6 +514,24 @@ export struct SessionDetailPage {
       .layoutWeight(1)
       .scrollBar(BarState.Off)
       .align(Alignment.Top)
+      // 滚动位置跟踪：用户手指滚动（Scroll 状态）时更新「是否仍在底部」；
+      // 触底（onScrollEdge）与停止滚动（onScrollStop）恢复跟随。
+      .onDidScroll((xOffset: number, yOffset: number, state: ScrollState): void => {
+        this.handleUserScroll(state);
+      })
+      .onScrollEdge((side: Edge): void => {
+        if (side === Edge.Bottom) {
+          this.followBottom = true;
+        }
+      })
+      .onScrollStop((): void => {
+        this.followBottom = this.nearBottom();
+      })
+      // 视口高度（vp）：用于「接近底部」的距离判定
+      .onAreaChange((oldArea: Area, newArea: Area): void => {
+        const h: Length = newArea.height;
+        this.viewportVp = typeof h === 'number' ? h : 0;
+      })
 
       // 本会话的审批 / 提问卡片（输入条上方；resolved / answered 后消失）
       if (this.store.approvalsFor(this.sessionId).length > 0 ||

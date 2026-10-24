@@ -194,7 +194,8 @@ struct SystemNote {
 @ComponentV2
 struct StepGroup {
   @Require @Param steps: TimelineItem[];
-  @Local open: boolean = true;
+  /** 整组默认收起（用户点组头才展开组内步骤）；折叠时子卡保持挂载，展开状态不丢。 */
+  @Local open: boolean = false;
 
   build() {
     Column() {

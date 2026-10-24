@@ -23,7 +23,7 @@ scripts/verify-*.mjs  dev 验证脚本（jsqr 独立解码 + 命令全路径 moc
 node --check index.js lib/*.mjs scripts/*.mjs          # 语法
 node -e "import('./lib/protocol.mjs').then(m=>m.assertKat())"   # KAT
 node scripts/verify-qr.mjs && node scripts/verify-pairing.mjs   # QR/命令回归（需 devDependencies）
-node scripts/verify-steps.mjs                                # v1.0.6 工作步骤/模式/权限回归（无依赖）
+node scripts/verify-steps.mjs                                # v1.0.8 步骤/模式/权限/归档/模型/思考/强度回归（无依赖，113 项）
 ```
 
 安装/重载（link 安装，磁盘即运行源码）：plugin_manager `install_bundle` → 本目录。
@@ -58,9 +58,10 @@ ESM 模块缓存不会重载源码（实测踩坑）。
 - `approval/request` req：`{agent, toolName, callId?, reason?, signal?}` →
   `'allowed-once'|'rejected'|'cancelled'|'unavailable'`。
 - assistant 文本增量来自 `agent/assistant-stream` 的 `frame.chunk.type==='text-delta'`，
-  按 sessionId 合并 125ms 冲刷（≤8 条/秒）。
+  思考增量来自 `reasoning-delta`；两者分流、分别按 sessionId 合并 125ms 冲刷（≤8 条/秒）。
 - **会话域没有归档概念**（归档属 Workspace 注册表 / dsh-archive-manager）：
-  sessionController.list 永远不回归档标记——wire 无 archived 字段（v1.0.5 移除）。
+  sessionController.list 原生不回归档标记；v1.0.7 起插件必须按
+  `workspaceRegistry.archivedSessionIds` 为 wire 摘要另补 `archived`，不是本机状态。
 
 ## v1.0.6：工作步骤 / 模式 / 权限（2026-10-23）
 
@@ -76,3 +77,30 @@ ESM 模块缓存不会重载源码（实测踩坑）。
   session 从 `sc.resolveAgent(sessionId).agent.session` 取。
 - **服务缺失要降级**：`ctx.get(name)` 对不存在服务会抛；能力目录取不到就回空数组
   （客户端隐藏选择区），**不得**因此让 session.create 失败。
+
+## v1.0.7：真实归档 / 模型 / 思考（2026-10-24）
+
+- **归档**：每次 session.list 现读 `workspaceRegistry.archivedSessionIds` 给 wire 摘要补 archived；
+  archive/unarchive 调 Host 方法并回传真实结果。订阅 `domain/changed`（workspace、table=''、put）
+  广播 `session.archives` 全集，桌面端已归档的历史会话首屏就会同步。
+- **模型**：`sessionController.modelCatalog()` 拍平 provider groups；create 成功后、首条 prompt 前
+  `selectModel`。selectModel 失败仍回 sessionId + modelError，**不得回 error 诱发重复 create**。
+- **思考**：历史 assistant content 的 reasoning 块独立成 role=reasoning 消息并排在正文前；
+  live reasoning-delta 走 `assistant.reasoningDelta`。contentText 仍忽略 reasoning，工具结果不得混入。
+- 回归：`node scripts/verify-steps.mjs` 目前 91 项（含首屏归档、模型失败、reasoning 分流）。
+
+## v1.0.8：思考强度目录 + 会话中切换模型（2026-10-24）
+
+- **强度目录**：`modelCatalog()` 的模型项 `reasoning = {efforts:[{id,name,description?}], defaultEffort?}`；
+  `modelCatalogToWire()` 把 `efforts` 拍平成 `ModelOption.efforts`（**合法 reasoningEffort 取值集合**），
+  模型没有 reasoning 时**不产出**该字段（客户端隐藏强度选择区）。`reasoningEffort` 仍取 `defaultEffort`。
+- **会话中切换**：`session.selectModel {sessionId, model}` → `sc.selectModel({sessionId, …})`；
+  成功回宿主归一化后的 `{model}`，**宿主拒绝回原文 error（不假成功）**，selection 非法回 `bad-params`。
+  校验用 `parseModelSelection()`（只认 provider/model，**不从 id 反拆**）。
+- **当前模型查询**：`session.model {sessionId}` → `{model | null}`。数据源是 `model/selection`
+  会话事件维护的**内存态**（`#modelSelections`）；插件重启后无记录 → `null`，**不得臆造**。
+- **变更广播**：`session/event` 总闸里 `event.type==='model/selection'`（data =
+  `{provider, model, reasoningEffort?}`）→ 更新内存态 + 广播 `session.modelChanged`
+  `{sessionId, model}`（无 reasoningEffort 时省略该字段）。桌面端与手机端切换都会触发，天然归一。
+- 回归：`node scripts/verify-steps.mjs` 目前 **113 项**（新增 efforts 映射、selectModel 成功/拒绝、
+  model 查询 null→追踪、modelChanged 广播）。

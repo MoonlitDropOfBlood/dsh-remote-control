@@ -147,9 +147,9 @@ struct Index {
   @Local store: SessionStore = sessionStore;
   @Local conn: ConnectionStore = connectionStore;
   @Local refreshing: boolean = false;
-  /** 是否处于「已归档」视图（v1.0.6 手机本地归档）。 */
+  /** 是否处于「已归档」视图（v1.0.7：Host 权威归档，契约 §5.9）。 */
   @Local showArchived: boolean = false;
-  /** 列表投影缓存键（listVersion + archiveVersion + 视图；变了才重建投影）。 */
+  /** 列表投影缓存键（listVersion + 视图；变了才重建投影）。 */
   private projKey: string = '';
   /** 列表投影缓存（不可变 items；数据没变时复用同一数组 → Repeat 不做无谓 diff）。 */
   private projItems: SessionListItem[] = [];
@@ -159,8 +159,6 @@ struct Index {
     HRouter.registerNavPathStack('default', this.navPathStack);
     const ctx: common.Context = getContext(this) as common.Context;
     this.conn.load(ctx);
-    // 手机本地归档清单（Preferences；必须在刷新前读入，列表投影才能正确过滤）
-    this.store.loadSessionArchive(ctx);
     this.store.refreshSessions();
     this.autoConnect(ctx);
     // 推送点击直达（EntryAbility onNewWant / onCreate 写入后回调这里）
@@ -225,13 +223,16 @@ struct Index {
    * v1.0.6 修复「刷新后数据没有变化」：
    *  - 数据源是 store.listItems() 产出的**新实例**（纯原始字段）——Repeat 以
    *    item 引用判断「数据是否变化」，复用可变实例会被判定为「没变」；
-   *  - 按 (listVersion, archiveVersion, 视图) 缓存：数据没变就不重建
+   *  - 按 (listVersion, 视图) 缓存：数据没变就不重建
    *    （数组身份稳定 → Repeat 不做无谓 diff），数据一变就整体重建
    *    （排序 / blank / subagent 过滤 / 归档过滤随之重算）。
+   *
+   * v1.0.7：归档过滤依据 = 当次 session.list 带回的 **archived 字段**（Host 权威），
+   * 所以启动/重连后的首屏就能把主机上已归档的会话分到「已归档」视图，
+   * 不依赖 domain/changed 事件，也不依赖本机任何持久化状态。
    */
   private listItems(): SessionListItem[] {
-    const key: string = this.store.listVersion.toString() + ':' +
-      this.store.archiveVersion.toString() + ':' + (this.showArchived ? '1' : '0');
+    const key: string = this.store.listVersion.toString() + ':' + (this.showArchived ? '1' : '0');
     if (key !== this.projKey) {
       this.projKey = key;
       this.projItems = this.buildItems();
@@ -241,14 +242,14 @@ struct Index {
 
   /**
    * 按当前视图构建列表项（普通视图 = 未归档；已归档视图 = 已归档）。
+   * 依据是 **Host 权威**的 item.archived（契约 §5.9 v1.0.7），本机不再存假归档状态。
    * 顺序沿用 store.listItems() 的 updatedAt 降序（过滤不改变相对顺序）。
    */
   private buildItems(): SessionListItem[] {
     const all: SessionListItem[] = this.store.listItems();
     const out: SessionListItem[] = [];
     for (const item of all) {
-      const archived: boolean = this.store.isSessionArchived(item.sessionId);
-      if (archived !== this.showArchived) {
+      if (item.archived !== this.showArchived) {
         continue;
       }
       out.push(item);
@@ -263,15 +264,20 @@ struct Index {
 
   /**
    * 侧滑动作：普通列表 = 归档；已归档列表 = 恢复。
-   * 成功后由 store.archiveVersion 驱动列表重建（无需手工改数组）。
+   * 走 **Host 真实归档**（session.archive / session.unarchive，契约 §5.9）：
+   * 主机确认后才更新列表；失败按主机错误原文提示，**不做本机假成功**。
    */
   private onSwipeArchive(sessionId: string, archived: boolean): void {
-    const ok: boolean = this.store.setSessionArchived(sessionId, !archived);
-    if (!ok) {
-      promptAction.showToast({ message: '归档失败（本地存储写入失败）', duration: 2500 });
+    if (!this.store.archiveSupported) {
+      promptAction.showToast({ message: '主机不支持归档', duration: 2500 });
       return;
     }
-    promptAction.showToast({ message: archived ? '已恢复到会话列表' : '已归档（仅本机）', duration: 1800 });
+    this.store.setSessionArchived(sessionId, !archived).then((): void => {
+      promptAction.showToast({ message: archived ? '已恢复到会话列表' : '已归档', duration: 1800 });
+    }).catch((e: Error): void => {
+      const msg: string = e.message.length > 0 ? e.message : '主机拒绝';
+      promptAction.showToast({ message: (archived ? '恢复失败：' : '归档失败：') + msg, duration: 3000 });
+    });
   }
 
   /** 下拉刷新：拉 session.list，完成后收起刷新态；失败明确提示（不假装已刷新）。 */
@@ -315,6 +321,49 @@ struct Index {
     return n.length > 0 ? n : '未配置';
   }
 
+  /**
+   * 顶栏连接目标显示名（v1.0.7）：
+   *  - 在线且拿到真实 hostName → 显示主机名（最准，指向实际那台机器）；
+   *  - 离线 → 显示自定义远程名；「默认远程」没有区分度 → 退到 relay 主机名/地址。
+   * 长文本由 maxWidth + ellipsis 兜底，不挤掉状态点。
+   */
+  private connectionTarget(): string {
+    const online: boolean = this.store.linkState === 'online';
+    const hostName: string = this.store.hostName.trim();
+    if (online && hostName.length > 0) {
+      return hostName;
+    }
+    const p: RemoteProfile | undefined = this.conn.activeProfile();
+    if (p === undefined) {
+      return '未配置';
+    }
+    const name: string = p.name.trim();
+    // connections.ets 迁移旧配对时用的默认名（该常量未导出，这里按字面量比对）
+    if (name.length > 0 && name !== '默认远程') {
+      return name;
+    }
+    const relay: string = this.relayHostLabel(p.relayUrl);
+    if (relay.length > 0) {
+      return relay;
+    }
+    return name.length > 0 ? name : '未配置';
+  }
+
+  /** relay 地址 → 主机名:端口（去掉 ws:// / wss:// 前缀）。 */
+  private relayHostLabel(relayUrl: string): string {
+    let s: string = relayUrl.trim();
+    if (s.startsWith('ws://')) {
+      s = s.substring(5);
+    } else if (s.startsWith('wss://')) {
+      s = s.substring(6);
+    }
+    const slash: number = s.indexOf('/');
+    if (slash >= 0) {
+      s = s.substring(0, slash);
+    }
+    return s;
+  }
+
   /** 顶栏：左标题（会话 / 已归档）+ 归档视图入口 + 右上角连接信息胶囊。 */
   @Builder
   topBar() {
@@ -323,15 +372,17 @@ struct Index {
         .fontSize(FS_SUBTITLE)
         .fontWeight(FontWeight.Bold)
         .fontColor($r('app.color.label_primary'))
-      Text(this.showArchived ? '返回' : '已归档')
-        .fontSize(FS_SMALL)
-        .fontWeight(FontWeight.Medium)
-        .fontColor($r('app.color.brand_label'))
-        .margin({ left: SP_2 })
-        .padding({ top: 4, bottom: 4, left: 4, right: 4 })
-        .onClick((): void => {
-          this.toggleArchiveView();
-        })
+      if (this.store.archiveSupported || this.showArchived) {
+        Text(this.showArchived ? '返回' : '已归档')
+          .fontSize(FS_SMALL)
+          .fontWeight(FontWeight.Medium)
+          .fontColor($r('app.color.brand_label'))
+          .margin({ left: SP_2 })
+          .padding({ top: 4, bottom: 4, left: 4, right: 4 })
+          .onClick((): void => {
+            this.toggleArchiveView();
+          })
+      }
       Blank()
       Row() {
         Circle({ width: 7, height: 7 }).fill(linkStateColor(this.store.linkState))
@@ -339,13 +390,13 @@ struct Index {
           .fontSize(FS_CAPTION)
           .fontColor($r('app.color.label_secondary'))
           .margin({ left: 5 })
-        Text(this.remoteName())
+        Text(this.connectionTarget())
           .fontSize(FS_CAPTION)
           .fontColor($r('app.color.label_primary'))
           .margin({ left: 6 })
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
-          .constraintSize({ maxWidth: 96 })
+          .constraintSize({ maxWidth: 120 })
       }
       .padding({ left: 8, right: 8, top: 4, bottom: 4 })
       .borderRadius(RADIUS_PILL)
@@ -410,12 +461,13 @@ struct Index {
       Text('○')
         .fontSize(40)
         .fontColor($r('app.color.label_tertiary'))
-      Text(this.showArchived ? '暂无已归档会话' :
+      Text(this.showArchived ? (this.store.archiveSupported ? '暂无已归档会话' : '当前主机不支持归档同步') :
         (this.store.linkState === 'online' ? '暂无会话' : '未连接，暂无会话数据'))
         .fontSize(FS_BODY)
         .fontColor($r('app.color.label_secondary'))
         .margin({ top: SP_2 })
-      Text(this.showArchived ? '在会话列表左滑可归档会话，已归档的会话会出现在这里' :
+      Text(this.showArchived ? (this.store.archiveSupported ?
+        '在会话列表左滑可归档会话，已归档的会话会出现在这里' : '请升级主机插件后重试') :
         (this.store.linkState === 'online' ?
           '点下方「新建会话」开始遥控' : '在右上角「连接」里选好远程并连接'))
         .fontSize(FS_SMALL)
@@ -428,20 +480,27 @@ struct Index {
 
   /**
    * 左滑操作按钮（官方写法：`ListItem(){...}.swipeAction({end:{builder:()=>{…}}})`）。
-   *  普通列表 = 「归档」；已归档列表 = 「恢复」。宽度 72vp、全高、品牌色底。
+   *  普通列表 = 「归档」；已归档列表 = 「恢复」。
+   *  v1.0.7：轻量圆角动作（68vp 宽）——图标（系统 SymbolGlyph）+ caption 文案，
+   *  背景走 brand_tint / bg_layer_2，文字走 brand_label / label_secondary，零硬编码色值。
    */
   @Builder
   sessionSwipeAction(param: SessionSwipeParam) {
     Column() {
+      // API 20+ 的 SymbolGlyph：构造参数是单个符号资源，fontColor 收**颜色数组**（多层符号）
+      SymbolGlyph(param.archived ? $r('sys.symbol.arrow_counterclockwise') : $r('sys.symbol.archivebox'))
+        .fontSize(18)
+        .fontColor([$r('app.color.brand_label')])
       Text(param.archived ? '恢复' : '归档')
-        .fontSize(FS_SMALL)
-        .fontWeight(FontWeight.Medium)
-        .fontColor($r('app.color.label_on_brand'))
+        .fontSize(FS_CAPTION)
+        .fontColor($r('app.color.brand_label'))
+        .margin({ top: SP_1 })
     }
-    .width(72)
+    .width(68)
     .height('100%')
     .justifyContent(FlexAlign.Center)
-    .backgroundColor($r('app.color.brand_fill'))
+    .borderRadius(RADIUS_CTRL)
+    .backgroundColor(param.archived ? $r('app.color.bg_layer_2') : $r('app.color.brand_tint'))
     .onClick((): void => {
       this.onSwipeArchive(param.sessionId, param.archived);
     })
@@ -484,7 +543,7 @@ struct Index {
                       }
                     })
                   }
-                  // 左滑：普通列表 = 归档；已归档列表 = 恢复（手机本地，不动主机会话）
+                  // 左滑：普通列表 = Host 归档；已归档列表 = Host 恢复（契约 §5.9）
                   .swipeAction({
                     end: {
                       builder: (): void => {

@@ -1,7 +1,9 @@
 # dsh-remote-control：手机（HarmonyOS）远程控制 DSH —— 架构与协议契约
 
 > 状态：v1 契约（2026-10-20 由 Lead 冻结；**v1.0.6 于 2026-10-23 增补：会话时间线（工具步骤）
-> 与新建会话的「模式/权限」选择**）。三个实现（DSH 插件 / 中继服务器 / HarmonyOS App）
+> 与新建会话的「模式/权限」选择；v1.0.7 于 2026-10-24 增补：Workspace 真实归档同步
+> 与新建会话的模型选择；v1.0.8 于 2026-10-24 增补：模型思考强度目录与会话中切换模型**）。
+> 三个实现（DSH 插件 / 中继服务器 / HarmonyOS App）
 > 都必须以本文档为准；任何协议改动必须先改本文档并通知 Lead。
 
 ## 1. 目标与范围（用户已确认）
@@ -112,13 +114,17 @@ dshrc://pair?r=<encodeURIComponent(relayUrl)>&c=<channel>&s=<secret>[&t=<encodeU
 | type | payload | 响应 value | 说明 |
 |---|---|---|---|
 | `hello` | `{proto:1, clientName, appVersion, pushToken?, sig}` | `{hostName, dshVersion, pluginVersion}` | 连接/重连后首条；`sig` 见 §3.4 |
-| `session.list` | `{}` | `{sessions:[SessionSummary]}` | SessionSummary 见 §5.3（**v1.0.5 移除 includeArchived**：Host 会话域无归档概念，归档属 Workspace 注册表） |
-| `session.history` | `{sessionId, beforeSeq?:number, maxMessages?:number}` | `{messages:[ChatMessage], steps:[StepRecord], hasMore, oldestSeq}` | **v1.0.4** 向后翻页的历史消息；`beforeSeq` 缺省取最新一页。ChatMessage：`{id, role:"user"\|"assistant", text, ts, seq}`。subagent 会话自动走 durable subagent 地址。**v1.0.6**：新增 `steps`（工具步骤，§5.7）——旧插件不返该字段时客户端只显示消息 |
+| `session.list` | `{}` | `{sessions:[SessionSummary]}` | SessionSummary 见 §5.3；**v1.0.7** 每项可带 `archived`，由插件根据 Workspace 注册表拼装，不需要 `includeArchived` 参数 |
+| `session.history` | `{sessionId, beforeSeq?:number, maxMessages?:number}` | `{messages:[ChatMessage], steps:[StepRecord], hasMore, oldestSeq}` | **v1.0.4** 向后翻页的历史消息；`beforeSeq` 缺省取最新一页。ChatMessage：`{id, role:"user"\|"assistant"\|"reasoning", text, ts, seq}`（`reasoning` 为 **v1.0.7** 新增；见 §5.3）。subagent 会话自动走 durable subagent 地址。**v1.0.6**：新增 `steps`（工具步骤，§5.7）——旧插件不返该字段时客户端只显示消息 |
 | `session.subagents` | `{sessionId}` | `{subagents:[SubagentInfo]}` | **v1.0.5** 父会话的直接子代理目录（父会话 `subagentCatalog` 投影 + 运行态）。SubagentInfo 见 §5.6 |
 | `session.subagentPrompt` | `{parentSessionId, childSessionId, text}` | `{accepted:bool}` | **v1.0.5** 向 **continuable** 子代理发消息（delivery:'queue'）；one-shot 子代理返回 `unsupported` 错误。回复走同一事件流（sessionId=child） |
 | `session.subagentCancel` | `{parentSessionId, childSessionId}` | `{accepted:bool}` | **v1.0.5** 取消 continuable 子代理当前 turn（interruptByParent；accepted=信号已受理，非已停止） |
-| `session.create` | `{title?, cwd?, agentPreset?, permission?}` | `{sessionId, agentPreset?}` | cwd 缺省用主机默认工作目录。**v1.0.6**：`agentPreset` = 模式（Host Agent preset id，§5.8）；`permission` = 权限档位 id（§5.8）。两者缺省时由 Host 用自身默认值 |
-| `session.capabilities` | `{}` | `{presets:[ModeOption], permissions:[PermissionOption], defaultPreset?, defaultPermission?}` | **v1.0.6** 新建会话可选的「模式」与「权限」目录（§5.8）。宿主未提供对应能力时对应数组为空——客户端隐藏该选择区，不得报错 |
+| `session.create` | `{title?, cwd?, agentPreset?, permission?, model?}` | `{sessionId, agentPreset?, model?, modelError?}` | cwd 缺省用主机默认工作目录。**v1.0.6**：`agentPreset` / `permission` = 模式与权限（§5.8）。**v1.0.7**：`model:{provider,model,reasoningEffort?}` = 模型选择；Host 在创建后、首条 prompt 前 `selectModel`。会话已创建但模型设置失败时仍回成功并带 `modelError`，客户端不得重复创建 |
+| `session.capabilities` | `{}` | `{presets:[ModeOption], permissions:[PermissionOption], defaultPreset?, defaultPermission?, models:[ModelOption], defaultModelId?, archiveSupported:bool}` | **v1.0.6** 模式与权限目录。**v1.0.7** 增加模型目录与真实归档能力标记（§5.8/§5.9）。**v1.0.8** `ModelOption.efforts` 暴露该模型可选思考强度（§5.8）；宿主未提供对应能力时 models 为空 / archiveSupported=false，客户端隐藏对应选择区，不得报错 |
+| `session.archive` | `{sessionId, stopActivity?:bool}` | `{sessionId, archived:true}` | **v1.0.7** 写入 Workspace 真实归档集合；`stopActivity=true` 时按 Host 语义停止运行活动，缺省为 false |
+| `session.unarchive` | `{sessionId}` | `{sessionId, archived:false}` | **v1.0.7** 从 Workspace 归档集合恢复；幂等 |
+| `session.selectModel` | `{sessionId, model:ModelSelection}` | `{model:ModelSelection}` | **v1.0.8** 对**已存在会话**切换模型/思考强度；插件调 `sessionController.selectModel({sessionId,…})`。Host 拒绝时回 `error`（原文带出），成功回归一化后的 selection，并视为一次 `model/selection`（同样触发 `session.modelChanged`） |
+| `session.model` | `{sessionId}` | `{model:ModelSelection\|null}` | **v1.0.8** 查询会话当前模型/思考强度。插件从 `model/selection` 会话事件维护内存态；插件重启后无记录时回 `null`（客户端回退展示目录默认），**不得臆造** |
 | `session.prompt` | `{sessionId, text}` | `{accepted:bool}` | 立即返回；实际回复走事件流 |
 | `session.cancel` | `{sessionId}` | `{cancelled:bool}` | 取消当前运行的 turn |
 | `session.rename` | `{sessionId, title}` | `{title}` | |
@@ -134,8 +140,11 @@ dshrc://pair?r=<encodeURIComponent(relayUrl)>&c=<channel>&s=<secret>[&t=<encodeU
 | `session.added` | `{session:SessionSummary}` | 事件 `api-session/added` |
 | `session.removed` | `{sessionId}` | 事件 `api-session/removed` |
 | `session.status` | `{sessionId, running:bool}` | 事件 `api-session/status` / `agent/status` |
+| `session.archives` | `{archivedSessionIds:string[]}` | **v1.0.7** Workspace `domain/changed` 后的归档全集快照；客户端据此覆盖各行 `archived`，不做增量猜测 |
+| `session.modelChanged` | `{sessionId, model:ModelSelection}` | **v1.0.8** 会话模型/思考强度变化：源为 Host 会话事件 `model/selection`（桌面端切换、手机端 `session.selectModel` 都会触发）；客户端更新会话当前模型显示 |
 | `session.activity` | `{sessionId, updatedAt}` | 事件 `api-session/activity` |
 | `assistant.delta` | `{sessionId, text}` | 事件 `agent/assistant-stream`（文本增量；**按 sessionId 合并节流 ≤8 条/秒**） |
+| `assistant.reasoningDelta` | `{sessionId, text}` | **v1.0.7** `agent/assistant-stream` 的 `reasoning-delta` 思考增量；与文本分流，客户端合并进「思考过程」块 |
 | `tool.call` | `{sessionId, callId, name, arguments, ts}` | **v1.0.6** Host 会话事件 `tool/call`（模型发起一次工具调用） |
 | `tool.result` | `{sessionId, callId, status:"ok"\|"error", resultText, errorText?, ts}` | **v1.0.6** Host 会话事件 `tool/result`（工具调用结束；`resultText` 为结果文本，失败时 `errorText` 为原因） |
 | `system.message` | `{sessionId, kind:"system"\|"developer", text, ts}` | **v1.0.6** Host 会话事件 `system/message` / `developer/message`（系统提示注入等非对话内容） |
@@ -161,9 +170,15 @@ dshrc://pair?r=<encodeURIComponent(relayUrl)>&c=<channel>&s=<secret>[&t=<encodeU
 - `blank:true`：尚无对话的空会话——**客户端应直接隐藏**（DSH 官方语义：
   clients hide blank Sessions from lists）。
 
-**v1.0.5 移除 `archived` 字段**：Host 会话域没有归档概念（归档是 Workspace
-注册表/dsh-archive-manager 的领域，sessionController.list 永远不回归档标记）。
-客户端会话列表**不再有任何归档筛选**。
+**v1.0.5 曾移除 `archived`；v1.0.7 以明确的数据来源重新加入可选 `archived:bool`**：
+Host `sessionController.list` 本身仍不回归档标记，插件必须用
+`workspaceRegistry.archivedSessionIds` 为每个 wire SessionSummary 拼装该字段。
+旧插件缺省 `archived` 时客户端按 false 处理；不得再把归档当成本机伪造状态。
+
+**v1.0.7 思考过程**：assistant 历史事件的 `content` 中，`type:"reasoning"` 的块独立映射为
+`ChatMessage{role:"reasoning", text}`，不混入普通 assistant 正文；同一事件的 reasoning
+消息使用 `id = "<sessionId>:<seq>:reasoning"` 与相同 seq/ts，并排在普通 assistant 消息之前。
+实时思考增量走 §5.2 `assistant.reasoningDelta`。没有 reasoning 内容时不产生空消息。
 
 **v1.0.5 客户端列表显示规则**（替代 v1.0.4 的「子代理筛选页签」方案）：
 - 列表只显示**根会话**（无 `parentSessionId` 且 `origin!=="subagent"`）且非 blank，
@@ -240,32 +255,61 @@ dshrc://pair?r=<encodeURIComponent(relayUrl)>&c=<channel>&s=<secret>[&t=<encodeU
 **降级**：宿主/旧插件不提供步骤（无 `steps` 字段、无 `tool.*` 事件）时，客户端只渲染
 `messages`，功能不受影响——**不得**因此报错或阻断会话。
 
-### 5.8 新建会话的「模式」与「权限」（v1.0.6）
+### 5.8 新建会话的「模式 / 权限 / 模型 / 思考强度」（v1.0.6；模型 v1.0.7；强度与切换 v1.0.8）
 
-手机端「新建会话」允许在创建前选择 Host 已有的**模式**（Agent preset）与**权限档位**
-（permission preset），与 DSH 桌面端语义一致：
+手机端「新建会话」允许在创建前选择 Host 已有的**模式**（Agent preset）、**权限档位**
+（permission preset）、**模型**与**思考强度**，与 DSH 桌面端语义一致：
 
-- 模式 = Host 的 Agent preset（Standard / Creator / PTC / Minimal / 自定义…），
-  决定该会话运行哪套插件组合；
-- 权限 = permission preset（`read-only` 仅可查看 / `workspace-write` 工作区内修改 /
-  `danger-full-access` 完全权限 / `auto` 自动审查…），把沙箱模式与审批策略打包。
+- 模式 = Host 的 Agent preset（Standard / Creator / PTC / Minimal / 自定义…），决定会话运行的插件组合；
+- 权限 = permission preset（`read-only` / `workspace-write` / `danger-full-access` / `auto`…）；
+- 模型 = Host `sessionController.modelCatalog()` 中可路由的 provider + model；
+- 思考强度 = 所选模型的 `reasoning.efforts`（无该字段的模型不支持，隐藏选择区）。
 
 ```json
-// session.capabilities 的响应 value
-{ "presets":    [ { "id": "standard", "name": "Standard", "description": "标准模式" } ],
-  "permissions":[ { "id": "workspace-write", "name": "工作区内修改", "description": "…" } ],
+// session.capabilities 的响应 value（节选）
+{ "presets": [ { "id": "standard", "name": "Standard", "description": "标准模式" } ],
+  "permissions": [ { "id": "workspace-write", "name": "工作区内修改", "description": "…" } ],
   "defaultPreset": "standard",
-  "defaultPermission": "workspace-write" }
+  "defaultPermission": "workspace-write",
+  "models": [ { "id": "deepseek/deepseek-chat", "provider": "deepseek",
+    "model": "deepseek-chat", "name": "DeepSeek Chat", "description": "",
+    "reasoningEffort": "high",
+    "efforts": [ { "id": "minimal", "name": "最少" }, { "id": "low", "name": "低" },
+      { "id": "medium", "name": "中" }, { "id": "high", "name": "高" } ] } ],
+  "defaultModelId": "deepseek/deepseek-chat",
+  "archiveSupported": true }
 ```
 
-- `id` 是提交给 `session.create` 的**稳定标识**（Agent preset id / permission preset key）；
-  `name` / `description` 是展示文案（客户端直接显示，**不做本地化映射**——宿主给什么就显示什么）。
-- `defaultPreset` / `defaultPermission` 可缺省；客户端此时默认选中第一项。
-- 宿主没有对应能力时数组为空（客户端隐藏选择区，仍可正常建会话）。
-- `session.create` 携带 `agentPreset` / `permission` 时，宿主按该值创建；宿主拒绝时
-  回 `result{ok:false, error:{code:"unsupported-…"}}`，客户端回退为「不带选项创建」并提示。
-- **权限选择的生效时机**：Host 侧权限档位在新会话「首次发布」前写入（构造种子）；
-  已存在的会话不受后续默认值变更影响（与 Host 语义一致）。
+- 模式/权限的 `id` 是提交给 `session.create` 的稳定标识；`name` / `description` 直接展示，不做本地化映射。
+- `ModelOption.id` 仅供客户端选择/默认项匹配，格式建议 `provider + "/" + model`；提交必须使用
+  `ModelSelection{provider, model, reasoningEffort?}`，不要从 id 反拆。`reasoningEffort` 取该模型的
+  `reasoning.defaultEffort`（若有）；`defaultModelId` 由 catalog.default 对应的 provider/model 生成。
+- **v1.0.8 efforts**：`efforts:[{id,name,description?}]` 来自宿主 `reasoning.efforts`，是提交
+  `reasoningEffort` 的**唯一合法取值集合**；缺省（模型无 reasoning）时不传 `reasoningEffort`。
+  客户端切模型时强度选择须重置为新模型的默认（`reasoningEffort`）或「默认」。
+- 模式/权限/模型目录为空时，客户端隐藏对应选择区；default id 未命中时默认第一项。
+- `session.create` 携带 `agentPreset` / `permission` 时按所选值创建；创建前被拒绝时回
+  `unsupported-…`，客户端可回退为「不带选项创建」并提示。
+- **模型选择时机**：Host create 不接受 model；插件必须在创建成功后、手机发送首条 prompt 前调用
+  `sessionController.selectModel({sessionId, provider, model, reasoningEffort?})`。
+  成功时响应 `model` 为 Host 归一化后的 selection；失败时响应仍包含 `sessionId` 并附 `modelError`，
+  客户端提示「已用默认模型」并继续发送首条内容，**不得再次 create**。
+- **权限选择的生效时机**：同样在新会话「首次发布」前写入；已存在会话不受后续默认值变更影响。
+- **v1.0.8 会话中切换**：`session.selectModel` 对已存在会话调 `sessionController.selectModel`，
+  下一次 prompt 组装即用新模型（与桌面端语义一致；运行中的 turn 不受影响）。客户端把入口放在
+  会话详情页输入框旁（模型+强度一起选）；当前值用 `session.model` 读取、`session.modelChanged` 保持实时。
+
+### 5.9 Workspace 真实归档同步（v1.0.7）
+
+归档的权威数据是 `workspaceRegistry.archivedSessionIds`，不是手机 Preferences：
+
+- `session.list` 的每个 SessionSummary 由插件按该集合补 `archived`；因此**已归档会话也必须能随 list 传到 App**。
+- 手机归档调用 `session.archive`，恢复调用 `session.unarchive`；插件分别调用
+  `workspaceRegistry.archiveSession(sessionId, {stopActivity})` / `unarchiveSession(sessionId)`。
+  运行中会话归档失败时把 Host 错误原文回给客户端，不得在本机假成功。
+- 插件订阅 `ctx.on("domain/changed", …)`；`domain==="workspace"` 且 `table===""` / `operation==="put"`
+  时读取最新 `archivedSessionIds`，向手机广播 `session.archives` **全集**。桌面端与手机端的归档变化因此一致。
+- `archiveSupported=false` 表示宿主没有 Workspace 注册表或归档方法；客户端应隐藏/禁用归档动作并提示，不能退回本机归档。
 
 ## 6. Push Kit（华为推送）旁路
 
@@ -417,3 +461,21 @@ AAD     = ""   ← 注意：本 KAT 用空 AAD，便于对齐；AAD 绑定逻辑
   - 宿主未装载该插件时 `ctx.get('permissionPresets')` 为空 → 插件回空目录，客户端隐藏权限选择。
 - **内容块**：`ContentBlock` 的 `type` ∈ `text` / `image` / `file` / `reasoning` / `tool-call` …；
   结果文本只取 `type==='text'` 的 `text` 拼接，image/file 用占位符（`[图片]` / `[文件]`）。
+
+## 附录 C：Host API 事实（v1.0.7 归档 / 模型 / 思考，2026-10-24 实测自安装源码）
+
+- **归档**：`ctx.workspaceRegistry.archivedSessionIds: readonly string[]`；
+  `archiveSession(sessionId, {stopActivity?})` / `unarchiveSession(sessionId)` 均为 Promise 且幂等。
+  归档运行中会话时 `stopActivity` 缺省=false 会被 `WorkspaceActiveSessionError` 拒绝。
+  注册表写盘触发 `domain/changed`；Workspace Feed 同样以 `domain==="workspace" && table===""` 读取全集。
+- **模型**：`sessionController.modelCatalog()`（无 request 参数）→
+  `{default:{provider,model,reasoningEffort?}, groups:[{id,name,models:[{id,name,description?,reasoning?}]}], failures}`；
+  `selectModel({sessionId,provider,model,reasoningEffort?})` → `{selected}`，并保存为后续默认。
+  **v1.0.8**：模型项 `reasoning = {efforts:[{id,name,description?}], defaultEffort?}`（源码
+  `dsh-api-session-controller/lib/types/catalog.js` buildModelCatalog）；efforts 即合法强度集合。
+- **模型变化事件**：会话日志事件 `model/selection`（`agent.session.append("model/selection", selection)`，
+  桌面/手机任何一端 selectModel 都会追加）；插件经 `ctx.on("session/event")` 观测并转
+  `session.modelChanged`。事件 data = `{provider, model, reasoningEffort?}`。
+- **思考**：`agent/assistant-stream` 的 `frame.chunk.type==="reasoning-delta"`，文本字段与 text-delta 相同；
+  历史 assistant/message 的 content 里 `type:"reasoning"` 是独立 ReasoningBlock。
+  普通 `contentText()` 仍忽略 reasoning；必须走独立映射，避免污染工具结果文本。

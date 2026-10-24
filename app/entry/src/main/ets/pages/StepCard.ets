@@ -276,9 +276,12 @@ export struct StepCard {
           .fontSize(FS_CAPTION)
           .fontColor($r('app.color.label_tertiary'))
           .margin({ left: SP_2 })
-        Text(this.expanded ? '⌄' : '›')
-          .fontSize(FS_SMALL)
-          .fontColor($r('app.color.label_tertiary'))
+        // 固定尺寸符号（不依赖字体行高，收起/展开两态盒子完全一致）
+        SymbolGlyph(this.expanded ? $r('sys.symbol.chevron_down') : $r('sys.symbol.chevron_right'))
+          .fontSize(16)
+          .fontColor([$r('app.color.label_tertiary')])
+          .width(18)
+          .height(16)
           .margin({ left: SP_1 })
       }
       .width('100%')

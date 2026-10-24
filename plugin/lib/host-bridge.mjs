@@ -49,12 +49,17 @@ function dshVersion() {
  * v1.0.4：透传 Host 原生 origin/parentSessionId/blank（§5.3 客户端据此隐藏
  * subagent 行与 blank 会话；wire 字段名与 Host 逐字一致）。
  * v1.0.5：删 archived——Host 会话域无归档概念（归档属 Workspace 注册表），
- * 之前的常量 false 是纯误导。 */
-function mapSummary(raw) {
+ * 之前的常量 false 是纯误导。
+ * v1.0.7：archived 重新加入，但**来源改为 Workspace 注册表**
+ * （ctx.workspaceRegistry.archivedSessionIds，§5.9）——由调用方以可选参数
+ * 传入；不传（宿主没有注册表）时**不产出该字段**，客户端按 false 处理，
+ * 不在本机伪造归档状态。 */
+function mapSummary(raw, archivedIds) {
   const values = raw?.projections?.values;
   const title = values && typeof values.title === "string" ? values.title : "";
-  return {
-    sessionId: String(raw?.sessionId ?? ""),
+  const sessionId = String(raw?.sessionId ?? "");
+  const summary = {
+    sessionId,
     title,
     cwd: typeof raw?.cwd === "string" ? raw.cwd : "",
     running: raw?.running === true,
@@ -63,6 +68,10 @@ function mapSummary(raw) {
     parentSessionId: typeof raw?.parentSessionId === "string" ? raw.parentSessionId : "",
     blank: raw?.blank === true,
   };
+  if (Array.isArray(archivedIds)) {
+    summary.archived = archivedIds.includes(sessionId);
+  }
+  return summary;
 }
 
 /** 契约 §5.1 session.history 默认/上限页大小（宿主 DEFAULT_MAX_MESSAGES=50）。 */
@@ -93,7 +102,27 @@ export function contentText(blocks) {
 }
 
 /**
- * 契约 §5.1 ChatMessage 提取：SessionWireEvent → {id,role,text,ts,seq} 或 null。
+ * 思考块 → 纯文本（契约 §5.3 / 附录 C）。
+ * 只取 type==='reasoning' 的块；普通正文与工具结果**不**进这里。
+ * @param {unknown} blocks ContentBlock[]
+ * @returns {string}
+ */
+export function reasoningText(blocks) {
+  if (!Array.isArray(blocks)) return "";
+  let text = "";
+  for (const block of blocks) {
+    if (!block || typeof block !== "object") continue;
+    if (block.type === "reasoning" && typeof block.text === "string") text += block.text;
+  }
+  return text;
+}
+
+/**
+ * 契约 §5.1 ChatMessage 提取（v1.0.7）：SessionWireEvent → ChatMessage[]。
+ *
+ * 一个事件可能产出**两条**消息：assistant/message 里 `type:"reasoning"` 的块
+ * 独立成条（role:"reasoning"，id = "<sessionId>:<seq>:reasoning"），
+ * 排在普通 assistant 正文**之前**；正文仍按 contentText 口径（忽略 reasoning）。
  *
  * 事件形态（@deepseek-ai/dsh-session 类型实证）：
  *   user/message      data = UserMessage  {content:[ContentBlock], source:{kind}}
@@ -104,41 +133,59 @@ export function contentText(blocks) {
  *   - user 只收 source.kind==='user' 的真人输入（agent.inject 的注入跳过）；
  *   - ContentBlock 只取 type==='text' 的纯文本（reasoning/tool-call 跳过，
  *     image/file 给占位符）；空文本一律跳过（不产生空泡）；
- *   - 任何不认识的形态返回 null（跳过），绝不抛出。
+ *   - 任何不认识的形态返回 []（跳过），绝不抛出。
+ * @returns {object[]} ChatMessage[]
  */
-export function mapHistoryMessage(sessionId, record) {
+export function mapHistoryMessages(sessionId, record) {
   const event = record?.event ?? record;
-  if (!event || typeof event !== "object") return null;
+  if (!event || typeof event !== "object") return [];
   const type = event.type;
-  if (type !== "user/message" && type !== "assistant/message") return null;
-  if (event.surfaceOp !== "append") return null;
+  if (type !== "user/message" && type !== "assistant/message") return [];
+  if (event.surfaceOp !== "append") return [];
   const seq = Number(event?.seq);
   const time = Number(event?.time);
-  if (!Number.isSafeInteger(seq) || seq < 0) return null;
+  if (!Number.isSafeInteger(seq) || seq < 0) return [];
   const data = event.data;
-  if (!data || typeof data !== "object") return null;
+  if (!data || typeof data !== "object") return [];
 
   let role;
   let content;
   if (type === "user/message") {
-    if (data?.source?.kind !== "user") return null;
+    if (data?.source?.kind !== "user") return [];
     role = "user";
     content = data.content;
   } else {
     role = "assistant";
     content = data?.message?.content;
   }
-  if (!Array.isArray(content)) return null;
+  if (!Array.isArray(content)) return [];
 
+  const ts = Number.isSafeInteger(time) && time > 0 ? time : 0;
+  const out = [];
+  // 思考过程独立成条，排在正文之前（v1.0.7 §5.3）
+  if (role === "assistant") {
+    const thinking = reasoningText(content);
+    if (thinking.trim() !== "") {
+      out.push({ id: `${sessionId}:${seq}:reasoning`, role: "reasoning", text: thinking, ts, seq });
+    }
+  }
   const text = contentText(content);
-  if (text.trim() === "") return null;
-  return {
-    id: `${sessionId}:${seq}`,
-    role,
-    text,
-    ts: Number.isSafeInteger(time) && time > 0 ? time : 0,
-    seq,
-  };
+  if (text.trim() !== "") {
+    out.push({ id: `${sessionId}:${seq}`, role, text, ts, seq });
+  }
+  return out;
+}
+
+/**
+ * 契约 §5.1 ChatMessage 提取（单条口径，保留旧签名）：只回**非思考**的那条，
+ * 没有正文时返回 null（与 v1.0.6 行为逐字一致）。
+ * @returns {object|null}
+ */
+export function mapHistoryMessage(sessionId, record) {
+  for (const message of mapHistoryMessages(sessionId, record)) {
+    if (message.role !== "reasoning") return message;
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -409,6 +456,126 @@ export function isAgentPresetRejection(e) {
   return /preset/i.test(text);
 }
 
+/**
+ * 契约 §5.8 模型目录映射（v1.0.7 + v1.0.8）：宿主 modelCatalog() → wire ModelOption[]。
+ *
+ * 宿主形状（附录 C / dsh-api-session-controller 实装）：
+ *   { default:{provider,model,reasoningEffort?},
+ *     groups:[{ id:providerId, name, models:[{id:modelId,name,description?,reasoning?}] }],
+ *     failures:[…] }
+ *   —— group.id 是 **provider**，models[].id 是 **model 名**。
+ * wire 形状：{ id:"provider/model", provider, model, name, description,
+ *              reasoningEffort?, efforts?:[{id,name,description?}] }
+ *   - reasoningEffort 取该模型 reasoning.defaultEffort（没有就不产出该字段）；
+ *   - efforts 拍平 reasoning.efforts（**合法思考强度集合**，v1.0.8）；
+ *     模型没有 reasoning 时**不产出** efforts 字段。
+ * @param {any} catalog
+ * @returns {{models:object[],defaultModelId:string}}
+ */
+export function modelCatalogToWire(catalog) {
+  const groups = Array.isArray(catalog?.groups) ? catalog.groups : [];
+  const models = [];
+  for (const group of groups) {
+    if (!group || typeof group !== "object") continue;
+    const provider = typeof group.id === "string" ? group.id : "";
+    if (provider === "") continue;
+    const entries = Array.isArray(group.models) ? group.models : [];
+    for (const entry of entries) {
+      if (!entry || typeof entry !== "object") continue;
+      const model = typeof entry.id === "string" ? entry.id : "";
+      if (model === "") continue;
+      const effort =
+        typeof entry?.reasoning?.defaultEffort === "string" ? entry.reasoning.defaultEffort : "";
+      const option = {
+        id: `${provider}/${model}`,
+        provider,
+        model,
+        name: typeof entry.name === "string" && entry.name !== "" ? entry.name : model,
+        description: typeof entry.description === "string" ? entry.description : "",
+      };
+      if (effort !== "") option.reasoningEffort = effort;
+      const efforts = mapReasoningEfforts(entry?.reasoning?.efforts);
+      if (efforts.length > 0) option.efforts = efforts;
+      models.push(option);
+    }
+  }
+  const def = catalog?.default;
+  const defaultModelId =
+    def && typeof def === "object" && typeof def.provider === "string" && def.provider !== "" &&
+    typeof def.model === "string" && def.model !== ""
+      ? `${def.provider}/${def.model}`
+      : "";
+  return { models, defaultModelId };
+}
+
+/** 兼容别名（v1.0.7 旧名）。 */
+export const mapModelCatalog = modelCatalogToWire;
+
+/**
+ * 契约 §5.8（v1.0.8）：宿主 reasoning.efforts → wire efforts[]。
+ * @param {unknown} rows
+ * @returns {{id:string,name:string,description:string}[]}
+ */
+export function mapReasoningEfforts(rows) {
+  const list = Array.isArray(rows) ? rows : [];
+  const efforts = [];
+  for (const row of list) {
+    if (!row || typeof row !== "object") continue;
+    const id = typeof row.id === "string" ? row.id.trim() : "";
+    if (id === "") continue;
+    efforts.push({
+      id,
+      name: typeof row.name === "string" && row.name !== "" ? row.name : id,
+      description: typeof row.description === "string" ? row.description : "",
+    });
+  }
+  return efforts;
+}
+
+/**
+ * 契约 §5.8 ModelSelection：手机提交的 model → 提交给宿主的
+ * {provider, model, reasoningEffort?}（id 不可反拆，只认 provider/model）。
+ * @param {unknown} raw
+ * @returns {{provider:string,model:string,reasoningEffort?:string}|null}
+ */
+export function parseModelSelection(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const provider = typeof raw.provider === "string" ? raw.provider.trim() : "";
+  const model = typeof raw.model === "string" ? raw.model.trim() : "";
+  if (provider === "" || model === "") return null;
+  const selection = { provider, model };
+  if (typeof raw.reasoningEffort === "string" && raw.reasoningEffort.trim() !== "") {
+    selection.reasoningEffort = raw.reasoningEffort.trim();
+  }
+  return selection;
+}
+
+/** 兼容别名（v1.0.7 旧名）。 */
+export const normalizeModelSelection = parseModelSelection;
+
+/**
+ * 契约 §5.8 ModelSelection 归一化：宿主 selection / model/selection 事件 data
+ * → wire {provider, model, reasoningEffort?}（无 reasoningEffort 时省略该字段）。
+ * @param {unknown} data
+ * @returns {{provider:string,model:string,reasoningEffort?:string}|null}
+ */
+export function mapModelSelection(data) {
+  return parseModelSelection(data);
+}
+
+/**
+ * 契约 §5.9 归档：宿主错误的「原样」回传。
+ * 优先用宿主的错误码（RemoteError.code，如 "workspace/active-session"），
+ * 没有就用调用方给的兜底码；message 一律用宿主原文。
+ * @param {unknown} e
+ * @param {string} fallbackCode
+ * @returns {{code:string,message:string}}
+ */
+export function hostErrorOf(e, fallbackCode) {
+  const code = typeof e?.code === "string" && e.code !== "" ? e.code : fallbackCode;
+  return { code, message: errText(e) };
+}
+
 /** result / error 信封（契约 §5）。 */
 function resultOf(m, value) {
   return msg("result", { id: m.id, ok: true, value });
@@ -429,7 +596,9 @@ export class HostBridge {
   #log;
   #pluginVersion;
   #disposed = false; // dispose() 后禁止一切出站与拦截
-  #deltaBuf = new Map(); // sessionId -> { text, timer }
+  #deltaBuf = new Map(); // sessionId -> { text, timer }（正文增量）
+  #reasoningBuf = new Map(); // sessionId -> { text, timer }（思考增量，v1.0.7 与正文分流）
+  #modelSelections = new Map(); // sessionId -> {provider, model, reasoningEffort?}（v1.0.8 内存态）
   #pending = new Map(); // askId -> { resolve, kind, sessionId, timer, abortHandler, signal }
   #titles = new Map(); // sessionId -> title（turn.end 推送文案用）
   #pushToken = ""; // 手机 push.register 上报的 token（内存态）
@@ -484,15 +653,21 @@ export class HostBridge {
       this.#sendEvent("session.activity", { sessionId: String(sessionId), updatedAt: Number(updatedAt) || 0 });
     });
 
-    // agent/assistant-stream：只取文本增量，按 sessionId 合并节流（≤8 条/秒）
+    // agent/assistant-stream：文本增量与**思考增量分流**，按 sessionId 合并节流（≤8 条/秒）
+    // v1.0.7：chunk.type==='reasoning-delta' → assistant.reasoningDelta（§5.2）
     this.#on("agent/assistant-stream", (payload) => {
       try {
         const frame = payload?.frame;
         if (!frame || frame.type !== "chunk") return;
         const chunk = frame.chunk;
-        if (!chunk || chunk.type !== "text-delta" || typeof chunk.text !== "string" || chunk.text === "") return;
+        if (!chunk || typeof chunk.text !== "string" || chunk.text === "") return;
+        if (chunk.type !== "text-delta" && chunk.type !== "reasoning-delta") return;
         const sessionId = payload?.agent?.session?.id;
         if (!sessionId) return;
+        if (chunk.type === "reasoning-delta") {
+          this.#queueReasoning(String(sessionId), chunk.text);
+          return;
+        }
         this.#queueDelta(String(sessionId), chunk.text);
       } catch (e) {
         this.#log("warn", "assistant-stream bridge error", { error: errText(e) });
@@ -506,6 +681,7 @@ export class HostBridge {
         if (!sessionId) return;
         if (payload.status === "idle") {
           this.#flushDelta(String(sessionId));
+          this.#flushReasoning(String(sessionId));
           this.#sendEvent("turn.end", { sessionId: String(sessionId), status: "idle" });
           this.#maybeNotifyTurnEnd(String(sessionId));
         }
@@ -521,6 +697,7 @@ export class HostBridge {
         const err = payload.error;
         const message = err && typeof err.message === "string" ? err.message : String(err);
         this.#flushDelta(String(sessionId));
+        this.#flushReasoning(String(sessionId));
         this.#sendEvent("turn.end", { sessionId: String(sessionId), status: "error", error: message });
         this.#maybeNotifyTurnEnd(String(sessionId), message);
       } catch (e) {
@@ -552,10 +729,55 @@ export class HostBridge {
         if (mapped !== null) this.#sendEvent("system.message", mapped);
         return;
       }
+      if (type === "model/selection") {
+        // v1.0.8：会话模型/思考强度变化（桌面端或手机端 selectModel 都会追加）
+        const selection = mapModelSelection(event.data);
+        if (selection === null) return;
+        this.#modelSelections.set(sessionId, selection);
+        this.#sendEvent("session.modelChanged", { sessionId, model: selection });
+        return;
+      }
       // 其余事件（assistant/message、user/message、turn/*、step/* …）忽略
     });
 
+    // --- v1.0.7（§5.9）：Workspace 归档变化 → 广播归档全集 ---
+    // 归档的权威数据是 workspaceRegistry.archivedSessionIds；注册表写盘后
+    // 宿主发 domain/changed（domain="workspace"、table=""、operation="put"），
+    // 此时读最新集合并广播 session.archives（**全集**，客户端覆盖各行 archived）。
+    this.#on("domain/changed", (change) => {
+      if (change?.domain !== "workspace") return;
+      if (change?.table !== "") return;
+      if (change?.operation !== "put") return;
+      this.#broadcastArchives();
+    });
+
     return () => this.dispose();
+  }
+
+  /** 广播归档全集（契约 §5.2 session.archives）。没有注册表 → 不发。 */
+  #broadcastArchives() {
+    const ids = this.#archivedSessionIds();
+    if (ids === null) return;
+    this.#sendEvent("session.archives", { archivedSessionIds: ids });
+  }
+
+  /** 归档集合（宿主没有 Workspace 注册表 → null，表示「不知道」而不是「空」）。 */
+  #archivedSessionIds() {
+    const reg = this.#workspaceRegistry();
+    if (!reg) return null;
+    try {
+      const ids = reg.archivedSessionIds;
+      if (!Array.isArray(ids)) return null;
+      return ids.map((id) => String(id));
+    } catch (e) {
+      this.#log("warn", "archivedSessionIds read failed", { error: errText(e) });
+      return null;
+    }
+  }
+
+  /** Workspace 注册表（宿主没装 dsh-workspace → null）。 */
+  #workspaceRegistry() {
+    return this.#service("workspaceRegistry");
   }
 
   /** 事件监听包装：emit 监听必须永不抛出。 */
@@ -584,6 +806,10 @@ export class HostBridge {
       if (b.timer !== null) clearTimeout(b.timer);
     }
     this.#deltaBuf.clear();
+    for (const b of this.#reasoningBuf.values()) {
+      if (b.timer !== null) clearTimeout(b.timer);
+    }
+    this.#reasoningBuf.clear();
     for (const entry of this.#pending.values()) {
       if (entry.timer !== null) clearTimeout(entry.timer);
       if (entry.signal && entry.abortHandler) {
@@ -660,6 +886,33 @@ export class HostBridge {
     if (text !== "") this.#sendEvent("assistant.delta", { sessionId, text });
   }
 
+  // ---- assistant.reasoningDelta 节流（v1.0.7，与正文同口径 ≤8 条/秒）--------
+
+  #queueReasoning(sessionId, text) {
+    let b = this.#reasoningBuf.get(sessionId);
+    if (b === undefined) {
+      b = { text: "", timer: null };
+      this.#reasoningBuf.set(sessionId, b);
+    }
+    b.text += text;
+    if (b.text.length > 65_536) b.text = b.text.slice(-65_536); // 内存上限
+    if (b.timer === null) {
+      b.timer = setTimeout(() => this.#flushReasoning(sessionId), Math.ceil(1000 / ASSISTANT_THROTTLE_PER_SEC));
+    }
+  }
+
+  #flushReasoning(sessionId) {
+    const b = this.#reasoningBuf.get(sessionId);
+    if (b === undefined) return;
+    if (b.timer !== null) {
+      clearTimeout(b.timer);
+      b.timer = null;
+    }
+    const text = b.text;
+    b.text = "";
+    if (text !== "") this.#sendEvent("assistant.reasoningDelta", { sessionId, text });
+  }
+
   // ---- 业务请求分发（§5.1）---------------------------------------------------
 
   /**
@@ -687,6 +940,14 @@ export class HostBridge {
           return await this.#rSessionCreate(m);
         case "session.capabilities":
           return await this.#rSessionCapabilities(m);
+        case "session.selectModel":
+          return await this.#rSessionSelectModel(m);
+        case "session.model":
+          return this.#rSessionModel(m);
+        case "session.archive":
+          return await this.#rSessionArchive(m);
+        case "session.unarchive":
+          return await this.#rSessionUnarchive(m);
         case "session.prompt":
           return await this.#rSessionPrompt(m);
         case "session.cancel":
@@ -781,9 +1042,12 @@ export class HostBridge {
   async #rSessionList(m) {
     try {
       const value = await this.#sc().list({}, this.#signal());
+      // v1.0.7（§5.9）：归档标记来自 Workspace 注册表（不是本机伪造状态）。
+      // 宿主没有注册表 → 不产出 archived 字段（客户端按 false 处理）。
+      const archivedIds = this.#archivedSessionIds();
       const sessions = [];
       for (const item of value?.items ?? []) {
-        const s = mapSummary(item);
+        const s = mapSummary(item, archivedIds ?? undefined);
         if (s.sessionId) {
           if (s.title) this.#titles.set(s.sessionId, s.title);
           sessions.push(s);
@@ -850,8 +1114,8 @@ export class HostBridge {
         if (Number.isSafeInteger(rawSeq) && rawSeq >= 0 && rawSeq < oldestEventSeq) {
           oldestEventSeq = rawSeq;
         }
-        const mapped = mapHistoryMessage(sessionId, record);
-        if (mapped !== null) {
+        // v1.0.7：一条事件可能产出「思考 + 正文」两条（mapHistoryMessages）
+        for (const mapped of mapHistoryMessages(sessionId, record)) {
           messages.push(mapped);
           if (mapped.seq < oldestSeq) oldestSeq = mapped.seq;
         }
@@ -1013,6 +1277,13 @@ export class HostBridge {
     const p = m.payload ?? {};
     const agentPreset = typeof p.agentPreset === "string" ? p.agentPreset.trim() : "";
     const permission = typeof p.permission === "string" ? p.permission.trim() : "";
+    // v1.0.7：model={provider,model,reasoningEffort?}（id 不可反拆，只认 provider/model）
+    const model = normalizeModelSelection(p.model);
+    if (p.model !== undefined && p.model !== null && model === null) {
+      this.#log("warn", "session.create got an invalid model selection; ignored", {
+        model: typeof p.model === "object" ? Object.keys(p.model) : typeof p.model,
+      });
+    }
     try {
       const sc = this.#sc();
       const req = {};
@@ -1048,23 +1319,43 @@ export class HostBridge {
       // 权限档位：创建成功后写入（宿主语义：写进「首次发布」前的种子）。
       // 失败只 warn，不阻断创建（会话照常返回 sessionId）。
       if (permission !== "") await this.#applyPermissionPreset(sessionId, permission);
+      // v1.0.7（§5.8）：模型选择——创建成功后、首条 prompt 前 selectModel。
+      // **失败绝不能回 error**（会话已创建，回 error 会让手机重复创建）：
+      // 仍回 sessionId，附 modelError 让客户端提示「已用默认模型」。
+      let modelOut = null;
+      let modelError = "";
+      if (model !== null) {
+        try {
+          const selected = await sc.selectModel({ sessionId, ...model });
+          modelOut = selected?.selected ?? null;
+        } catch (e) {
+          modelError = errText(e);
+          this.#log("warn", "selectModel failed; session created with default model", {
+            sessionId,
+            error: modelError,
+          });
+        }
+      }
       const out = { sessionId };
       const echoed =
         typeof value?.agentPreset === "string" && value.agentPreset !== ""
           ? value.agentPreset
           : agentPreset;
       if (echoed !== "") out.agentPreset = echoed;
+      if (modelOut !== null) out.model = modelOut;
+      if (modelError !== "") out.modelError = modelError;
       this.#reply(m, resultOf(m, out));
     } catch (e) {
       this.#reply(m, errorOf(m, "session-create-failed", errText(e)));
     }
   }
 
-  /** 契约 §5.8 session.capabilities：新建会话可选的「模式」与「权限」目录。
-   *  宿主没有对应能力 → 对应数组为空（客户端隐藏选择区），不得报错。 */
+  /** 契约 §5.8/§5.9 session.capabilities：模式、权限、模型目录 + 归档能力标记。
+   *  宿主没有对应能力 → 对应数组为空 / archiveSupported=false，不得报错。 */
   async #rSessionCapabilities(m) {
     const presets = await this.#loadAgentPresets();
     const permissions = await this.#loadPermissionPresets();
+    const models = await this.#loadModelCatalog();
     this.#reply(
       m,
       resultOf(m, {
@@ -1072,8 +1363,88 @@ export class HostBridge {
         permissions: permissions.permissions,
         defaultPreset: presets.defaultPreset,
         defaultPermission: permissions.defaultPermission,
+        models: models.models,
+        defaultModelId: models.defaultModelId,
+        archiveSupported: this.#archiveSupported(),
       }),
     );
+  }
+
+  /** 归档能力（§5.9）：宿主有 Workspace 注册表**且**有归档方法才为 true。 */
+  #archiveSupported() {
+    const reg = this.#workspaceRegistry();
+    if (!reg) return false;
+    return typeof reg.archiveSession === "function" && typeof reg.unarchiveSession === "function";
+  }
+
+  /** 模型目录（宿主 sessionController.modelCatalog()）。失败/无方法 → 空目录。 */
+  async #loadModelCatalog() {
+    let sc = null;
+    try {
+      sc = this.#sc();
+    } catch {
+      return { models: [], defaultModelId: "" };
+    }
+    if (typeof sc.modelCatalog !== "function") return { models: [], defaultModelId: "" };
+    let catalog = null;
+    try {
+      catalog = await sc.modelCatalog();
+    } catch (e) {
+      this.#log("warn", "model catalog failed; capabilities degrade to empty", { error: errText(e) });
+      return { models: [], defaultModelId: "" };
+    }
+    return modelCatalogToWire(catalog);
+  }
+
+  /** 契约 §5.1/§5.8（v1.0.8）session.selectModel：对**已存在会话**切换模型/思考强度。
+   *  无效 selection → result.error；宿主拒绝 → 原文带出（不假成功）；
+   *  成功 → 回宿主归一化后的 {model}。 */
+  async #rSessionSelectModel(m) {
+    const p = m.payload ?? {};
+    const sessionId = typeof p.sessionId === "string" ? p.sessionId : "";
+    if (sessionId === "") {
+      this.#reply(m, errorOf(m, "bad-params", "sessionId required"));
+      return;
+    }
+    const selection = parseModelSelection(p.model);
+    if (selection === null) {
+      this.#reply(m, errorOf(m, "bad-params", "invalid model selection (provider/model required)"));
+      return;
+    }
+    let sc = null;
+    try {
+      sc = this.#sc();
+    } catch (e) {
+      this.#reply(m, errorOf(m, "service-unavailable", errText(e)));
+      return;
+    }
+    if (typeof sc.selectModel !== "function") {
+      this.#reply(m, errorOf(m, "service-unavailable", "sessionController.selectModel unavailable"));
+      return;
+    }
+    try {
+      const value = await sc.selectModel({ sessionId, ...selection });
+      const model = mapModelSelection(value?.selected) ?? selection;
+      this.#reply(m, resultOf(m, { model }));
+    } catch (e) {
+      const err = hostErrorOf(e, "session-select-model-failed");
+      this.#log("warn", "selectModel failed", { sessionId, code: err.code });
+      this.#reply(m, errorOf(m, err.code, err.message));
+    }
+  }
+
+  /** 契约 §5.1/§5.8（v1.0.8）session.model：查询会话当前模型/思考强度。
+   *  数据源是 model/selection 会话事件维护的**内存态**——插件重启后无记录 → null
+   *  （**不得臆造**；客户端回退展示目录默认）。 */
+  #rSessionModel(m) {
+    const p = m.payload ?? {};
+    const sessionId = typeof p.sessionId === "string" ? p.sessionId : "";
+    if (sessionId === "") {
+      this.#reply(m, errorOf(m, "bad-params", "sessionId required"));
+      return;
+    }
+    const model = this.#modelSelections.get(sessionId) ?? null;
+    this.#reply(m, resultOf(m, { model }));
   }
 
   /** 模式目录（宿主 Agent preset 目录）。服务缺失/抛错 → 空目录。 */
@@ -1165,6 +1536,55 @@ export class HostBridge {
         sessionId,
         error: errText(e),
       });
+    }
+  }
+
+  /** 契约 §5.1/§5.9 session.archive：写入 Workspace 真实归档集合。
+   *  宿主错误**原样**回给客户端（不得在本机假成功）；归档广播由
+   *  domain/changed 驱动（#broadcastArchives）。 */
+  async #rSessionArchive(m) {
+    const p = m.payload ?? {};
+    const sessionId = typeof p.sessionId === "string" ? p.sessionId : "";
+    if (sessionId === "") {
+      this.#reply(m, errorOf(m, "bad-params", "sessionId required"));
+      return;
+    }
+    const reg = this.#workspaceRegistry();
+    if (!reg || typeof reg.archiveSession !== "function") {
+      this.#reply(m, errorOf(m, "service-unavailable", "workspace registry unavailable"));
+      return;
+    }
+    const stopActivity = p.stopActivity === true;
+    try {
+      await reg.archiveSession(sessionId, { stopActivity });
+      this.#reply(m, resultOf(m, { sessionId, archived: true }));
+    } catch (e) {
+      const err = hostErrorOf(e, "session-archive-failed");
+      this.#log("warn", "archive failed", { sessionId, code: err.code });
+      this.#reply(m, errorOf(m, err.code, err.message));
+    }
+  }
+
+  /** 契约 §5.1/§5.9 session.unarchive：从 Workspace 归档集合恢复（幂等）。 */
+  async #rSessionUnarchive(m) {
+    const p = m.payload ?? {};
+    const sessionId = typeof p.sessionId === "string" ? p.sessionId : "";
+    if (sessionId === "") {
+      this.#reply(m, errorOf(m, "bad-params", "sessionId required"));
+      return;
+    }
+    const reg = this.#workspaceRegistry();
+    if (!reg || typeof reg.unarchiveSession !== "function") {
+      this.#reply(m, errorOf(m, "service-unavailable", "workspace registry unavailable"));
+      return;
+    }
+    try {
+      await reg.unarchiveSession(sessionId);
+      this.#reply(m, resultOf(m, { sessionId, archived: false }));
+    } catch (e) {
+      const err = hostErrorOf(e, "session-unarchive-failed");
+      this.#log("warn", "unarchive failed", { sessionId, code: err.code });
+      this.#reply(m, errorOf(m, err.code, err.message));
     }
   }
 

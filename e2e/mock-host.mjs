@@ -5,6 +5,9 @@
 // v1.0.6：支持 session.capabilities（模式/权限目录）、session.create 的
 // agentPreset / permission、session.history 的 steps，以及 tool.call /
 // tool.result / system.message 事件推送（契约 §5.2 / §5.7 / §5.8）。
+// v1.0.7：追加模型目录（capabilities.models / defaultModelId）、真实归档
+// （session.archive / session.unarchive / session.archives 广播 / list 的 archived）、
+// 以及思考过程（assistant.reasoningDelta 事件 + 历史 role:"reasoning" 消息）。
 import { pathToFileURL } from "node:url";
 import { RelayLink, msg } from "./link.mjs";
 
@@ -20,8 +23,28 @@ export const MOCK_PERMISSIONS = [
   { id: "workspace-write", name: "工作区内修改", description: "工作区内可修改" },
 ];
 
+/** mock 的模型目录（宿主 modelCatalog 的等价物；id = provider/model）。 */
+export const MOCK_MODELS = [
+  {
+    id: "deepseek/deepseek-chat",
+    provider: "deepseek",
+    model: "deepseek-chat",
+    name: "DeepSeek Chat",
+    description: "通用对话",
+    reasoningEffort: "high",
+    efforts: [
+      { id: "minimal", name: "最少", description: "" },
+      { id: "low", name: "低", description: "" },
+      { id: "medium", name: "中", description: "" },
+      { id: "high", name: "高", description: "" },
+    ],
+  },
+  { id: "zai/glm-4.6", provider: "zai", model: "glm-4.6", name: "GLM 4.6", description: "" },
+];
+
 export const MOCK_DEFAULT_PRESET = "standard";
 export const MOCK_DEFAULT_PERMISSION = "read-only";
+export const MOCK_DEFAULT_MODEL = "deepseek/deepseek-chat";
 
 function resultOf(m, value) {
   return msg("result", { id: m.id, ok: true, value });
@@ -30,7 +53,7 @@ function errorOf(m, code, message) {
   return msg("result", { id: m.id, ok: false, error: { code, message } });
 }
 
-/** 内容块 → 纯文本（契约 §5.7 口径：text 拼接，image/file 占位符）。 */
+/** 内容块 → 纯文本（契约 §5.7 口径：text 拼接，image/file 占位符；忽略 reasoning）。 */
 function contentText(content) {
   if (!Array.isArray(content)) return "";
   let text = "";
@@ -39,6 +62,17 @@ function contentText(content) {
     if (block.type === "text" && typeof block.text === "string") text += block.text;
     else if (block.type === "image") text += "[图片]";
     else if (block.type === "file") text += "[文件]";
+  }
+  return text;
+}
+
+/** 思考块 → 纯文本（契约 §5.3：独立成 role:"reasoning" 的消息）。 */
+function reasoningText(content) {
+  if (!Array.isArray(content)) return "";
+  let text = "";
+  for (const block of content) {
+    if (!block || typeof block !== "object") continue;
+    if (block.type === "reasoning" && typeof block.text === "string") text += block.text;
   }
   return text;
 }
@@ -59,6 +93,19 @@ export function mockHistory(session) {
     if (ev.type === "user/message" || ev.type === "assistant/message") {
       const content =
         ev.type === "user/message" ? data.content : data?.message?.content;
+      // v1.0.7：思考块独立成条，排在正文之前（§5.3）
+      if (ev.type === "assistant/message") {
+        const thinking = reasoningText(content);
+        if (thinking.trim() !== "") {
+          messages.push({
+            id: `${session.sessionId}:${seq}:reasoning`,
+            role: "reasoning",
+            text: thinking,
+            ts,
+            seq,
+          });
+        }
+      }
       const text = contentText(content);
       if (text.trim() === "") continue;
       messages.push({
@@ -150,6 +197,8 @@ export function createMockHost(deps) {
   let askSeq = 0;
   const pendingAsks = new Map(); // askId -> {resolve}
   let eventSeq = 0;
+  /** v1.0.7：真实归档集合（对应宿主 workspaceRegistry.archivedSessionIds）。 */
+  const archivedSessionIds = new Set();
 
   /** 记一条会话事件（进历史）。 */
   const record = (session, type, data, time) => {
@@ -169,6 +218,31 @@ export function createMockHost(deps) {
     link.send(msg("event", { topic, data: wireData }));
   };
 
+  /** v1.0.7（§5.9）：广播归档全集（对应宿主的 domain/changed 触发）。 */
+  const broadcastArchives = () => {
+    link.send(
+      msg("event", {
+        topic: "session.archives",
+        data: { archivedSessionIds: [...archivedSessionIds] },
+      }),
+    );
+  };
+
+  /** v1.0.8：设置会话模型并广播 session.modelChanged（对应宿主的 model/selection 事件）。 */
+  const applyModel = (session, selection) => {
+    session.model = { ...selection };
+    link.send(
+      msg("event", {
+        topic: "session.modelChanged",
+        data: { sessionId: session.sessionId, model: { ...selection } },
+      }),
+    );
+  };
+
+  /** 宿主口径的 selection 校验：provider/model 必填，模型必须在目录里。 */
+  const knownModel = (provider, model) =>
+    MOCK_MODELS.find((x) => x.provider === provider && x.model === model);
+
   const handle = async (m) => {
     const p = m.payload ?? {};
     switch (m.type) {
@@ -177,15 +251,25 @@ export function createMockHost(deps) {
       case "ping":
         return link.send(resultOf(m, { pong: Date.now() }));
       case "session.list":
-        return link.send(resultOf(m, { sessions: [...sessions.values()] }));
+        return link.send(
+          resultOf(m, {
+            sessions: [...sessions.values()].map((s) => ({
+              ...s,
+              archived: archivedSessionIds.has(s.sessionId),
+            })),
+          }),
+        );
       case "session.capabilities":
-        // 契约 §5.8：模式 + 权限目录（宿主没有的能力这里是空数组）
+        // 契约 §5.8/§5.9：模式 + 权限 + 模型目录 + 归档能力标记
         return link.send(
           resultOf(m, {
             presets: MOCK_PRESETS.map((x) => ({ ...x })),
             permissions: MOCK_PERMISSIONS.map((x) => ({ ...x })),
             defaultPreset: MOCK_DEFAULT_PRESET,
             defaultPermission: MOCK_DEFAULT_PERMISSION,
+            models: MOCK_MODELS.map((x) => ({ ...x })),
+            defaultModelId: MOCK_DEFAULT_MODEL,
+            archiveSupported: true,
           }),
         );
       case "session.create": {
@@ -209,7 +293,76 @@ export function createMockHost(deps) {
         link.send(msg("event", { topic: "session.added", data: { session: s } }));
         const value = { sessionId: id };
         if (agentPreset !== "") value.agentPreset = agentPreset;
+        // v1.0.7：模型选择——未知模型**不回 error**（会话已创建），只附 modelError
+        const model = p.model;
+        if (model && typeof model === "object") {
+          const known = knownModel(model.provider, model.model);
+          if (known) {
+            const selection = {
+              provider: String(model.provider),
+              model: String(model.model),
+              ...(typeof model.reasoningEffort === "string" && model.reasoningEffort !== ""
+                ? { reasoningEffort: model.reasoningEffort }
+                : {}),
+            };
+            value.model = { ...selection };
+            // v1.0.8：选模型即会话模型变化（对应宿主的 model/selection 事件）
+            applyModel(s, selection);
+          } else {
+            value.modelError = `model not available: ${model.provider}/${model.model}`;
+          }
+        }
         return link.send(resultOf(m, value));
+      }
+      case "session.selectModel": {
+        // v1.0.8：会话中切换模型/思考强度
+        const sessionId = typeof p.sessionId === "string" ? p.sessionId : "";
+        if (sessionId === "") return link.send(errorOf(m, "bad-params", "sessionId required"));
+        const s = sessions.get(sessionId);
+        if (!s) return link.send(errorOf(m, "not-found", "session not found"));
+        const model = p.model;
+        if (!model || typeof model !== "object" || !model.provider || !model.model) {
+          return link.send(errorOf(m, "bad-params", "invalid model selection"));
+        }
+        const known = knownModel(model.provider, model.model);
+        if (!known) {
+          return link.send(
+            errorOf(m, "session/model-unavailable", `model not available: ${model.provider}/${model.model}`),
+          );
+        }
+        const selection = { provider: String(model.provider), model: String(model.model) };
+        if (typeof model.reasoningEffort === "string" && model.reasoningEffort !== "") {
+          selection.reasoningEffort = model.reasoningEffort;
+        }
+        applyModel(s, selection);
+        return link.send(resultOf(m, { model: { ...selection } }));
+      }
+      case "session.model": {
+        // v1.0.8：查询会话当前模型/思考强度（没有则 null）
+        const sessionId = typeof p.sessionId === "string" ? p.sessionId : "";
+        if (sessionId === "") return link.send(errorOf(m, "bad-params", "sessionId required"));
+        const s = sessions.get(sessionId);
+        if (!s) return link.send(errorOf(m, "not-found", "session not found"));
+        return link.send(resultOf(m, { model: s.model ? { ...s.model } : null }));
+      }
+      case "session.archive": {
+        const sessionId = typeof p.sessionId === "string" ? p.sessionId : "";
+        if (sessionId === "") return link.send(errorOf(m, "bad-params", "sessionId required"));
+        if (!sessions.has(sessionId)) {
+          return link.send(
+            errorOf(m, "workspace/unknown-session", `unknown session: ${sessionId}`),
+          );
+        }
+        archivedSessionIds.add(sessionId);
+        broadcastArchives();
+        return link.send(resultOf(m, { sessionId, archived: true }));
+      }
+      case "session.unarchive": {
+        const sessionId = typeof p.sessionId === "string" ? p.sessionId : "";
+        if (sessionId === "") return link.send(errorOf(m, "bad-params", "sessionId required"));
+        archivedSessionIds.delete(sessionId);
+        broadcastArchives();
+        return link.send(resultOf(m, { sessionId, archived: false }));
       }
       case "session.history": {
         const s = sessions.get(p.sessionId);
@@ -259,13 +412,30 @@ export function createMockHost(deps) {
             message: { role: "tool", toolCallId: callId, content: [{ type: "text", text: "hello" }] },
           },
         );
+        // v1.0.7：思考增量（§5.2 assistant.reasoningDelta，与正文分流）
+        link.send(
+          msg("event", {
+            topic: "assistant.reasoningDelta",
+            data: { sessionId: s.sessionId, text: "mock: 思考中…" },
+          }),
+        );
         // 流式回复
         const reply = `已收到：「${p.text}」。这是 mock-host 的流式回复。`;
         for (const ch of reply.match(/.{1,8}/g) ?? []) {
           link.send(msg("event", { topic: "assistant.delta", data: { sessionId: s.sessionId, text: ch } }));
           await new Promise((r) => setTimeout(r, 60));
         }
-        record(s, "assistant/message", { turn: 1, step: 2, message: { content: [{ type: "text", text: reply }] } });
+        // 历史里带一条 reasoning 块（§5.3：独立成 role:"reasoning" 的消息）
+        record(s, "assistant/message", {
+          turn: 1,
+          step: 2,
+          message: {
+            content: [
+              { type: "reasoning", text: "mock: 思考中…" },
+              { type: "text", text: reply },
+            ],
+          },
+        });
         // 文本含 "approve" 触发一次审批问答演示
         if (/approve/i.test(p.text)) {
           const askId = "ask-" + ++askSeq;

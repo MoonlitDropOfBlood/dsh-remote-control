@@ -5,11 +5,13 @@
  *  - assistant.delta 流式追加到当前气泡（带光标），turn.end 定稿
  *  - 底部输入条 + 发送；running 时显示「取消」；顶部标题栏 + 运行状态徽标
  *  - 本会话的审批 / 提问卡片内嵌在输入条上方（AskCards），resolved 后自动消失
+ *  - v1.0.8：输入条上方「模型 / 思考强度」胶囊 → bindSheet 选模型与强度（session.selectModel）
  */
 import { MarkdownController } from '@luvi/lv-markdown-in';
 import { promptAction } from '@kit.ArkUI';
 import { HRouter } from 'hrouter';
 import { dshrcLink } from '../model/link';
+import { DshrcEffortOption, DshrcModelOption, DshrcModelSelection } from '../model/protocol';
 import { SessionDetailParam, goBack, openSessionDetail } from '../model/routes';
 import {
   ApprovalCard,
@@ -32,7 +34,8 @@ import {
   SP_1,
   SP_2,
   SP_3,
-  SP_4
+  SP_4,
+  SP_6
 } from '../model/theme';
 import { ApprovalCardView, QuestionCardView } from './AskCards';
 import { TimelineView } from './TimelineView';
@@ -91,6 +94,12 @@ export struct SessionDetailPage {
   @Local draft: string = '';
   /** 用户是否仍在底部（自动贴底开关）：上翻历史即暂停，滑回底部即恢复跟随。 */
   @Local followBottom: boolean = true;
+  /** 模型选择面板是否展开（V2 bindSheet 用 $$ 双向绑定）。 */
+  @Local modelSheetOpen: boolean = false;
+  /** 面板内选中的模型目录 id。 */
+  @Local sheetModelId: string = '';
+  /** 面板内选中的思考强度 id（'' = 默认）。 */
+  @Local sheetEffortId: string = '';
   private scroller: Scroller = new Scroller();
   /** 首次进入是否已完成贴底（timeline 有缓存 / 历史异步到达两种都要滚到底）。 */
   private pendingInitialScroll: boolean = true;
@@ -148,6 +157,8 @@ export struct SessionDetailPage {
       this.store.openSession(this.sessionId);
       // 契约 §5.1 v1.0.4：先拉最新一页历史消息（修复打开历史会话空白）
       this.store.loadHistory(this.sessionId, false);
+      // 契约 §5.1 v1.0.8：拉会话当前模型 / 思考强度（静默，失败不打扰时间线）
+      this.store.loadSessionModel(this.sessionId);
       // 契约 §5.6 v1.0.5：根会话拉子代理目录（详情页子代理入口区数据）
       this.maybeLoadSubagents();
     }
@@ -161,6 +172,7 @@ export struct SessionDetailPage {
           if (this.sessionId.length > 0) {
             this.store.openSession(this.sessionId);
             this.store.loadHistory(this.sessionId, false);
+            this.store.loadSessionModel(this.sessionId);
           }
         }
       },
@@ -169,6 +181,8 @@ export struct SessionDetailPage {
           this.store.openSession(this.sessionId);
           // 重进页面补拉最新一页（store 内按 seq 去重，不会重复显示）
           this.store.loadHistory(this.sessionId, false);
+          // 重进页面刷新会话当前模型（桌面端切换后回来即最新）
+          this.store.loadSessionModel(this.sessionId);
           this.maybeLoadSubagents();
         }
       }
@@ -300,6 +314,324 @@ export struct SessionDetailPage {
     if (this.followBottom) {
       this.scrollToBottom();
     }
+  }
+
+  // ---- v1.0.8：模型 / 思考强度（session.model + session.selectModel，契约 §5.1/§5.8）----
+
+  /** 目录中匹配 provider + model 的模型项（不按 id 反拆）。 */
+  private findModelOption(provider: string, model: string): DshrcModelOption | undefined {
+    const models: DshrcModelOption[] = this.store.models;
+    for (let i: number = 0; i < models.length; i++) {
+      if (models[i].provider === provider && models[i].model === model) {
+        return models[i];
+      }
+    }
+    return undefined;
+  }
+
+  /** 目录中按 id 取模型项。 */
+  private modelOptionById(id: string): DshrcModelOption | undefined {
+    const models: DshrcModelOption[] = this.store.models;
+    for (let i: number = 0; i < models.length; i++) {
+      if (models[i].id === id) {
+        return models[i];
+      }
+    }
+    return undefined;
+  }
+
+  /** 目录默认模型项（defaultModelId 命中；未命中 → 第一项；空目录 → undefined）。 */
+  private defaultModelOption(): DshrcModelOption | undefined {
+    const models: DshrcModelOption[] = this.store.models;
+    if (models.length === 0) {
+      return undefined;
+    }
+    for (let i: number = 0; i < models.length; i++) {
+      if (models[i].id === this.store.defaultModelId) {
+        return models[i];
+      }
+    }
+    return models[0];
+  }
+
+  /** 当前会话模型在目录中的对应项（无 → undefined：目录为空或模型不在目录里）。 */
+  private currentModelOption(): DshrcModelOption | undefined {
+    const sel: DshrcModelSelection | null = this.store.sessionModel;
+    if (sel === null) {
+      return undefined;
+    }
+    return this.findModelOption(sel.provider, sel.model);
+  }
+
+  /** 胶囊主文案：当前模型短名（未知 → 目录默认名；都没有 → 「模型」）。 */
+  private modelCapsuleText(): string {
+    const cur: DshrcModelOption | undefined = this.currentModelOption();
+    if (cur !== undefined) {
+      return cur.name.length > 0 ? cur.name : cur.model;
+    }
+    const sel: DshrcModelSelection | null = this.store.sessionModel;
+    if (sel !== null) {
+      // 目录里没有该模型（Host 目录变了）→ provider/model 截断显示
+      const ref: string = sel.provider + '/' + sel.model;
+      return ref.length > 24 ? ref.substring(0, 24) + '…' : ref;
+    }
+    const def: DshrcModelOption | undefined = this.defaultModelOption();
+    if (def !== undefined) {
+      return def.name.length > 0 ? def.name : def.model;
+    }
+    return '模型';
+  }
+
+  /** 胶囊上的思考强度（id）；无 → 空串。 */
+  private modelEffortText(): string {
+    const sel: DshrcModelSelection | null = this.store.sessionModel;
+    if (sel === null || sel.reasoningEffort === undefined) {
+      return '';
+    }
+    return sel.reasoningEffort;
+  }
+
+  /** 面板中所选模型的合法思考强度集合（无 → 空数组 = 该模型不支持强度）。 */
+  private sheetModelEfforts(): DshrcEffortOption[] {
+    const option: DshrcModelOption | undefined = this.modelOptionById(this.sheetModelId);
+    if (option === undefined || option.efforts === undefined) {
+      return [];
+    }
+    return option.efforts;
+  }
+
+  /** 面板：模型下拉选项（name · provider，区分不同来源的同名模型）。 */
+  private sheetModelOptions(): SelectOption[] {
+    const out: SelectOption[] = [];
+    const models: DshrcModelOption[] = this.store.models;
+    for (let i: number = 0; i < models.length; i++) {
+      const m: DshrcModelOption = models[i];
+      const base: string = m.name.length > 0 ? m.name : m.model;
+      out.push({ value: m.provider.length > 0 ? base + ' · ' + m.provider : base });
+    }
+    return out;
+  }
+
+  /** 面板：强度下拉选项（首项「默认」= id 空串）。 */
+  private sheetEffortOptions(): SelectOption[] {
+    const out: SelectOption[] = [];
+    out.push({ value: '默认' });
+    const efforts: DshrcEffortOption[] = this.sheetModelEfforts();
+    for (let i: number = 0; i < efforts.length; i++) {
+      out.push({ value: efforts[i].name });
+    }
+    return out;
+  }
+
+  /** 面板：模型选中下标（未命中 → 第一项；空目录 → -1）。 */
+  private sheetModelIndex(): number {
+    const models: DshrcModelOption[] = this.store.models;
+    for (let i: number = 0; i < models.length; i++) {
+      if (models[i].id === this.sheetModelId) {
+        return i;
+      }
+    }
+    return models.length > 0 ? 0 : -1;
+  }
+
+  /** 面板：强度选中下标（0 = 默认；其余是 efforts 下标 + 1）。 */
+  private sheetEffortIndex(): number {
+    const efforts: DshrcEffortOption[] = this.sheetModelEfforts();
+    if (this.sheetEffortId.length === 0) {
+      return 0;
+    }
+    for (let i: number = 0; i < efforts.length; i++) {
+      if (efforts[i].id === this.sheetEffortId) {
+        return i + 1;
+      }
+    }
+    return 0;
+  }
+
+  /** 面板：模型当前显示文案。 */
+  private sheetModelValue(): string {
+    const idx: number = this.sheetModelIndex();
+    const models: DshrcModelOption[] = this.store.models;
+    if (idx < 0 || idx >= models.length) {
+      return '模型';
+    }
+    const m: DshrcModelOption = models[idx];
+    const base: string = m.name.length > 0 ? m.name : m.model;
+    return m.provider.length > 0 ? base + ' · ' + m.provider : base;
+  }
+
+  /** 面板：强度当前显示文案。 */
+  private sheetEffortValue(): string {
+    const idx: number = this.sheetEffortIndex();
+    const efforts: DshrcEffortOption[] = this.sheetModelEfforts();
+    if (idx <= 0 || idx - 1 >= efforts.length) {
+      return '默认';
+    }
+    return efforts[idx - 1].name;
+  }
+
+  /** 打开面板：初值 = 当前会话模型（未知 → 目录默认）；强度取当前值（不属于所选模型则「默认」）。 */
+  private openModelSheet(): void {
+    const cur: DshrcModelOption | undefined = this.currentModelOption();
+    if (cur !== undefined) {
+      this.sheetModelId = cur.id;
+    } else {
+      const def: DshrcModelOption | undefined = this.defaultModelOption();
+      this.sheetModelId = def !== undefined ? def.id : '';
+    }
+    let effortId: string = '';
+    const sel: DshrcModelSelection | null = this.store.sessionModel;
+    const efforts: DshrcEffortOption[] = this.sheetModelEfforts();
+    if (sel !== null && sel.reasoningEffort !== undefined) {
+      for (let i: number = 0; i < efforts.length; i++) {
+        if (efforts[i].id === sel.reasoningEffort) {
+          effortId = sel.reasoningEffort;
+          break;
+        }
+      }
+    }
+    this.sheetEffortId = effortId;
+    this.modelSheetOpen = true;
+  }
+
+  /** 面板：切换模型（换模型后强度重置为「默认」，契约 §5.8 v1.0.8）。 */
+  private onSheetModelSelect(index: number): void {
+    const models: DshrcModelOption[] = this.store.models;
+    if (index < 0 || index >= models.length) {
+      return;
+    }
+    this.sheetModelId = models[index].id;
+    this.sheetEffortId = '';
+  }
+
+  /** 面板：切换思考强度（index 0 = 默认）。 */
+  private onSheetEffortSelect(index: number): void {
+    const efforts: DshrcEffortOption[] = this.sheetModelEfforts();
+    if (index <= 0) {
+      this.sheetEffortId = '';
+      return;
+    }
+    const i: number = index - 1;
+    if (i < efforts.length) {
+      this.sheetEffortId = efforts[i].id;
+    }
+  }
+
+  /** 应用：按目录项构造 ModelSelection 调 session.selectModel（成功收面板，失败回主机原文）。 */
+  private applySheetModel(): void {
+    const option: DshrcModelOption | undefined = this.modelOptionById(this.sheetModelId);
+    if (option === undefined) {
+      promptAction.showToast({ message: '模型目录不可用', duration: 2000 });
+      return;
+    }
+    const sel: DshrcModelSelection = { provider: option.provider, model: option.model };
+    if (this.sheetEffortId.length > 0) {
+      sel.reasoningEffort = this.sheetEffortId;
+    }
+    this.store.applyModelSelection(this.sessionId, sel).then((): void => {
+      promptAction.showToast({ message: '已切换模型', duration: 1500 });
+      this.modelSheetOpen = false;
+    }).catch((e: Error): void => {
+      promptAction.showToast({ message: e.message, duration: 2500 });
+    });
+  }
+
+  /** 输入条上方的「模型 / 思考强度」胶囊（one-shot 只读会话随输入条一起隐藏）。 */
+  @Builder
+  modelCapsule() {
+    Row() {
+      Text(this.modelCapsuleText())
+        .fontSize(FS_SMALL)
+        .fontColor($r('app.color.label_secondary'))
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+      if (this.modelEffortText().length > 0) {
+        Text(this.modelEffortText())
+          .fontSize(FS_CAPTION)
+          .fontColor($r('app.color.label_tertiary'))
+          .margin({ left: SP_1 })
+      }
+      SymbolGlyph($r('sys.symbol.chevron_down'))
+        .fontSize(14)
+        .fontColor([$r('app.color.label_tertiary')])
+        .width(16)
+        .height(14)
+        .margin({ left: SP_1 })
+    }
+    .padding({ left: SP_2, right: SP_2, top: SP_1, bottom: SP_1 })
+    .backgroundColor($r('app.color.bg_layer_2'))
+    .borderRadius(RADIUS_PILL)
+    .border({ width: HAIRLINE, color: $r('app.color.border_l1') })
+    .constraintSize({ maxWidth: '76%' })
+    .onClick((): void => {
+      this.openModelSheet();
+    })
+  }
+
+  /** 模型 / 思考强度选择面板（bindSheet 内容）。 */
+  @Builder
+  modelSheet() {
+    Column() {
+      Text('模型与思考强度')
+        .fontSize(FS_SUBTITLE)
+        .fontColor($r('app.color.label_primary'))
+        .width('100%')
+        .margin({ bottom: SP_3 })
+
+      Text('模型')
+        .fontSize(FS_CAPTION)
+        .fontColor($r('app.color.label_tertiary'))
+        .width('100%')
+        .margin({ bottom: SP_1 })
+      Select(this.sheetModelOptions())
+        .selected(this.sheetModelIndex())
+        .value(this.sheetModelValue())
+        .fontColor($r('app.color.label_primary'))
+        .selectedOptionFontColor($r('app.color.brand_label'))
+        .optionFontColor($r('app.color.label_primary'))
+        .menuBackgroundColor($r('app.color.bg_layer_1'))
+        .width('100%')
+        .onSelect((index: number): void => {
+          this.onSheetModelSelect(index);
+        })
+
+      // 思考强度：所选模型不支持（无 efforts）→ 整块隐藏
+      if (this.sheetModelEfforts().length > 0) {
+        Text('思考强度')
+          .fontSize(FS_CAPTION)
+          .fontColor($r('app.color.label_tertiary'))
+          .width('100%')
+          .margin({ top: SP_3, bottom: SP_1 })
+        Select(this.sheetEffortOptions())
+          .selected(this.sheetEffortIndex())
+          .value(this.sheetEffortValue())
+          .fontColor($r('app.color.label_primary'))
+          .selectedOptionFontColor($r('app.color.brand_label'))
+          .optionFontColor($r('app.color.label_primary'))
+          .menuBackgroundColor($r('app.color.bg_layer_1'))
+          .width('100%')
+          .onSelect((index: number): void => {
+            this.onSheetEffortSelect(index);
+          })
+      }
+
+      Button('应用')
+        .width('100%')
+        .height(44)
+        .margin({ top: SP_4 })
+        .fontSize(FS_BODY)
+        .fontWeight(FontWeight.Medium)
+        .fontColor($r('app.color.label_on_brand'))
+        .backgroundColor($r('app.color.brand_fill'))
+        .borderRadius(RADIUS_CTRL)
+        .enabled(this.store.models.length > 0)
+        .onClick((): void => {
+          this.applySheetModel();
+        })
+    }
+    .width('100%')
+    .alignItems(HorizontalAlign.Start)
+    .padding({ left: SP_4, right: SP_4, top: SP_4, bottom: SP_6 })
   }
 
   /** 发送提示词（乐观上屏；根会话走 session.prompt，subagent 走 session.subagentPrompt §5.1 v1.0.5）。 */
@@ -571,58 +903,80 @@ export struct SessionDetailPage {
         .backgroundColor($r('app.color.bg_layer_1'))
         .border({ width: HAIRLINE, color: $r('app.color.border_l1') })
       } else {
-        Row() {
-        TextArea({ text: this.draft, placeholder: '输入提示词，Enter 发送…' })
-          .onChange((v: string): void => {
-            this.draft = v;
-          })
-          .layoutWeight(1)
-          .height(44)
-          .padding({ left: SP_3, right: SP_3, top: 8, bottom: 8 })
-          .backgroundColor($r('app.color.bg_layer_2'))
-          .borderRadius(RADIUS_CARD)
-          .border({ width: HAIRLINE, color: $r('app.color.border_l1') })
-          .fontSize(FS_BODY)
-          .fontColor($r('app.color.label_primary'))
-          .placeholderColor($r('app.color.label_tertiary'))
-          .caretColor($r('app.color.brand_fill'))
-        if (this.store.runningOf(this.sessionId)) {
-          Button('取消')
-            .height(44)
-            .margin({ left: SP_2 })
-            .padding({ left: SP_3, right: SP_3 })
-            .fontSize(FS_BODY)
-            .fontColor($r('app.color.state_error'))
-            .backgroundColor($r('app.color.bg_layer_1'))
-            .border({ width: HAIRLINE, color: $r('app.color.state_error') })
-            .borderRadius(RADIUS_CTRL)
-            .onClick((): void => {
-              this.cancelTurn();
-            })
+        Column() {
+          // 模型 / 思考强度胶囊（v1.0.8）：在输入框上方一行，点击弹选择面板
+          Row() {
+            this.modelCapsule()
+            Blank()
+          }
+          .width('100%')
+          .alignItems(VerticalAlign.Center)
+          .padding({ left: SP_3, right: SP_3, top: SP_2, bottom: SP_1 })
+
+          Row() {
+            TextArea({ text: this.draft, placeholder: '输入提示词，Enter 发送…' })
+              .onChange((v: string): void => {
+                this.draft = v;
+              })
+              .layoutWeight(1)
+              .height(44)
+              .padding({ left: SP_3, right: SP_3, top: 8, bottom: 8 })
+              .backgroundColor($r('app.color.bg_layer_2'))
+              .borderRadius(RADIUS_CARD)
+              .border({ width: HAIRLINE, color: $r('app.color.border_l1') })
+              .fontSize(FS_BODY)
+              .fontColor($r('app.color.label_primary'))
+              .placeholderColor($r('app.color.label_tertiary'))
+              .caretColor($r('app.color.brand_fill'))
+            if (this.store.runningOf(this.sessionId)) {
+              Button('取消')
+                .height(44)
+                .margin({ left: SP_2 })
+                .padding({ left: SP_3, right: SP_3 })
+                .fontSize(FS_BODY)
+                .fontColor($r('app.color.state_error'))
+                .backgroundColor($r('app.color.bg_layer_1'))
+                .border({ width: HAIRLINE, color: $r('app.color.state_error') })
+                .borderRadius(RADIUS_CTRL)
+                .onClick((): void => {
+                  this.cancelTurn();
+                })
+            }
+            Button('发送')
+              .height(44)
+              .margin({ left: SP_2 })
+              .padding({ left: SP_4, right: SP_4 })
+              .fontSize(FS_BODY)
+              .fontWeight(FontWeight.Medium)
+              .fontColor($r('app.color.label_on_brand'))
+              .backgroundColor($r('app.color.brand_fill'))
+              .borderRadius(RADIUS_CTRL)
+              .enabled(this.draft.trim().length > 0 && this.store.linkState === 'online')
+              .onClick((): void => {
+                this.send();
+              })
+          }
+          .width('100%')
+          .alignItems(VerticalAlign.Center)
+          .padding({ left: SP_3, right: SP_3, top: SP_1, bottom: SP_4 })
         }
-        Button('发送')
-          .height(44)
-          .margin({ left: SP_2 })
-          .padding({ left: SP_4, right: SP_4 })
-          .fontSize(FS_BODY)
-          .fontWeight(FontWeight.Medium)
-          .fontColor($r('app.color.label_on_brand'))
-          .backgroundColor($r('app.color.brand_fill'))
-          .borderRadius(RADIUS_CTRL)
-          .enabled(this.draft.trim().length > 0 && this.store.linkState === 'online')
-          .onClick((): void => {
-            this.send();
-          })
-      }
-      .width('100%')
-      .alignItems(VerticalAlign.Center)
-      .padding({ left: SP_3, right: SP_3, top: SP_3, bottom: SP_4 })
-      .backgroundColor($r('app.color.bg_layer_1'))
-      .border({ width: HAIRLINE, color: $r('app.color.border_l1') })
+        .width('100%')
+        .backgroundColor($r('app.color.bg_layer_1'))
+        .border({ width: HAIRLINE, color: $r('app.color.border_l1') })
       }
     }
     .width('100%')
     .height('100%')
     .backgroundColor($r('app.color.bg_base'))
+    // v1.0.8：模型 / 思考强度选择面板（bindSheet；用户关闭时 onDisappear 回写开关）
+    .bindSheet(this.modelSheetOpen, this.modelSheet(), {
+      height: 300,
+      showClose: true,
+      dragBar: true,
+      backgroundColor: $r('app.color.bg_layer_1'),
+      onDisappear: (): void => {
+        this.modelSheetOpen = false;
+      }
+    })
   }
 }

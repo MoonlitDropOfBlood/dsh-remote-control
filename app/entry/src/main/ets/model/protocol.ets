@@ -8,8 +8,8 @@
 /** 协议版本（契约 §5.1 hello.proto）。 */
 export const PROTO_VERSION: number = 1;
 
-/** 协议契约文档版本（v1.0.6：§5.7 工作步骤 StepRecord、§5.8 模式/权限目录；关于页展示用）。 */
-export const CONTRACT_VERSION: string = 'v1.0.6';
+/** 协议契约文档版本（v1.0.7：§5.8 模型目录、§5.9 Workspace 真实归档、reasoning 思考过程；关于页展示用）。 */
+export const CONTRACT_VERSION: string = 'v1.0.8';
 
 /** 角色：host = PC 端 DSH 插件；client = 本 App。 */
 export const ROLE_HOST: string = 'host';
@@ -67,6 +67,10 @@ export const MSG_SESSION_SUBAGENT_PROMPT: string = 'session.subagentPrompt'; // 
 export const MSG_SESSION_SUBAGENT_CANCEL: string = 'session.subagentCancel'; // v1.0.5：取消子代理当前 turn
 export const MSG_SESSION_CREATE: string = 'session.create';
 export const MSG_SESSION_CAPABILITIES: string = 'session.capabilities'; // v1.0.6：模式/权限目录
+export const MSG_SESSION_ARCHIVE: string = 'session.archive'; // v1.0.7：Workspace 真实归档
+export const MSG_SESSION_UNARCHIVE: string = 'session.unarchive'; // v1.0.7：从 Workspace 归档恢复
+export const MSG_SESSION_SELECT_MODEL: string = 'session.selectModel'; // v1.0.8：会话中切换模型/思考强度
+export const MSG_SESSION_MODEL: string = 'session.model'; // v1.0.8：查询会话当前模型
 export const MSG_SESSION_PROMPT: string = 'session.prompt';
 export const MSG_SESSION_CANCEL: string = 'session.cancel';
 export const MSG_SESSION_RENAME: string = 'session.rename';
@@ -84,7 +88,10 @@ export const TOPIC_SESSION_ADDED: string = 'session.added';
 export const TOPIC_SESSION_REMOVED: string = 'session.removed';
 export const TOPIC_SESSION_STATUS: string = 'session.status';
 export const TOPIC_SESSION_ACTIVITY: string = 'session.activity';
+export const TOPIC_SESSION_ARCHIVES: string = 'session.archives'; // v1.0.7：Workspace 归档全集快照
+export const TOPIC_SESSION_MODEL_CHANGED: string = 'session.modelChanged'; // v1.0.8：会话模型/强度变化
 export const TOPIC_ASSISTANT_DELTA: string = 'assistant.delta';
+export const TOPIC_ASSISTANT_REASONING_DELTA: string = 'assistant.reasoningDelta'; // v1.0.7：思考增量
 export const TOPIC_TOOL_CALL: string = 'tool.call'; // v1.0.6：工具调用开始
 export const TOPIC_TOOL_RESULT: string = 'tool.result'; // v1.0.6：工具调用结束
 export const TOPIC_SYSTEM_MESSAGE: string = 'system.message'; // v1.0.6：系统/开发者消息
@@ -143,6 +150,16 @@ export interface DshrcPayload {
   permissions?: DshrcPermissionOption[];
   defaultPreset?: string;
   defaultPermission?: string;
+  // session.create 模型选择 / session.capabilities 模型目录（§5.8 v1.0.7）
+  model?: DshrcModelSelection;
+  modelError?: string;
+  models?: DshrcModelOption[];
+  defaultModelId?: string;
+  archiveSupported?: boolean;
+  // session.archive / session.unarchive（§5.1 v1.0.7）
+  archived?: boolean;
+  archivedSessionIds?: string[];
+  stopActivity?: boolean;
   // session.subagents / subagentPrompt / subagentCancel（§5.1 v1.0.5）
   subagents?: DshrcSubagentInfo[];
   parentSessionId?: string;
@@ -218,6 +235,17 @@ export interface DshrcValue {
   permissions?: DshrcPermissionOption[];
   defaultPreset?: string;
   defaultPermission?: string;
+  // session.capabilities（§5.1 v1.0.7）：模型目录 + 真实归档能力标记
+  models?: DshrcModelOption[];
+  defaultModelId?: string;
+  archiveSupported?: boolean;
+  // session.create（§5.1 v1.0.7）：模型选择与设置结果
+  model?: DshrcModelSelection;
+  modelError?: string;
+  agentPreset?: string;
+  // session.archive / session.unarchive（§5.1 v1.0.7）
+  archived?: boolean;
+  archivedSessionIds?: string[];
   // session.subagents（§5.1 v1.0.5）：子代理目录
   subagents?: DshrcSubagentInfo[];
 }
@@ -225,7 +253,7 @@ export interface DshrcValue {
 /** session.history 的单条历史消息（契约 §5.1 v1.0.4 ChatMessage）。 */
 export interface DshrcChatMessage {
   id: string;
-  role: string; // "user" | "assistant"
+  role: string; // "user" | "assistant" | "reasoning"（v1.0.7 思考过程，独立于 assistant 正文）
   text: string;
   ts: number;
   seq: number; // host 日志持久序号（去重键）
@@ -271,12 +299,61 @@ export interface DshrcPermissionOption {
   description: string;
 }
 
-/** session.capabilities 响应 value（契约 §5.8 v1.0.6）。 */
+/**
+ * 思考强度选项（契约 §5.8 v1.0.8）：宿主 reasoning.efforts 的单项。
+ */
+export interface DshrcEffortOption {
+  id: string;
+  name: string;
+  description?: string;
+}
+
+/**
+ * 模型选项（契约 §5.8 v1.0.7 + v1.0.8）：Host `sessionController.modelCatalog()` 的可路由模型。
+ *  id 仅供客户端选择/默认项匹配（建议 `provider + "/" + model`）；
+ *  提交时必须用 DshrcModelSelection，**不要从 id 反拆**。
+ */
+export interface DshrcModelOption {
+  id: string;
+  name: string;
+  description: string;
+  provider: string;
+  model: string;
+  reasoningEffort?: string; // 该模型的 reasoning.defaultEffort（若有）
+  /** v1.0.8：该模型合法的思考强度集合（无该字段 = 模型不支持思考强度）。 */
+  efforts?: DshrcEffortOption[];
+}
+
+/** 模型选择（契约 §5.8 v1.0.7）：session.create 的 model 载荷。 */
+export interface DshrcModelSelection {
+  provider: string;
+  model: string;
+  reasoningEffort?: string;
+}
+
+/** session.capabilities 响应 value（契约 §5.8 v1.0.6 + v1.0.7）。 */
 export interface DshrcCapabilities {
   presets: DshrcModeOption[];
   permissions: DshrcPermissionOption[];
   defaultPreset: string;
   defaultPermission: string;
+  /** v1.0.7：模型目录（宿主不支持时为空数组）。 */
+  models: DshrcModelOption[];
+  /** v1.0.7：默认模型 id（宿主不支持时为空串）。 */
+  defaultModelId: string;
+  /** v1.0.7：宿主是否支持 Workspace 真实归档（false 时客户端禁用归档动作）。 */
+  archiveSupported: boolean;
+}
+
+/**
+ * session.create 响应 value（契约 §5.1 v1.0.7）。
+ *  会话已创建但模型设置失败时仍回成功并带 modelError——客户端**不得重复创建**。
+ */
+export interface DshrcCreateResult {
+  sessionId: string;
+  agentPreset: string;
+  model?: DshrcModelSelection;
+  modelError?: string;
 }
 
 /** result.error（契约 §5）。 */
@@ -300,7 +377,8 @@ export interface DshrcQuestion {
 }
 
 /** SessionSummary（契约 §5.3；v1.0.4 补 origin/parentSessionId/blank；
- *  v1.0.5 删 archived——Host 会话域无归档概念，列表不再有归档筛选）。 */
+ *  v1.0.7 重新加入 archived——由插件按 workspaceRegistry.archivedSessionIds 拼装，
+ *  旧插件缺省时按 false 处理）。 */
 export interface DshrcSessionSummary {
   sessionId: string;
   title: string;
@@ -311,6 +389,8 @@ export interface DshrcSessionSummary {
   origin?: string; // "subagent" | ""
   parentSessionId?: string;
   blank?: boolean;
+  // v1.0.7：Workspace 真实归档标记（插件按归档集合拼装）
+  archived?: boolean;
 }
 
 /** SubagentInfo（契约 §5.6 v1.0.5）：session.subagents 的目录行。 */

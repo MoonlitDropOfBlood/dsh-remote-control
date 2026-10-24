@@ -1,6 +1,6 @@
 # AGENTS.md — app/（HarmonyOS 手机 App）
 
-DSH 遥控器（ArkTS / ArkUI，DevEco 工程，bundleName=com.dukedsh.remotecontrol）。
+DSH Pocket（DSH 遥控器；ArkTS / ArkUI，DevEco 工程，bundleName=com.dukedsh.remotecontrol）。
 协议契约见 [../docs/PROTOCOL.md](../docs/PROTOCOL.md)；全局约定见 [../AGENTS.md](../AGENTS.md)。
 
 ## 结构（devecocli create 脚手架，勿手搓骨架）
@@ -11,7 +11,7 @@ entry/src/main/ets/model/    protocol(KAT向量) / crypto(HKDF+AES-GCM+HMAC) / l
                              push / theme / pairqr / logger(@duke/logan-ext 双写日志)
                              events(eventpost 事件契约) / routes(hrouter 统一跳转)
 entry/src/main/ets/pages/    Index(会话列表=**首页**) / ConnectionsPage(多远程连接管理)
-                             NewSessionPage(新建会话: 模式+权限) / SessionDetailPage(统一时间线)
+                             NewSessionPage(新建会话: 目录/模型+强度/模式/权限) / SessionDetailPage(统一时间线)
                              AskCards + ApprovalQueuePage(审批提问) / AboutPage / FieldInput
 entry/src/main/ets/_generated/hrouter/   hrouter-compiler 生成的 NavDestination wrapper
                              （构建产物勿手改勿入 git；路由表=resources/base/profile/router_map.json）
@@ -82,13 +82,13 @@ grep -rnE "@State|@Prop|@Link|@ObjectLink|@Observed[^V]|@Provide|@Consume|@Watch
   签名坑：`setTitleSize` 收 **6 元组**（h1..h6）不收单值；`setTableNormalTextColor` /
   `setTableInterleaveTextColor` **返回 void**（不能链式，单独调）。
 
-## 会话列表与子代理显示规则（契约 §5.3/§5.6 v1.0.5）
+## 会话列表与子代理显示规则（契约 §5.3/§5.6/§5.9）
 
 - **列表数据源**：只显示根会话（无 parentSessionId 且 origin!=='subagent'）非 blank，
-  updatedAt 降序。Host 会话域没有归档字段，wire 不增加 archived。
-- **本机归档**：普通列表左滑「归档」，顶栏进入「已归档」后左滑「恢复」；只把 sessionId
-  存进 Preferences `dshrc_prefs.archivedSessions`（archiveVersion 驱动列表投影），重启保留。
-  这是**手机本地 UI 状态**，不得调用/伪造成 Host 归档，也不影响详情与主机会话。
+  updatedAt 降序。v1.0.7 起 wire SessionSummary.archived 由插件按 Workspace 注册表拼装。
+- **Host 真实归档**：普通列表左滑「归档」调 session.archive，归档视图左滑「恢复」调
+  session.unarchive；session.list 首屏即过滤已有归档，session.archives 全集事件实时覆盖。
+  **禁止再写 Preferences archivedSessions / 本机假归档**；Host 拒绝时保留原行并提示错误。
 - **subagent 不进列表**：入口在父会话详情页顶部的「子代理」目录区
   （`store.activeSubagents`，SubagentChip 横向滚动；running 圆点 + label + 一次性角标），
   点击进子代理详情（session.history 已支持 subagent 地址，流式事件按 child id 寻址天然工作）。
@@ -110,19 +110,33 @@ grep -rnE "@State|@Prop|@Link|@ObjectLink|@Observed[^V]|@Provide|@Consume|@Watch
 - 切换远程 = `dshrcLink.stop()` + `dshrcLink.start(toLinkConfig(...))`；链路断开时
   `sessionStore` 清空 timeline/hostName（避免展示上一台主机的时间线）。
 
-### 统一时间线（契约 §5.7）
+### 统一时间线（契约 §5.7；reasoning 为 v1.0.7）
 - `sessionstore.timeline: TimelineItem[]` 是详情页**唯一**数据源，取代旧的 `messages`：
-  `kind='message'`（对话）/ `'step'`（工具调用）/ `'system'`（系统消息）。
+  `kind='message'`（对话）/ `'step'`（工具调用）/ `'system'`（系统消息）/ `'reasoning'`（思考）。
 - durable 项按 `seq` 升序在前，直播项（`seq=-1`）按到达顺序在末尾；
   历史页 `steps` 与直播 `tool.call`/`tool.result` 按 `callId` 配对去重。
-- 详情页渲染：**工作步骤卡**（折叠态 = 状态点 + 工具标题 + chevron，展开态 = 参数/输出，
-  等宽字体）+ 连续的步骤归为一个「工作步骤 · N」分组（组头可整体折叠）。
+- 工作步骤卡与组头的 chevron 都用 **18×16 固定尺寸 SymbolGlyph**，禁止文字箭头影响行高。
+  reasoning 用独立 ReasoningCard（默认收起的弱化「思考过程」），不进 assistant 气泡/StepGroup。
 
-### 新建会话的模式与权限（契约 §5.8）
-- `session.capabilities` → `sessionStore.presets`（模式）/ `permissions`（权限）/
-  `defaultPresetId` / `defaultPermissionId`；宿主不支持时数组为空 → 客户端隐藏选择区。
-- `dshrcLink.sessionCreate(title, agentPreset?, permission?, cwd?)`；宿主拒绝（unsupported）
-  时客户端回退为「不带选项」再创建一次。
-- 新建页**不填标题**：首屏输入首条任务，工作目录/模式/权限都用 Select；目录候选为
-  「默认目录」+ 现有会话 cwd 去重。`sessionCreate('', …)` 成功后必须 `sessionPrompt`
-  发送首条内容；create 成功但 prompt 失败也要进详情提示重试，不能留在表单重复创建。
+### 新建会话的模式 / 权限 / 模型 / 思考强度（契约 §5.8 v1.0.7+v1.0.8）
+- `session.capabilities` → presets / permissions / models（含 efforts 强度目录）及对应默认项；目录为空隐藏选择区。
+- `sessionCreate(title, agentPreset?, permission?, cwd?, model?)` 返回 DshrcCreateResult；
+  modelError 只提示并继续首条 prompt，**不得重复 create**。unsupported 回退仅去掉 preset/permission，
+  保留 cwd/model。
+- 新建页**不填标题**：首屏输入首条任务，工作目录/模型+强度（ModelFieldCard 一卡两行）/模式/权限都用
+  Select；强度档位 = 所选模型 `efforts`（首项「默认」= 不提交 reasoningEffort），换模型重置为该模型
+  默认档；目录候选 = 「默认目录」+ 现有会话 cwd 去重。create 成功但 prompt 失败也要进详情提示重试。
+
+### 会话中切换模型 / 思考强度（契约 §5.8 v1.0.8）
+- 入口在**详情页输入框旁的模型胶囊**（对齐各家 Harness 习惯；one-shot 只读会话随输入条一起隐藏），
+  点开 bindSheet 选模型+强度，「应用」调 `store.applyModelSelection`（wire `session.selectModel`），
+  Host 拒绝 toast 原文。
+- 当前值：`store.sessionModel`（`session.model` 拉取 + `session.modelChanged` 事件实时覆盖；
+  null = 插件无记录 → 回退显示目录默认）。下一次 prompt 组装即用新模型，运行中 turn 不受影响。
+
+### 品牌（2026-10-24，v2）
+- 应用名 **DSH Pocket**（AppScope app_name、EntryAbility_label、APP_NAME）；bundleName 不变。
+- 图标 = DSH 插件家族风格：44×44 rx11 圆角方块 + `#4D6BFE→#00B8A9` 对角渐变 + 白色圆头线条
+  （手机+终端光标+信号弧）+ 底部半透明波浪（家族签名）。源文件 `tools/icon/*.svg`，
+  用 `node tools/icon/render-icons.mjs`（resvg）重渲染 layered background/foreground（1024）与
+  startIcon（288）；plugin/icon.svg 同款。改图标只改 SVG 再重跑脚本，勿手改 PNG。

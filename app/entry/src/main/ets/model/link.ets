@@ -27,6 +27,8 @@ import {
   DshrcSessionSummary,
   DshrcHistoryPage,
   DshrcCapabilities,
+  DshrcCreateResult,
+  DshrcModelSelection,
   DshrcSubagentInfo,
   DshrcRelayFrame,
   DshrcRelayPeers,
@@ -49,6 +51,10 @@ import {
   MSG_SESSION_SUBAGENT_PROMPT,
   MSG_SESSION_SUBAGENT_CANCEL,
   MSG_SESSION_CREATE,
+  MSG_SESSION_ARCHIVE,
+  MSG_SESSION_UNARCHIVE,
+  MSG_SESSION_SELECT_MODEL,
+  MSG_SESSION_MODEL,
   MSG_SESSION_PROMPT,
   MSG_SESSION_CANCEL,
   MSG_SESSION_RENAME,
@@ -742,8 +748,8 @@ export class DshrcLink {
     });
   }
 
-  /** session.capabilities（§5.1 v1.0.6）：新建会话可选的「模式」与「权限」目录。
-   *  宿主不支持时返回空目录（客户端隐藏选择区，不报错）。 */
+  /** session.capabilities（§5.1 v1.0.6 + v1.0.7）：新建会话可选的「模式 / 权限 / 模型」目录
+   *  与真实归档能力标记。宿主不支持时返回空目录（客户端隐藏选择区，不报错）。 */
   sessionCapabilities(): Promise<DshrcCapabilities> {
     const p: DshrcPayload = {};
     return this.request(MSG_SESSION_CAPABILITIES, p, 15000).then((v: DshrcValue): DshrcCapabilities => {
@@ -751,9 +757,68 @@ export class DshrcLink {
         presets: v.presets !== undefined ? v.presets : [],
         permissions: v.permissions !== undefined ? v.permissions : [],
         defaultPreset: v.defaultPreset !== undefined ? v.defaultPreset : '',
-        defaultPermission: v.defaultPermission !== undefined ? v.defaultPermission : ''
+        defaultPermission: v.defaultPermission !== undefined ? v.defaultPermission : '',
+        models: v.models !== undefined ? v.models : [],
+        defaultModelId: v.defaultModelId !== undefined ? v.defaultModelId : '',
+        archiveSupported: v.archiveSupported === true
       };
       return caps;
+    });
+  }
+
+  /**
+   * session.archive / session.unarchive（§5.1 v1.0.7）：Workspace **真实归档**。
+   *  - archive：payload 带 stopActivity=false（默认不打断运行中的活动）；
+   *  - unarchive：幂等恢复。
+   *  返回 true = 主机已确认；false / reject = 主机拒绝（客户端不得本机假成功）。
+   */
+  sessionSetArchived(sessionId: string, archived: boolean): Promise<boolean> {
+    if (sessionId.length === 0) {
+      return Promise.reject(new Error('sessionId empty'));
+    }
+    if (archived) {
+      const p: DshrcPayload = { sessionId: sessionId, stopActivity: false };
+      return this.request(MSG_SESSION_ARCHIVE, p).then((v: DshrcValue): boolean => {
+        return v.archived === true;
+      });
+    }
+    const p2: DshrcPayload = { sessionId: sessionId };
+    return this.request(MSG_SESSION_UNARCHIVE, p2).then((v: DshrcValue): boolean => {
+      return v.archived === false;
+    });
+  }
+
+  /**
+   * session.selectModel（§5.1 v1.0.8）：对**已存在会话**切换模型/思考强度。
+   * 成功 resolve 归一化后的 selection（下一次 prompt 组装即生效）；
+   * Host 拒绝时 reject（错误原文带出）——调用方提示，不回退假成功。
+   */
+  sessionSelectModel(sessionId: string, model: DshrcModelSelection): Promise<DshrcModelSelection> {
+    if (sessionId.length === 0) {
+      return Promise.reject(new Error('sessionId empty'));
+    }
+    const p: DshrcPayload = { sessionId: sessionId, model: model };
+    return this.request(MSG_SESSION_SELECT_MODEL, p).then((v: DshrcValue): DshrcModelSelection => {
+      const sel: DshrcModelSelection | undefined = v.model;
+      if (sel === undefined) {
+        throw new Error('主机未返回模型结果');
+      }
+      return sel;
+    });
+  }
+
+  /**
+   * session.model（§5.1 v1.0.8）：查询会话当前模型/思考强度。
+   * 插件无记录（如刚重启）时 resolve null——调用方回退展示目录默认，不臆造。
+   */
+  sessionModel(sessionId: string): Promise<DshrcModelSelection | null> {
+    if (sessionId.length === 0) {
+      return Promise.reject(new Error('sessionId empty'));
+    }
+    const p: DshrcPayload = { sessionId: sessionId };
+    return this.request(MSG_SESSION_MODEL, p).then((v: DshrcValue): DshrcModelSelection | null => {
+      const sel: DshrcModelSelection | undefined = v.model;
+      return sel !== undefined ? sel : null;
     });
   }
 
@@ -785,9 +850,14 @@ export class DshrcLink {
     });
   }
 
-  /** session.create（§5.1）：返回新建会话的 sessionId。
-   *  v1.0.6：可带 agentPreset（模式）与 permission（权限档位，§5.8）。 */
-  sessionCreate(title: string, agentPreset?: string, permission?: string, cwd?: string): Promise<string> {
+  /**
+   * session.create（§5.1 v1.0.6 + v1.0.7）：返回创建结果。
+   *  - agentPreset（模式）/ permission（权限档位）/ model（模型选择，§5.8）；
+   *  - v1.0.7：会话已创建但模型设置失败时仍回成功并带 modelError——
+   *    调用方**不得重复创建**（sessionId 照常使用，提示「已用默认模型」）。
+   */
+  sessionCreate(title: string, agentPreset?: string, permission?: string, cwd?: string,
+    model?: DshrcModelSelection): Promise<DshrcCreateResult> {
     const p: DshrcPayload = {};
     if (title.length > 0) {
       p.title = title;
@@ -801,8 +871,21 @@ export class DshrcLink {
     if (cwd !== undefined && cwd.length > 0) {
       p.cwd = cwd;
     }
-    return this.request(MSG_SESSION_CREATE, p).then((v: DshrcValue): string => {
-      return v.sessionId !== undefined ? v.sessionId : '';
+    if (model !== undefined) {
+      p.model = model;
+    }
+    return this.request(MSG_SESSION_CREATE, p).then((v: DshrcValue): DshrcCreateResult => {
+      const res: DshrcCreateResult = {
+        sessionId: v.sessionId !== undefined ? v.sessionId : '',
+        agentPreset: v.agentPreset !== undefined ? v.agentPreset : ''
+      };
+      if (v.model !== undefined) {
+        res.model = v.model;
+      }
+      if (v.modelError !== undefined && v.modelError.length > 0) {
+        res.modelError = v.modelError;
+      }
+      return res;
     });
   }
 

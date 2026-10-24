@@ -11,7 +11,6 @@ import {
   FS_BODY,
   FS_CAPTION,
   FS_SMALL,
-  FS_SUBTITLE,
   HAIRLINE,
   RADIUS_BUBBLE,
   SP_1,
@@ -204,9 +203,12 @@ struct StepGroup {
           .fontSize(FS_SMALL)
           .fontColor($r('app.color.label_secondary'))
         Blank()
-        Text(this.open ? '⌄' : '›')
-          .fontSize(FS_SUBTITLE)
-          .fontColor($r('app.color.label_tertiary'))
+        // 固定尺寸符号（不依赖字体行高，收起/展开两态盒子完全一致）
+        SymbolGlyph(this.open ? $r('sys.symbol.chevron_down') : $r('sys.symbol.chevron_right'))
+          .fontSize(16)
+          .fontColor([$r('app.color.label_tertiary')])
+          .width(18)
+          .height(16)
       }
       .width('100%')
       .padding({ left: SP_1, right: SP_1, top: SP_1, bottom: SP_1 })
@@ -229,7 +231,58 @@ struct StepGroup {
   }
 }
 
-/** 统一时间线：按 kind 分派渲染（消息 / 工作步骤分组 / 系统说明行）。 */
+/**
+ * 「思考过程」折叠块（kind="reasoning"）：lightbulb 图标 + 标题 + 固定尺寸 chevron。
+ * 默认收起，点标题行展开/收起；正文用 item.text（FS_SMALL + label_secondary），
+ * 左缩进 + padding，刻意弱化——既不是等宽代码块，也不是助手气泡。
+ * 流式刷新：item 为 @Param，item.text 是 model 侧 @Trace 字段，原地增量更新即可自然刷新。
+ */
+@ComponentV2
+struct ReasoningCard {
+  @Require @Param item: TimelineItem;
+  /** 默认收起。 */
+  @Local expanded: boolean = false;
+
+  build() {
+    Column() {
+      Row() {
+        SymbolGlyph($r('sys.symbol.lightbulb'))
+          .fontSize(16)
+          .fontColor([$r('app.color.label_tertiary')])
+          .width(18)
+          .height(16)
+        Text('思考过程')
+          .fontSize(FS_SMALL)
+          .fontColor($r('app.color.label_secondary'))
+          .margin({ left: SP_2 })
+        Blank()
+        SymbolGlyph(this.expanded ? $r('sys.symbol.chevron_down') : $r('sys.symbol.chevron_right'))
+          .fontSize(16)
+          .fontColor([$r('app.color.label_tertiary')])
+          .width(18)
+          .height(16)
+      }
+      .width('100%')
+      .alignItems(VerticalAlign.Center)
+      .padding({ left: SP_1, right: SP_1, top: SP_1, bottom: SP_1 })
+      .onClick((): void => {
+        this.expanded = !this.expanded;
+      })
+
+      if (this.expanded) {
+        Text(this.item.text)
+          .fontSize(FS_SMALL)
+          .fontColor($r('app.color.label_secondary'))
+          .width('100%')
+          .padding({ left: SP_4, right: SP_2, top: SP_2, bottom: SP_2 })
+      }
+    }
+    .width('100%')
+    .margin({ bottom: SP_1 })
+  }
+}
+
+/** 统一时间线：按 kind 分派渲染（消息 / 工作步骤分组 / 思考过程 / 系统说明行）。 */
 @ComponentV2
 export struct TimelineView {
   @Require @Param items: TimelineItem[];
@@ -248,6 +301,9 @@ export struct TimelineView {
             StepGroup({ steps: cell.item.steps })
           } else if (cell.item.head.kind === 'system') {
             SystemNote({ item: cell.item.head })
+          } else if (cell.item.head.kind === 'reasoning') {
+            // 思考过程：独立折叠块，不进消息气泡、也不并入工作步骤分组
+            ReasoningCard({ item: cell.item.head })
           } else {
             MessageBubble({ item: cell.item.head, mdController: this.mdController })
           }

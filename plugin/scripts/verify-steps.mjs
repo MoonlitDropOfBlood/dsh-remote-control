@@ -1,7 +1,7 @@
-// scripts/verify-steps.mjs —— v1.0.6 新链路自检（dev-only，无外部依赖）。
+// scripts/verify-steps.mjs —— v1.0.6 / v1.0.7 新链路自检（dev-only，无外部依赖）。
 //
-// 用 mock ctx（假 sessionController / agentPresets / permissionPresets）+ 假 relay
-// 驱动真正的 HostBridge，覆盖契约 §5.7 / §5.8：
+// 用 mock ctx（假 sessionController / agentPresets / permissionPresets /
+// workspaceRegistry）+ 假 relay 驱动真正的 HostBridge，覆盖契约 §5.7 / §5.8 / §5.9：
 //   1. session/event 总闸 → tool.call / tool.result / system.message（§5.2 + §5.7）；
 //   2. session.history → steps（StepRecord，tool/call 与 tool/result 按 callId 配对）；
 //   3. session.capabilities → presets / permissions / defaultPreset / defaultPermission
@@ -11,9 +11,28 @@
 //   5. 宿主拒绝 preset → 回 unsupported-agent-preset；
 //   6. 降级：宿主没有 agentPresets / permissionPresets 服务 → 目录为空、
 //      创建照常成功（只 warn，不阻断）。
+//   7. v1.0.7 归档：session.list 补 archived、session.archive / session.unarchive、
+//      domain/changed → session.archives 广播、capabilities.archiveSupported；
+//   8. v1.0.7 模型：capabilities models / defaultModelId、session.create 带 model →
+//      selectModel；selectModel 失败仍回 sessionId + modelError（**不回 error**）；
+//   9. v1.0.7 思考：reasoning-delta → assistant.reasoningDelta；历史 reasoning 块
+//      独立成 role:"reasoning" 的 ChatMessage，排在正文之前。
 //
 // 用法：node scripts/verify-steps.mjs（在 plugin/ 目录下）
-import { HostBridge, mapHistorySteps, mapPermissionOptions } from "../lib/host-bridge.mjs";
+import {
+  HostBridge,
+  mapHistorySteps,
+  mapPermissionOptions,
+  modelCatalogToWire,
+  mapModelCatalog,
+  normalizeModelSelection,
+  parseModelSelection,
+  mapModelSelection,
+  mapReasoningEfforts,
+  mapHistoryMessages,
+  reasoningText,
+  contentText,
+} from "../lib/host-bridge.mjs";
 
 let pass = 0;
 let fail = 0;
@@ -392,6 +411,451 @@ function eventsOf(sent, topic) {
   const perm = mapPermissionOptions({ options: [{ value: "custom" }, { id: "a", name: "A" }], defaultPreset: "a" });
   check("mapPermissionOptions：跳过 custom、接受 id 字段", perm.permissions.length === 1 && perm.permissions[0].id === "a", JSON.stringify(perm));
   check("mapPermissionOptions：默认值", perm.defaultPermission === "a", JSON.stringify(perm));
+}
+
+// ===========================================================================
+// 场景 4（v1.0.7）：真实归档 —— list 补 archived / archive / unarchive / 广播
+// ===========================================================================
+{
+  const relay = makeRelay();
+  const archived = new Set(["sess-old"]);
+  const archiveCalls = [];
+  const unarchiveCalls = [];
+  const workspaceRegistry = {
+    get archivedSessionIds() {
+      return [...archived];
+    },
+    async archiveSession(sessionId, options) {
+      archiveCalls.push({ sessionId, options });
+      if (sessionId === "sess-busy") {
+        const e = new Error("session is active");
+        e.code = "workspace/active-session";
+        throw e;
+      }
+      archived.add(sessionId);
+    },
+    async unarchiveSession(sessionId) {
+      unarchiveCalls.push(sessionId);
+      archived.delete(sessionId);
+    },
+  };
+  const sessionController = {
+    async list() {
+      return {
+        items: [
+          { sessionId: "sess-old", cwd: "D:/x", running: false, updatedAt: 1 },
+          { sessionId: "sess-new", cwd: "D:/x", running: true, updatedAt: 2 },
+        ],
+      };
+    },
+  };
+  const ctx = makeCtx({ sessionController, workspaceRegistry });
+  const bridge = new HostBridge({ ctx, relay, push: { configured: false, notify: async () => ({ ok: true }) }, config: CFG, log });
+  bridge.attach();
+
+  // list：archived 来自注册表（**首屏即带**：归档早于插件启动、没有任何
+  // domain/changed 事件发生，也必须在首次 list 里就带 archived=true）
+  check("list 前没有任何 session.archives 广播", eventsOf(relay.sent, "session.archives").length === 0, JSON.stringify(relay.sent));
+  await bridge.dispatch({ id: "a-list", type: "session.list", ts: Date.now(), payload: {} });
+  const list = lastResult(relay.sent, "a-list");
+  const oldRow = list?.value?.sessions?.find((s) => s.sessionId === "sess-old");
+  const newRow = list?.value?.sessions?.find((s) => s.sessionId === "sess-new");
+  check("list：已归档会话带 archived=true（首屏即带）", oldRow?.archived === true, JSON.stringify(oldRow));
+  check("list：未归档会话带 archived=false", newRow?.archived === false, JSON.stringify(newRow));
+  check("list：已归档会话仍在列表里（不隐藏）", list?.value?.sessions?.some((s) => s.sessionId === "sess-old") === true, JSON.stringify(list?.value?.sessions?.map((s) => s.sessionId)));
+
+  // capabilities：archiveSupported
+  await bridge.dispatch({ id: "a-caps", type: "session.capabilities", ts: Date.now(), payload: {} });
+  const caps = lastResult(relay.sent, "a-caps");
+  check("capabilities：archiveSupported=true", caps?.value?.archiveSupported === true, JSON.stringify(caps?.value));
+
+  // archive
+  await bridge.dispatch({ id: "a-arch", type: "session.archive", ts: Date.now(), payload: { sessionId: "sess-new" } });
+  const arch = lastResult(relay.sent, "a-arch");
+  check("archive：回 {sessionId,archived:true}", arch?.value?.sessionId === "sess-new" && arch?.value?.archived === true, JSON.stringify(arch));
+  check("archive：调 workspaceRegistry.archiveSession(sid,{stopActivity:false})", archiveCalls[0]?.sessionId === "sess-new" && archiveCalls[0]?.options?.stopActivity === false, JSON.stringify(archiveCalls[0]));
+
+  // archive：stopActivity 透传
+  await bridge.dispatch({ id: "a-arch2", type: "session.archive", ts: Date.now(), payload: { sessionId: "sess-new", stopActivity: true } });
+  check("archive：stopActivity=true 透传", archiveCalls[1]?.options?.stopActivity === true, JSON.stringify(archiveCalls[1]));
+
+  // 宿主错误原样回传
+  await bridge.dispatch({ id: "a-busy", type: "session.archive", ts: Date.now(), payload: { sessionId: "sess-busy" } });
+  const busy = lastResult(relay.sent, "a-busy");
+  check("archive：宿主错误原样回传（code+message）", busy?.error?.code === "workspace/active-session" && busy?.error?.message === "session is active", JSON.stringify(busy));
+
+  // unarchive
+  await bridge.dispatch({ id: "a-un", type: "session.unarchive", ts: Date.now(), payload: { sessionId: "sess-old" } });
+  const un = lastResult(relay.sent, "a-un");
+  check("unarchive：回 {sessionId,archived:false}", un?.value?.sessionId === "sess-old" && un?.value?.archived === false, JSON.stringify(un));
+  check("unarchive：调 workspaceRegistry.unarchiveSession(sid)", unarchiveCalls[0] === "sess-old", JSON.stringify(unarchiveCalls));
+
+  // domain/changed → 广播归档全集
+  relay.sent.length = 0;
+  ctx.emit("domain/changed", { domain: "workspace", table: "", key: "", operation: "put", value: {} });
+  const archives = eventsOf(relay.sent, "session.archives");
+  check("domain/changed(workspace,'',put) → 广播 session.archives", archives.length === 1, JSON.stringify(archives));
+  check("session.archives 带全集 archivedSessionIds", Array.isArray(archives[0]?.archivedSessionIds) && archives[0].archivedSessionIds.includes("sess-new"), JSON.stringify(archives[0]));
+
+  // 其它 domain/table/operation 不触发
+  relay.sent.length = 0;
+  ctx.emit("domain/changed", { domain: "other", table: "", operation: "put" });
+  ctx.emit("domain/changed", { domain: "workspace", table: "x", operation: "put" });
+  ctx.emit("domain/changed", { domain: "workspace", table: "", operation: "deleted" });
+  check("非 workspace/''/put 的 domain/changed 不广播", eventsOf(relay.sent, "session.archives").length === 0, JSON.stringify(relay.sent));
+
+  bridge.dispose();
+}
+
+// ===========================================================================
+// 场景 5（v1.0.7）：没有 Workspace 注册表 → archiveSupported=false + 归档不可用
+// ===========================================================================
+{
+  const relay = makeRelay();
+  const sessionController = { async list() { return { items: [{ sessionId: "s1" }] }; } };
+  const ctx = makeCtx({ sessionController });
+  const bridge = new HostBridge({ ctx, relay, push: { configured: false, notify: async () => ({ ok: true }) }, config: CFG, log });
+  bridge.attach();
+
+  await bridge.dispatch({ id: "n-caps", type: "session.capabilities", ts: Date.now(), payload: {} });
+  const caps = lastResult(relay.sent, "n-caps");
+  check("无注册表 → archiveSupported=false", caps?.value?.archiveSupported === false, JSON.stringify(caps?.value));
+
+  await bridge.dispatch({ id: "n-list", type: "session.list", ts: Date.now(), payload: {} });
+  const list = lastResult(relay.sent, "n-list");
+  check("无注册表 → list 不产出 archived 字段", list?.value?.sessions?.[0] !== undefined && !("archived" in list.value.sessions[0]), JSON.stringify(list?.value?.sessions?.[0]));
+
+  await bridge.dispatch({ id: "n-arch", type: "session.archive", ts: Date.now(), payload: { sessionId: "s1" } });
+  const arch = lastResult(relay.sent, "n-arch");
+  check("无注册表 → archive 回 service-unavailable", arch?.error?.code === "service-unavailable", JSON.stringify(arch));
+  bridge.dispose();
+}
+
+// ===========================================================================
+// 场景 6（v1.0.7）：模型 —— capabilities models + create 带 model
+// ===========================================================================
+{
+  const relay = makeRelay();
+  const selected = [];
+  let selectModelFails = false;
+  const catalog = {
+    default: { provider: "deepseek", model: "deepseek-chat", reasoningEffort: "high" },
+    groups: [
+      {
+        id: "deepseek",
+        name: "DeepSeek",
+        models: [
+          { id: "deepseek-chat", name: "DeepSeek Chat", description: "通用", reasoning: { efforts: [{ id: "high" }], defaultEffort: "high" } },
+          { id: "deepseek-reasoner", name: "DeepSeek Reasoner" },
+        ],
+      },
+      { id: "zai", name: "ZAI", models: [{ id: "glm-4.6", name: "GLM 4.6" }] },
+    ],
+    failures: [],
+  };
+  const sessionController = {
+    async create() {
+      return { sessionId: "sess-m" };
+    },
+    async modelCatalog() {
+      return catalog;
+    },
+    async selectModel(req) {
+      selected.push(req);
+      if (selectModelFails) {
+        const e = new Error("model not available");
+        e.code = "session/model-unavailable";
+        throw e;
+      }
+      return { selected: { provider: req.provider, model: req.model, reasoningEffort: req.reasoningEffort } };
+    },
+  };
+  const ctx = makeCtx({ sessionController });
+  const bridge = new HostBridge({ ctx, relay, push: { configured: false, notify: async () => ({ ok: true }) }, config: CFG, log });
+  bridge.attach();
+
+  // capabilities：models 拍平
+  await bridge.dispatch({ id: "m-caps", type: "session.capabilities", ts: Date.now(), payload: {} });
+  const caps = lastResult(relay.sent, "m-caps");
+  const models = caps?.value?.models;
+  check("capabilities：models 拍平 groups", Array.isArray(models) && models.length === 3, JSON.stringify(models));
+  check("ModelOption.id = provider/model", models?.[0]?.id === "deepseek/deepseek-chat", JSON.stringify(models?.[0]));
+  check("ModelOption.provider/model 分列", models?.[0]?.provider === "deepseek" && models?.[0]?.model === "deepseek-chat", JSON.stringify(models?.[0]));
+  check("ModelOption.name/description", models?.[0]?.name === "DeepSeek Chat" && models?.[0]?.description === "通用", JSON.stringify(models?.[0]));
+  check("ModelOption.reasoningEffort 取 reasoning.defaultEffort", models?.[0]?.reasoningEffort === "high", JSON.stringify(models?.[0]));
+  check("无 reasoning 的模型不带 reasoningEffort", models?.[1]?.reasoningEffort === undefined, JSON.stringify(models?.[1]));
+  check("capabilities：defaultModelId 由 catalog.default 生成", caps?.value?.defaultModelId === "deepseek/deepseek-chat", JSON.stringify(caps?.value?.defaultModelId));
+
+  // create 带 model → selectModel
+  await bridge.dispatch({
+    id: "m-create",
+    type: "session.create",
+    ts: Date.now(),
+    payload: { model: { provider: "zai", model: "glm-4.6", reasoningEffort: "max" } },
+  });
+  const created = lastResult(relay.sent, "m-create");
+  check("create：回 sessionId", created?.value?.sessionId === "sess-m", JSON.stringify(created));
+  check("create：调 selectModel({sessionId,provider,model,reasoningEffort})", selected[0]?.sessionId === "sess-m" && selected[0]?.provider === "zai" && selected[0]?.model === "glm-4.6" && selected[0]?.reasoningEffort === "max", JSON.stringify(selected[0]));
+  check("create：回 model=归一化后的 selection", created?.value?.model?.provider === "zai" && created?.value?.model?.model === "glm-4.6", JSON.stringify(created?.value?.model));
+
+  // selectModel 失败：仍回 sessionId + modelError（**绝不能回 error**）
+  selectModelFails = true;
+  await bridge.dispatch({
+    id: "m-fail",
+    type: "session.create",
+    ts: Date.now(),
+    payload: { model: { provider: "deepseek", model: "nope" } },
+  });
+  const failed = lastResult(relay.sent, "m-fail");
+  check("selectModel 失败：仍回 ok + sessionId（手机不得重复创建）", failed?.value?.sessionId === "sess-m" && failed?.error === undefined, JSON.stringify(failed));
+  check("selectModel 失败：附 modelError", typeof failed?.value?.modelError === "string" && failed.value.modelError.includes("model not available"), JSON.stringify(failed?.value?.modelError));
+
+  bridge.dispose();
+}
+
+// ===========================================================================
+// 场景 7（v1.0.7）：思考 —— reasoning-delta 事件 + 历史 reasoning 消息
+// ===========================================================================
+{
+  const relay = makeRelay();
+  const events = [
+    {
+      type: "assistant/message",
+      seq: 20,
+      time: 3000,
+      surfaceOp: "append",
+      data: {
+        turn: 1,
+        step: 1,
+        message: {
+          content: [
+            { type: "reasoning", text: "先想想…" },
+            { type: "text", text: "结论如下" },
+          ],
+        },
+      },
+    },
+    {
+      type: "assistant/message",
+      seq: 21,
+      time: 3100,
+      surfaceOp: "append",
+      data: { turn: 1, step: 2, message: { content: [{ type: "reasoning", text: "只有思考" }] } },
+    },
+  ];
+  const sessionController = {
+    async inspect() {
+      return { events };
+    },
+    async page() {
+      return { records: events.map((e) => ({ event: e })), hasMore: false };
+    },
+  };
+  const ctx = makeCtx({ sessionController });
+  const bridge = new HostBridge({ ctx, relay, push: { configured: false, notify: async () => ({ ok: true }) }, config: CFG, log });
+  bridge.attach();
+
+  // history：reasoning 独立成条，排在正文之前
+  await bridge.dispatch({ id: "r-hist", type: "session.history", ts: Date.now(), payload: { sessionId: "sess-r" } });
+  const hist = lastResult(relay.sent, "r-hist");
+  const messages = hist?.value?.messages ?? [];
+  check("history：reasoning 独立成条且排在正文之前", messages.length === 3 && messages[0]?.role === "reasoning" && messages[1]?.role === "assistant", JSON.stringify(messages));
+  check("history：reasoning id = sessionId:seq:reasoning", messages[0]?.id === "sess-r:20:reasoning", JSON.stringify(messages[0]));
+  check("history：reasoning 与正文同 seq/ts", messages[0]?.seq === 20 && messages[0]?.ts === 3000 && messages[1]?.seq === 20 && messages[1]?.ts === 3000, JSON.stringify(messages.slice(0, 2)));
+  check("history：正文不含思考文本", messages[1]?.text === "结论如下", JSON.stringify(messages[1]));
+  check("history：只有思考块也产出 reasoning 消息", messages[2]?.role === "reasoning" && messages[2]?.text === "只有思考", JSON.stringify(messages[2]));
+
+  // live：reasoning-delta → assistant.reasoningDelta；text-delta 仍走 assistant.delta
+  relay.sent.length = 0;
+  const liveSession = { id: "sess-r" };
+  ctx.emit("agent/assistant-stream", {
+    agent: { session: { id: liveSession.id } },
+    frame: { type: "chunk", chunk: { type: "reasoning-delta", text: "思考中…" } },
+  });
+  ctx.emit("agent/assistant-stream", {
+    agent: { session: { id: liveSession.id } },
+    frame: { type: "chunk", chunk: { type: "text-delta", text: "正文" } },
+  });
+  // 结束 turn → 两个缓冲分别冲刷
+  ctx.emit("agent/status", { agent: { session: { id: liveSession.id } }, status: "idle" });
+  const reasoningEvents = eventsOf(relay.sent, "assistant.reasoningDelta");
+  const textEvents = eventsOf(relay.sent, "assistant.delta");
+  check("live：reasoning-delta → assistant.reasoningDelta", reasoningEvents.length === 1 && reasoningEvents[0]?.text === "思考中…" && reasoningEvents[0]?.sessionId === "sess-r", JSON.stringify(reasoningEvents));
+  check("live：text-delta 仍走 assistant.delta（分流）", textEvents.length === 1 && textEvents[0]?.text === "正文", JSON.stringify(textEvents));
+  check("live：思考不进 assistant.delta", !eventsOf(relay.sent, "assistant.delta").some((d) => (d.text ?? "").includes("思考中")), JSON.stringify(textEvents));
+
+  bridge.dispose();
+}
+
+// ===========================================================================
+// 纯函数：mapModelCatalog / normalizeModelSelection / mapHistoryMessages
+// ===========================================================================
+{
+  const cat = mapModelCatalog({
+    default: { provider: "p", model: "m" },
+    groups: [{ id: "p", name: "P", models: [{ id: "m", name: "M", reasoning: { defaultEffort: "low" } }] }],
+  });
+  check("mapModelCatalog：id=provider/model", cat.models[0]?.id === "p/m", JSON.stringify(cat.models[0]));
+  check("mapModelCatalog：defaultModelId", cat.defaultModelId === "p/m", JSON.stringify(cat.defaultModelId));
+  check("mapModelCatalog：空目录", mapModelCatalog({}).models.length === 0 && mapModelCatalog({}).defaultModelId === "", JSON.stringify(mapModelCatalog({})));
+  check("mapModelCatalog：非法输入不抛", mapModelCatalog(null).models.length === 0, "null");
+
+  check("normalizeModelSelection：正常", JSON.stringify(normalizeModelSelection({ provider: "a", model: "b", reasoningEffort: "high" })) === JSON.stringify({ provider: "a", model: "b", reasoningEffort: "high" }), JSON.stringify(normalizeModelSelection({ provider: "a", model: "b" })));
+  check("normalizeModelSelection：缺字段回 null", normalizeModelSelection({ provider: "a" }) === null && normalizeModelSelection(null) === null, "null");
+  check("normalizeModelSelection：不从 id 反拆", normalizeModelSelection({ id: "a/b" }) === null, "null");
+
+  check("reasoningText：只取 reasoning 块", reasoningText([{ type: "reasoning", text: "a" }, { type: "text", text: "b" }]) === "a", reasoningText([{ type: "reasoning", text: "a" }]));
+  check("contentText 不含 reasoning", contentText([{ type: "reasoning", text: "a" }, { type: "text", text: "b" }]) === "b", contentText([{ type: "reasoning", text: "a" }]));
+
+  const msgs = mapHistoryMessages("s", {
+    event: { type: "assistant/message", seq: 3, time: 9, surfaceOp: "append", data: { message: { content: [{ type: "reasoning", text: "r" }, { type: "text", text: "t" }] } } },
+  });
+  check("mapHistoryMessages：两条（reasoning 在前）", msgs.length === 2 && msgs[0].role === "reasoning" && msgs[1].role === "assistant", JSON.stringify(msgs));
+  check("mapHistoryMessages：非对话事件回空数组", mapHistoryMessages("s", { event: { type: "tool/call", seq: 1 } }).length === 0, "[]");
+}
+
+// ===========================================================================
+// 场景 8（v1.0.8）：思考强度目录 + 会话中切换模型
+// ===========================================================================
+{
+  const relay = makeRelay();
+  const selected = [];
+  let selectFails = false;
+  const catalog = {
+    default: { provider: "deepseek", model: "deepseek-chat", reasoningEffort: "high" },
+    groups: [
+      {
+        id: "deepseek",
+        name: "DeepSeek",
+        models: [
+          {
+            id: "deepseek-chat",
+            name: "DeepSeek Chat",
+            description: "通用",
+            reasoning: {
+              efforts: [
+                { id: "minimal", name: "最少" },
+                { id: "low", name: "低", description: "更快" },
+                { id: "high", name: "高" },
+              ],
+              defaultEffort: "high",
+            },
+          },
+          { id: "deepseek-plain", name: "Plain" }, // 无 reasoning → 不产出 efforts
+        ],
+      },
+    ],
+  };
+  const sessionController = {
+    async modelCatalog() {
+      return catalog;
+    },
+    async selectModel(req) {
+      selected.push(req);
+      if (selectFails) {
+        const e = new Error("model is not available");
+        e.code = "session/model-unavailable";
+        throw e;
+      }
+      return { selected: { provider: req.provider, model: req.model, reasoningEffort: req.reasoningEffort } };
+    },
+  };
+  const ctx = makeCtx({ sessionController });
+  const bridge = new HostBridge({ ctx, relay, push: { configured: false, notify: async () => ({ ok: true }) }, config: CFG, log });
+  bridge.attach();
+
+  // capabilities：efforts 目录
+  await bridge.dispatch({ id: "v-caps", type: "session.capabilities", ts: Date.now(), payload: {} });
+  const caps = lastResult(relay.sent, "v-caps");
+  const opt = caps?.value?.models?.[0];
+  check("capabilities：ModelOption.efforts 拍平 reasoning.efforts", Array.isArray(opt?.efforts) && opt.efforts.length === 3, JSON.stringify(opt));
+  check("efforts 字段：id/name/description", opt?.efforts?.[1]?.id === "low" && opt?.efforts?.[1]?.name === "低" && opt?.efforts?.[1]?.description === "更快", JSON.stringify(opt?.efforts?.[1]));
+  check("efforts：name 回退 id", opt?.efforts?.[0]?.name === "最少" && opt?.efforts?.[0]?.description === "", JSON.stringify(opt?.efforts?.[0]));
+  check("无 reasoning 的模型不产出 efforts", caps?.value?.models?.[1]?.efforts === undefined, JSON.stringify(caps?.value?.models?.[1]));
+  check("capabilities：reasoningEffort 仍取 defaultEffort", opt?.reasoningEffort === "high", JSON.stringify(opt?.reasoningEffort));
+
+  // session.model：初始为 null（内存态为空）
+  await bridge.dispatch({ id: "v-model0", type: "session.model", ts: Date.now(), payload: { sessionId: "sess-v" } });
+  const m0 = lastResult(relay.sent, "v-model0");
+  check("session.model：未追踪到时回 null（不臆造）", m0?.value?.model === null && m0?.error === undefined, JSON.stringify(m0));
+
+  // session.selectModel：成功
+  await bridge.dispatch({
+    id: "v-sel",
+    type: "session.selectModel",
+    ts: Date.now(),
+    payload: { sessionId: "sess-v", model: { provider: "deepseek", model: "deepseek-chat", reasoningEffort: "low" } },
+  });
+  const sel = lastResult(relay.sent, "v-sel");
+  check("selectModel：成功回 {model}", sel?.value?.model?.provider === "deepseek" && sel?.value?.model?.model === "deepseek-chat" && sel?.value?.model?.reasoningEffort === "low", JSON.stringify(sel));
+  check("selectModel：调宿主 selectModel({sessionId,...selection})", selected[0]?.sessionId === "sess-v" && selected[0]?.provider === "deepseek" && selected[0]?.model === "deepseek-chat" && selected[0]?.reasoningEffort === "low", JSON.stringify(selected[0]));
+
+  // session.selectModel：无效 selection → result.error
+  await bridge.dispatch({ id: "v-bad", type: "session.selectModel", ts: Date.now(), payload: { sessionId: "sess-v", model: { id: "a/b" } } });
+  const bad = lastResult(relay.sent, "v-bad");
+  check("selectModel：无效 selection 回 error", bad?.error?.code === "bad-params" && bad?.value === undefined, JSON.stringify(bad));
+
+  // session.selectModel：宿主拒绝 → 原文带出（不假成功）
+  selectFails = true;
+  await bridge.dispatch({
+    id: "v-reject",
+    type: "session.selectModel",
+    ts: Date.now(),
+    payload: { sessionId: "sess-v", model: { provider: "deepseek", model: "nope" } },
+  });
+  const rej = lastResult(relay.sent, "v-reject");
+  check("selectModel：宿主拒绝回原文 error", rej?.error?.code === "session/model-unavailable" && rej?.error?.message === "model is not available" && rej?.value === undefined, JSON.stringify(rej));
+  selectFails = false;
+
+  // model/selection 事件 → 内存态 + session.modelChanged 广播
+  relay.sent.length = 0;
+  ctx.emit("session/event", { id: "sess-v" }, { type: "model/selection", seq: 30, time: 4000, data: { provider: "deepseek", model: "deepseek-chat", reasoningEffort: "minimal" } });
+  const changed = eventsOf(relay.sent, "session.modelChanged");
+  check("model/selection → 广播 session.modelChanged", changed.length === 1, JSON.stringify(changed));
+  check("session.modelChanged 字段", changed[0]?.sessionId === "sess-v" && changed[0]?.model?.provider === "deepseek" && changed[0]?.model?.model === "deepseek-chat" && changed[0]?.model?.reasoningEffort === "minimal", JSON.stringify(changed[0]));
+
+  await bridge.dispatch({ id: "v-model1", type: "session.model", ts: Date.now(), payload: { sessionId: "sess-v" } });
+  const m1 = lastResult(relay.sent, "v-model1");
+  check("session.model：追踪到后回当前 selection", m1?.value?.model?.reasoningEffort === "minimal", JSON.stringify(m1));
+
+  // 无 reasoningEffort 的事件 → 省略该字段
+  relay.sent.length = 0;
+  ctx.emit("session/event", { id: "sess-v2" }, { type: "model/selection", seq: 31, time: 4100, data: { provider: "zai", model: "glm-4.6" } });
+  const changed2 = eventsOf(relay.sent, "session.modelChanged");
+  check("model/selection 无 reasoningEffort → 省略该字段", changed2[0]?.model?.provider === "zai" && changed2[0]?.model?.reasoningEffort === undefined, JSON.stringify(changed2[0]));
+
+  await bridge.dispatch({ id: "v-model2", type: "session.model", ts: Date.now(), payload: { sessionId: "sess-v2" } });
+  const m2 = lastResult(relay.sent, "v-model2");
+  check("session.model：无 reasoningEffort 的 selection", m2?.value?.model?.model === "glm-4.6" && m2?.value?.model?.reasoningEffort === undefined, JSON.stringify(m2));
+
+  // 另一个会话的模型状态不串台
+  await bridge.dispatch({ id: "v-model3", type: "session.model", ts: Date.now(), payload: { sessionId: "sess-other" } });
+  const m3 = lastResult(relay.sent, "v-model3");
+  check("session.model：未追踪的会话回 null", m3?.value?.model === null, JSON.stringify(m3));
+
+  bridge.dispose();
+}
+
+// ===========================================================================
+// 纯函数：modelCatalogToWire / mapReasoningEfforts / parseModelSelection
+// ===========================================================================
+{
+  const cat = modelCatalogToWire({
+    default: { provider: "p", model: "m" },
+    groups: [
+      {
+        id: "p",
+        name: "P",
+        models: [{ id: "m", name: "M", reasoning: { efforts: [{ id: "high", name: "高" }], defaultEffort: "high" } }],
+      },
+    ],
+  });
+  check("modelCatalogToWire：efforts 拍平", cat.models[0]?.efforts?.[0]?.id === "high", JSON.stringify(cat.models[0]));
+  check("modelCatalogToWire：无 efforts 的模型不带该字段", modelCatalogToWire({ groups: [{ id: "p", models: [{ id: "x" }] }] }).models[0]?.efforts === undefined, "undefined");
+  check("mapReasoningEfforts：跳过非法项", mapReasoningEfforts([{ id: "" }, { id: "a", name: "A" }]).length === 1, JSON.stringify(mapReasoningEfforts([{ id: "" }, { id: "a" }])));
+  check("mapReasoningEfforts：name 回退 id + description 空串", mapReasoningEfforts([{ id: "a" }])[0]?.name === "a" && mapReasoningEfforts([{ id: "a" }])[0]?.description === "", JSON.stringify(mapReasoningEfforts([{ id: "a" }])));
+  check("parseModelSelection：无效回 null", parseModelSelection({ provider: "a" }) === null && parseModelSelection("x") === null, "null");
+  check("mapModelSelection：省略空 reasoningEffort", mapModelSelection({ provider: "a", model: "b", reasoningEffort: "" })?.reasoningEffort === undefined, JSON.stringify(mapModelSelection({ provider: "a", model: "b" })));
 }
 
 console.log("");

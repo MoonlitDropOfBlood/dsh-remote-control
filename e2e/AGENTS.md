@@ -23,15 +23,30 @@ probe-raw.mjs     原始帧探针（看帧顶层字段，如 sid 是否透传）
 node -e "import('./protocol.mjs').then(m=>{m.assertKat();console.log('KAT OK')})"
 node mock-host.mjs ws://127.0.0.1:8788 KMNPQRTVWXY23456 <secret>     # 终端 1
 node mock-phone.mjs ws://127.0.0.1:8788 KMNPQRTVWXY23456 <secret>   # 终端 2
-node auto-test.mjs ws://127.0.0.1:8788                               # 真实插件链路
+node auto-test.mjs ws://127.0.0.1:8788                               # 真实插件链路（见下方警告）
 ```
+
+## ⚠️ 手机在线时不要跑 auto-test.mjs 的真实宿主链路
+
+- 中继是「**同 channel 同 role 单活跃连接：新顶旧**」（契约 §4）。手机与
+  `node auto-test.mjs` 用**同一个 channel + client 角色**时，两边会互相顶替：
+  中继把旧的踢掉 → 旧的自动重连 → 又把新的踢掉 → **每秒互抢**，手机被反复断连。
+- 因此：**真实手机在线时不要直接跑 `auto-test.mjs` 的真实宿主链路**（它默认读
+  `~/.dsh/remote-control/config.json` 的真实 channel + relayUrl）。
+  要跑真实链路，先让手机离线；或用**独立临时 channel/端口**另起一套
+  （临时 relay + 临时 config.json + `DSH_HOME=<临时目录>`），别用真实 channel。
+- **v1.0.6 的 loopback 用例不受影响**：它是进程内直连回环（自带临时
+  channel/secret，不经中继、不占真实 channel），恒跑、不会碰到手机。
+- link.mjs 已做防护：收到中继 `replaced` / `bad-hello` 错误帧即**停心跳、停自动重连**
+  （close 回调不复活），避免互抢成死循环；`close()` 幂等。
 
 ## 关键约定
 
 - 本目录代码是**验证工具**，不是产品代码：协议改动时三方（plugin/app/e2e）同步改，
   但 KAT 向量永远不变。
 - channel 示例必须用合法 RFC4648 base32（`^[A-Z2-7]{16,64}$`，如 KMNPQRTVWXY23456）
-  ——历史上示例串带 8/9 被中继 bad-hello 拒过。
+  ——历史上示例串带 8/9 被中继 bad-hello 拒过。**注意数字只能是 2-7**（没有 0/1/8/9），
+  临时 channel 也别写成 `TMP…TEST1` 这种含 1 的串。
 - link.mjs 的 outbox（未 open 时缓冲发送）与 sid:seq 去重是踩坑后补的，别删：
   请求早于 WS open 会被静默丢弃；裸 seq 去重会误杀新连接的 seq=1。
 - **LoopbackLink 的 seq 必须在 send 时刻定格**：连续多次 send 会把多帧排进微任务队列，

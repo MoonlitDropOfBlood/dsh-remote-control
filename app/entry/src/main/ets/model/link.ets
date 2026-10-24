@@ -191,6 +191,8 @@ export class Correlator {
  * idle/deriving → connecting(ws connect) → handshaking(hello/welcome) → online
  * 任意在线态断开 → reconnecting（指数退避）→ connecting …
  * stop() → stopped；配置非法或 hello 被拒 → error。
+ * 终局错误（relay: bad-hello / channel-full / replaced）→ error 并**停止自动重连**
+ *   （不置 reconnecting，否则「重连 → 再次被顶替」死循环，UI 永远停在「重连中」）。
  */
 export class DshrcLink {
   private ws: webSocket.WebSocket | null = null;
@@ -476,17 +478,23 @@ export class DshrcLink {
       case FRAME_ERROR: {
         const code: string = frame.code !== undefined ? frame.code : '?';
         this.log('relay error: ' + code + ' ' + (frame.message !== undefined ? frame.message : ''));
-        if (code === 'bad-hello') {
-          // 鉴权失败，重连无意义
+        // 终局错误（契约 §4）：鉴权失败 bad-hello / 频道被占 channel-full /
+        // 被同 role 的新连接顶替 replaced —— 重连没有意义（replaced 会「重连→再被顶替」
+        // 死循环，UI 永远停在「重连中」），必须停掉自动重连并落到 error。
+        if (code === 'bad-hello' || code === 'channel-full' || code === 'replaced') {
           this.shouldRun = false;
+          this.clearHeartbeatTimer();
+          this.clearHelloTimer();
+          this.clearReconnectTimer();
           this.setState('error');
-          this.stopInternal('bad-hello');
-        } else if (code === 'channel-full') {
-          this.shouldRun = false;
-          this.setState('error');
-          this.stopInternal('channel-full');
+          this.peers = { host: false, client: false };
+          this.emitPeers();
+          // 关掉当前 ws（内部同样清 timer + reject pending 请求）；
+          // 随后的 close 事件由 onWsDown 兜底：state 已是 error → 保持 error，不再重连。
+          this.stopInternal('relay-' + code);
+          this.log('relay terminal error: ' + code + ', auto reconnect stopped');
         }
-        // rate-limited / replaced：交给重连退避
+        // rate-limited 等非终局错误：交给退避重连（onWsDown 统一处理）
         break;
       }
       default: {
@@ -574,15 +582,34 @@ export class DshrcLink {
     return false;
   }
 
-  /** 连接下行（断开/出错）：退避重连。 */
+  /**
+   * 连接下行（断开/出错）：退避重连。
+   *
+   * 状态机约束（v1.0.6 修复）：
+   *  - 终局态（stopped / error / shouldRun=false / 无配置）**一律不置 reconnecting**——
+   *    否则 UI 会停在「重连中」而实际上没有任何重连定时器（看着像在重连，其实已经死了）。
+   *  - 只有确实要 schedule 重连时，才置 reconnecting。
+   *  - 终局错误路径（relay bad-hello / channel-full / replaced）先置 error，
+   *    随后的 close 事件进来时保持 error，不再退避重连。
+   */
   private onWsDown(reason: string): void {
     this.clearHeartbeatTimer();
     this.clearHelloTimer();
+    this.clearReconnectTimer();
     this.ws = null;
     this.correlator.rejectAll('connection lost: ' + reason);
     this.peers = { host: false, client: false };
     this.emitPeers();
-    if (!this.shouldRun) {
+    // 用户主动停止 → 保持 stopped，不再重连
+    if (this.state === 'stopped') {
+      return;
+    }
+    // 不该再跑（shouldRun=false：终局错误或用户停止）或没有配置：
+    // 已是 error 就保持 error，否则落 stopped；**不得**置 reconnecting。
+    if (!this.shouldRun || this.cfg === null) {
+      if (this.state !== 'error') {
+        this.setState('stopped');
+      }
       return;
     }
     this.reconnectAttempts = this.reconnectAttempts + 1;
@@ -591,7 +618,6 @@ export class DshrcLink {
     const delay: number = Math.round(cap * jitter);
     this.setState('reconnecting');
     this.log('reconnect in ' + delay.toString() + 'ms (attempt ' + this.reconnectAttempts.toString() + ')');
-    this.clearReconnectTimer();
     this.reconnectTimerId = setTimeout(() => {
       this.reconnectTimerId = -1;
       this.connectOnce();

@@ -2,9 +2,24 @@
 // mock-phone 与 mock-host 共用。依赖 Node ≥22 全局 WebSocket。
 import { deriveKey, helloSig, seal, open, msg, Correlator } from "./protocol.mjs";
 
+/**
+ * 中继级**致命**错误：重连无意义，收到后必须停心跳、停止自动重连。
+ *   - `replaced`：同 channel 同 role 有新连接顶替了我们（中继 §4「同 channel 同 role
+ *     单活跃连接：新顶旧」）。真实手机在线时再跑 auto-test 的真实宿主链路就会踩到：
+ *     两边每秒互抢（手机被顶 → 手机重连 → 顶掉我们 → 我们重连 …）。
+ *   - `bad-hello`：握手被拒（channel/role/token 不合法），再连也是被拒。
+ * 其它错误（rate-limited / transient）保持原有退避重连逻辑。
+ */
+export const FATAL_ERROR_CODES = new Set(["replaced", "bad-hello"]);
+
+/** 中继顶替旧连接时的 WS close code（relay/server.js：old.ws.close(4001, …)）。 */
+const REPLACED_CLOSE_CODE = 4001;
+
 export class RelayLink {
   #heartbeat;
   #outbox;
+  #reconnectTimer = null;
+  #fatalCode = "";
   /**
    * @param {{relayUrl:string, channel:string, secret:string, role:"host"|"client",
    *          onMessage:(m:any)=>void, onStatus?:(s:string)=>void, onPeer?:(joined:boolean, role:string)=>void}} opts
@@ -21,6 +36,11 @@ export class RelayLink {
     this.peers = { host: false, client: false };
     this.#connect();
     this.#heartbeat = setInterval(() => this.#tick(), 30000);
+  }
+
+  /** 致命错误后的错误码（空串 = 没发生过致命错误）。 */
+  get fatalCode() {
+    return this.#fatalCode;
   }
 
   #connect() {
@@ -41,11 +61,21 @@ export class RelayLink {
       );
     });
     this.ws.addEventListener("message", (ev) => this.#onRaw(String(ev.data)));
-    this.ws.addEventListener("close", () => {
+    this.ws.addEventListener("close", (ev) => {
       if (this.closed) return;
+      // 中继以 4001 关闭 = 被同 role 的新连接顶替（即使没收到 error 帧也不能再连，
+      // 否则会和新连接互抢到天荒地老）。
+      if (ev?.code === REPLACED_CLOSE_CODE) {
+        this.#fatal("replaced", typeof ev.reason === "string" ? ev.reason : "replaced by a newer connection");
+        return;
+      }
       this.opts.onStatus?.("disconnected");
       const delay = this.#nextBackoff();
-      setTimeout(() => this.#connect(), delay);
+      this.#reconnectTimer = setTimeout(() => {
+        this.#reconnectTimer = null;
+        if (this.closed) return; // close() / 致命错误之后不复活
+        this.#connect();
+      }, delay);
     });
     this.ws.addEventListener("error", () => {
       try {
@@ -54,6 +84,30 @@ export class RelayLink {
         /* already closing */
       }
     });
+  }
+
+  /**
+   * 致命错误：停心跳 + 停自动重连（close 回调不得复活本连接）。
+   * 幂等：重复调用无副作用。
+   */
+  #fatal(code, message) {
+    if (this.closed) return;
+    this.closed = true; // 必须先置位：随后的 close 回调才不会重连
+    this.#fatalCode = typeof code === "string" ? code : "";
+    if (this.#reconnectTimer !== null) {
+      clearTimeout(this.#reconnectTimer);
+      this.#reconnectTimer = null;
+    }
+    if (this.#heartbeat !== null && this.#heartbeat !== undefined) {
+      clearInterval(this.#heartbeat);
+      this.#heartbeat = null;
+    }
+    this.opts.onStatus?.("fatal: " + this.#fatalCode + " " + (message ?? ""));
+    try {
+      this.ws?.close();
+    } catch {
+      /* already closing */
+    }
   }
 
   #nextBackoff() {
@@ -92,9 +146,17 @@ export class RelayLink {
         break;
       case "pong":
         break;
-      case "error":
-        this.opts.onStatus?.("error: " + f.code + " " + f.message);
+      case "error": {
+        const code = typeof f.code === "string" ? f.code : "";
+        const message = typeof f.message === "string" ? f.message : "";
+        if (FATAL_ERROR_CODES.has(code)) {
+          // 致命：不再自动重连（否则同 channel 同 role 会互抢到天荒地老）
+          this.#fatal(code, message);
+          return;
+        }
+        this.opts.onStatus?.("error: " + code + " " + message);
         break;
+      }
       case "frame": {
         // 契约 §4 v1.0.2：去重键 = sid:seq（缺 sid 按 legacy）
         const sid = typeof f.sid === "string" && f.sid !== "" ? f.sid : "legacy";
@@ -135,6 +197,7 @@ export class RelayLink {
   }
 
   #tick() {
+    if (this.closed) return; // 致命错误 / close() 之后不再心跳
     if (Date.now() - this.lastTraffic > 90000) {
       try {
         this.ws?.close();
@@ -148,9 +211,11 @@ export class RelayLink {
 
   /** 发送一条业务消息（自动加密 + sid/seq） */
   send(message, urgent = false) {
+    if (this.closed) return false; // 致命错误 / close() 之后不再发（也不进 outbox 缓冲）
     this.seq += 1;
     const data = seal(this.key, this.opts.role, this.seq, message);
     this.#sendRelay({ t: "frame", sid: this.sid, seq: this.seq, data, urgent });
+    return true;
   }
 
   /** 请求-响应 */
@@ -158,9 +223,17 @@ export class RelayLink {
     return this.corr.request((m) => this.send(m), type, payload, timeoutMs);
   }
 
+  /** 关闭连接：幂等（可重复调用；致命错误后调用同样安全，不会复活连接）。 */
   close() {
     this.closed = true;
-    clearInterval(this.#heartbeat);
+    if (this.#reconnectTimer !== null) {
+      clearTimeout(this.#reconnectTimer);
+      this.#reconnectTimer = null;
+    }
+    if (this.#heartbeat !== null && this.#heartbeat !== undefined) {
+      clearInterval(this.#heartbeat);
+      this.#heartbeat = null;
+    }
     try {
       this.ws?.close();
     } catch {

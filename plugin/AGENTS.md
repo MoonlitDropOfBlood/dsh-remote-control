@@ -35,7 +35,7 @@ node scripts/verify-qr.mjs && node scripts/verify-pairing.mjs           # QR/配
 node scripts/verify-steps.mjs                                          # v1.0.9 步骤/模式/权限/归档/模型/思考/强度 + 图片回归（无依赖，154 项）
 node scripts/verify-images.mjs                                         # v1.0.9 图片专项：元数据映射/缩略图降级/image.fetch 缓存与报错/帧预算守卫（无依赖，88 项）
 node scripts/verify-settings.mjs                                       # v1.1.x 设置页/manifest/combo/信封自检 + Host 真跑一遍（112 项）
-node scripts/verify-relay-supervisor.mjs                               # v1.1.1 中继进程托管：决策/端口占用不抢/启停/看门狗/跨平台/bundle（无依赖，121 项）
+node scripts/verify-relay-supervisor.mjs                               # v1.1.1 中继进程托管：决策/端口占用不抢/启停/看门狗/跨平台/bundle（无依赖，131 项）
 node scripts/sync-client-icon.mjs                                      # 改了 icon.svg 后同步 client.js 的图标 data-uri
 ```
 
@@ -258,11 +258,21 @@ node scripts/sync-client-icon.mjs                                      # 改了 
   改完 `relay/server.js` **必须**跑 `node scripts/vendor-relay.mjs` 重新生成。
 - **设置页可见**：`getPairing()` / `setRelayUrl()` 的 value 带 `relayProcess`
   `{managed, running, pid, port, detail, external}`，设置页「中继进程」一行显示「插件托管 · 运行中（pid N）」。
-- 回归：`node scripts/verify-relay-supervisor.mjs` **121 项**（纯函数决策 / 远端不托管 /
+- 回归：`node scripts/verify-relay-supervisor.mjs` **131 项**（纯函数决策 / 远端不托管 /
   autoStart=false / 找不到入口 / 端口占用不抢 / **真 relay/server.js 的看门狗与 shutdown 通道** /
   手工启动行为不变 / 改端口换进程 / 并发 ensure 只 spawn 一次 / 崩溃后重拉 /
   dispose 后不拉起 / unref 时机 / 跨平台 env 与停止语义 / 看门狗判定纯函数 /
-  **bundle 形态**：vendor 副本同步 + 包内含 vendor + 依赖 ws + bundle 布局能解析到入口）。
+  **bundle 形态**：vendor 副本同步 + 包内含 vendor + 依赖 ws + bundle 布局能解析到入口 /
+  **回归 N1–N8**（禁用插件不拉中继 / dispose 后重载可恢复 / 崩溃输出进日志 / IPv6 探测 /
+  活着未监听不谎报 / 并发不同 URL 不返回陈旧端口 / 外部占用者消失后接管）/
+  **接线层覆盖**（`shouldTickWatchdog` 纯函数 + index.js 源码级断言）/
+  **变异盲区 ①–⑥**（exit 归属 / unref 时机 / shutdown 命令 / 端口双探 / child.killed / 幂等闩锁））。
+
+> **这个门禁必须用变异测试自检**：第二轮审计发现 6 处「改坏实现，71 项照样全绿」的盲区
+> （exit 归属判断 / unref 时机 / stop 不写 shutdown / 端口只探 127.0.0.1 / 不记子进程输出 /
+> stop 用 `child.killed`）。现已补 13 个变异点，**全部能被门禁杀死**。
+> 新增关键实现点时，请顺手写一条「改坏它就会红」的用例（或自己跑一遍变异）——
+> **项数多 ≠ 门禁强，变异存活率才是里子**。
 
 ## v1.1.x：配对入口搬进设置面板（2026-10-24）
 

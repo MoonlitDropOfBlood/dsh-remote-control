@@ -7,7 +7,7 @@ Cordis 功能插件：把 DSH 的会话/审批/事件桥接到中继，供手机
 
 ```
 index.js              Cordis 类插件入口：export default class RemoteControlService extends TypertRemoteService
-                      （服务名 remoteControl；[Service.init] 启动宿主链路 + 标记三个 Remote 方法；
+                      （服务名 remoteControl；[Service.init] 启动宿主链路 + 标记四个 Remote 方法；
                         另保留函数式 apply(ctx, config) 供函数插件宿主使用，两条路共用 startRemoteHost）
 client.js             Web 半边：window.__ModuleLoader__.load → 注册「设置 → DSH Pocket」分区
 typert.host.js        TYPERT Host manifest（package/face/invocations + strict codec，每个 codec 带 create()）
@@ -16,6 +16,7 @@ lib/config.mjs        %DSH_HOME%/remote-control/config.json 读写（首启生�
 lib/relay-client.mjs  中继 WS 客户端（退避重连/心跳/sid:seq 去重/reload 热更换）
 lib/host-bridge.mjs   Host 桥接：sessionController + api-session/agent 事件 + 审批/提问瀑布
 lib/pairing.mjs       配对核心：URI（§3.5）/QR（SVG+ASCII）/rotatePairingIdentity/setPairingHidden
+                      /isLoopbackRelayUrl+loopbackWarning（回环地址判定与警告文案）
 lib/qr.mjs            内嵌 QR 编码器（移植 Nayuki qrcodegen，MIT；byte 模式 ECC-M v1-10）
 lib/push.mjs          Push Kit REST（token 缓存 + messages:send，失败静默降级）
 scripts/verify-*.mjs  dev 验证脚本（jsqr 独立解码 + 配对 API mock + 设置页结构自检）
@@ -29,7 +30,7 @@ node --check index.js client.js typert.host.js lib/*.mjs scripts/*.mjs   # 语�
 node -e "import('./lib/protocol.mjs').then(m=>m.assertKat())"           # KAT
 node scripts/verify-qr.mjs && node scripts/verify-pairing.mjs           # QR/配对 API 回归（需 devDependencies）
 node scripts/verify-steps.mjs                                          # v1.0.8 步骤/模式/权限/归档/模型/思考/强度回归（无依赖，113 项）
-node scripts/verify-settings.mjs                                       # v1.1.x 设置页/manifest/combo 自检 + Host 真跑一遍（68 项）
+node scripts/verify-settings.mjs                                       # v1.1.x 设置页/manifest/combo 自检 + Host 真跑一遍（107 项）
 node scripts/sync-client-icon.mjs                                      # 改了 icon.svg 后同步 client.js 的图标 data-uri
 ```
 
@@ -64,7 +65,8 @@ ESM 模块缓存不会重载源码（实测踩坑）。
   否则插件被兼容性 gate 静默禁用。
 - 二维码/URI 含 secret 明文：**绝不写日志**（日志只允许 lib/pairing.mjs 的 redactUri 形式）；
   Remote 返回体里也**没有 secret 明文**——只有二维码图像。
-- relayUrl 是 loopback（127.0.0.1/localhost）时设置页必须打醒目警告（手机连不上）。
+- relayUrl 是 loopback（127.0.0.1/localhost/::1）时设置页必须打醒目警告（手机连不上）；
+  判定统一走 `lib/pairing.mjs` 的 `isLoopbackRelayUrl()`/`loopbackWarning()`，别再各写一套。
 
 ## Host API 速查（实测，契约附录 A）
 
@@ -137,14 +139,30 @@ ESM 模块缓存不会重载源码（实测踩坑）。
 
 | 文件 | 角色 |
 |---|---|
-| `index.js` | **类插件** `export default class RemoteControlService extends TypertRemoteService`（服务名 `remoteControl`）。`[Service.init]()` 里启动宿主链路（`startRemoteHost`）并把三个方法标记成 Remote 导出。 |
-| `typert.host.js` | **TYPERT Host manifest**：`package` 必须等于 package.json 的 name，`face:"host"`，三个 invocation（`getPairing` / `rotateSecret` / `setHidden`）。 |
+| `index.js` | **类插件** `export default class RemoteControlService extends TypertRemoteService`（服务名 `remoteControl`）。`[Service.init]()` 里启动宿主链路（`startRemoteHost`）并把四个方法标记成 Remote 导出。 |
+| `typert.host.js` | **TYPERT Host manifest**：`package` 必须等于 package.json 的 name，`face:"host"`，四个 invocation（`getPairing` / `setRelayUrl` / `rotateSecret` / `setHidden`）。 |
 | `client.js` | **Web 半边**：`window.__ModuleLoader__.load({id: <包名>, factory})` → `ctx.slots.inject("settings.section", …)` 注册 `{id:"remote-control", order:40, label:()=>"DSH Pocket"}`，并 `ctx.remote.$mount(CLIENT_REMOTE)` 挂自己的 Remote 命名空间。 |
+
+设置页长这样（用户**不需要改任何文件**）：
+
+- 头部：中继地址 + 连接状态点（已配置=绿点 / 未配置=红点）。
+- 「配对信息」卡：**中继地址是可直接编辑的输入框**（monospace，placeholder
+  `ws://192.168.x.x:8788`）+「保存」按钮（保存中禁用）；下面一行小字说明「留空即取消
+  中继配置」；再下面是只读的「配对频道」。
+- 「手机配对二维码」卡：二维码（内联 SVG）/ 隐藏态 / 空态文案
+  「填写中继地址并保存后，这里会显示手机配对二维码。」+「轮换密钥」「隐藏/显示配对」。
 
 Remote 方法（返回 `{ok:true,value}` 或 `{ok:false,error:{code,message}}`）：
 
 - `getPairing()` → `{relayUrl, channel, hidden, qrSvg, note}`——**返回体里没有 secret 明文**，
-  secret 只在二维码图像里；`hidden=true` 时不返回二维码、只给一句说明。
+  secret 只在二维码图像里；`hidden=true` 时不返回二维码、只给一句说明；
+  未配置中继地址时回 `{ok:false,error:{code:"pairing-unavailable"}}`（文案指向设置页）。
+- `setRelayUrl(url)` → 设置页直改中继地址：校验（trim；空串=清除配置；非空必须
+  `ws://`/`wss://` 开头且 `new URL()` 有 host；≤512 字符；非法回 `bad-params` + 中文原因）
+  → `saveConfig` 落盘 → 内存同步 → **链路热切换**（有客户端走 `relay.reload()`，没有就现场
+  新建客户端+桥接）→ 回新的配对信息（按新地址重生成二维码；`hidden=true` 时不带二维码）。
+  回环地址（127.0.0.1/localhost/::1）的 `note` 带**醒目警告**（手机连不上），
+  判定函数 `isLoopbackRelayUrl`/`loopbackWarning` 在 `lib/pairing.mjs`（判定唯一出处）。
 - `rotateSecret()` → 换 channel+secret 并落盘、旧 secret 不保留、`relay.reload()` 热更换链路；
   成功后回新的配对信息。
 - `setHidden(hidden)` → 落盘 `config.json` 的 `hidden` 字段；隐藏时删掉盘上 `pairing.svg`，
@@ -174,4 +192,5 @@ Remote 方法（返回 `{ok:true,value}` 或 `{ok:false,error:{code,message}}`�
   `>svg:first-child{display:none}` + `::before` 用 currentColor mask 画自家图标。
 - **本包 CSS 标签要自己 `setAttribute("data-plugin", 包名)`**：`apply()` 是异步的，追加
   <style> 时 client-modules 的 `claimStyles(ownerId)` 扫描已经过去，不认领会被别的包收养。
-- 回归：`node scripts/verify-settings.mjs`（68 项，含 combo 拼接安全 + Host 半边真跑一遍）+ `node scripts/verify-pairing.mjs`（47 项）。
+- 回归：`node scripts/verify-settings.mjs`（**107 项**，含 combo 拼接安全 + Host 半边真跑一遍
+  + setRelayUrl 校验/落盘/清除/回环警告）+ `node scripts/verify-pairing.mjs`（47 项）。

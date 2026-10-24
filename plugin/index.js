@@ -35,7 +35,7 @@
 import { Service } from "@deepseek-ai/cordis";
 import { Remote, TypertRemoteService } from "@deepseek-ai/dsh-typert-protocol";
 import { assertKat } from "./lib/protocol.mjs";
-import { loadConfig, dataDir } from "./lib/config.mjs";
+import { loadConfig, saveConfig, dataDir } from "./lib/config.mjs";
 import { RelayClient } from "./lib/relay-client.mjs";
 import { PushSender, pushConfigured, pushUnavailableReason } from "./lib/push.mjs";
 import { HostBridge } from "./lib/host-bridge.mjs";
@@ -45,6 +45,7 @@ import {
   writePairingSvg,
   rotatePairingIdentity,
   setPairingHidden,
+  loopbackWarning,
 } from "./lib/pairing.mjs";
 
 /**
@@ -134,10 +135,119 @@ export function startRemoteHost(ctx, rowConfig) {
   if (typeof rowCfg.interceptQuestions === "boolean") cfg.interceptQuestions = rowCfg.interceptQuestions;
   if (typeof rowCfg.approvalTimeoutMs === "number") cfg.approvalTimeoutMs = rowCfg.approvalTimeoutMs;
 
-  /** @type {any} 中继客户端（空转时为 null）。 */
-  let relay = null;
-  const state = { cfg, configPath, log, relay: null, katOk, running: false };
+  const state = {
+    cfg,
+    configPath,
+    log,
+    relay: null,
+    katOk,
+    running: false,
+    /** 启动/热更换中继链路（设置页改中继地址时复用）。 */
+    startLink: null,
+    /** 停止并释放当前链路（清空中继地址时用）。 */
+    stopLink: null,
+  };
   HOST_STATES.set(ctx, state);
+
+  // ---- 3. Push Kit（§6；未配置时优雅禁用，不影响主链路）--------------------
+  // 提前创建：设置页改中继地址后要能立刻起链路，push 发送器得先备好。
+  const push = new PushSender(cfg.push, log);
+  if (!pushConfigured(cfg.push)) {
+    log("info", "push.state disabled: " + pushUnavailableReason(cfg.push), { hint: "configure push.* in " + configPath });
+  }
+
+  // ---- 4. 链路控制（启动 / 热更换 / 停止）------------------------------------
+  /** 停止并释放当前链路（幂等；未在跑时是 no-op）。 */
+  function stopLink() {
+    const currentRelay = state.relay;
+    const detach = state.detachBridge;
+    state.relay = null;
+    state.bridge = null;
+    state.detachBridge = null;
+    state.running = false;
+    try {
+      currentRelay?.close();
+    } catch {
+      /* ignore */
+    }
+    try {
+      detach?.();
+    } catch {
+      /* ignore */
+    }
+  }
+
+  /**
+   * 建立中继链路：已有客户端 → 热更换（换地址立即重连）；没有 → 新建客户端 + 桥接。
+   * @returns {{ok:boolean, mode?:string, message?:string}}
+   */
+  function startLink() {
+    if (!state.katOk) {
+      return { ok: false, message: "协议 KAT 自测未通过，已禁用连接。" };
+    }
+    if (state.cfg.enabled !== true) {
+      return { ok: false, message: "插件已被配置禁用（config.json 的 enabled=false）。" };
+    }
+    const url = typeof state.cfg.relayUrl === "string" ? state.cfg.relayUrl.trim() : "";
+    if (url === "") {
+      return { ok: false, message: "未配置中继地址。" };
+    }
+    if (state.relay) {
+      // 已有客户端：热更换（地址/凭据立即生效，旧连接作废）
+      state.relay.reload({
+        relayUrl: url,
+        channel: state.cfg.channel,
+        secret: state.cfg.secret,
+        relayToken: state.cfg.relayToken,
+      });
+      return { ok: true, mode: "reload" };
+    }
+    // 新建客户端 + Host 桥接
+    const client = new RelayClient({
+      relayUrl: url,
+      channel: state.cfg.channel,
+      secret: state.cfg.secret,
+      relayToken: state.cfg.relayToken,
+      role: "host",
+      log,
+      onStatus: (s, detail) => {
+        log("info", "relay " + s + (detail ? ": " + detail : ""), {
+          relayUrl: state.cfg.relayUrl,
+          channel: state.cfg.channel,
+        });
+        if (s === "ready") state.bridge?.sendPushState();
+      },
+      onPeer: (joined, role) => {
+        log("info", "peer " + (joined ? "joined" : "left"), { role });
+      },
+      onFatal: (code, message) => {
+        // bad-hello / channel-full：协议级拒绝，重连无意义——停掉链路并大声说明
+        log("error", "relay rejected connection (fatal); disconnecting", { code, message, channel: state.cfg.channel });
+        stopLink();
+      },
+      onMessage: (plain) => {
+        state.bridge?.onPlainMessage(plain);
+      },
+    });
+    const hostBridge = new HostBridge({ ctx, relay: client, push, config: state.cfg, log });
+    const detachHostBridge = hostBridge.attach();
+    client.start();
+    state.relay = client;
+    state.bridge = hostBridge;
+    state.detachBridge = detachHostBridge;
+    state.running = true;
+    return { ok: true, mode: "start" };
+  }
+
+  state.startLink = startLink;
+  state.stopLink = stopLink;
+
+  // ---- 5. 卸载清理（插件热卸载时释放 socket/定时器/监听）-------------------
+  // 无论当前是否在跑链路都要注册：设置页稍后起链路时同样要能收回资源。
+  ctx.effect(() => () => {
+    stopLink();
+    log("info", "unloaded");
+  });
 
   if (!katOk) {
     log("error", "KAT failure takes precedence: not connecting", { channel: cfg.channel });
@@ -148,80 +258,28 @@ export function startRemoteHost(ctx, rowConfig) {
     return state;
   }
   if (typeof cfg.relayUrl !== "string" || cfg.relayUrl === "") {
-    // 未配置 relayUrl：优雅空转——不连接、不拦截（瀑布照常 next()），等用户配对。
+    // 未配置 relayUrl：优雅空转——不连接、不拦截（瀑布照常 next()），
+    // 等用户在设置页填写中继地址（v1.1.x：setRelayUrl 会现场把链路拉起来）。
     log(
       "info",
       "relayUrl not configured — idling (no connection, no interception). " +
-        "Set relayUrl/channel/secret in " + configPath + ", then pair the phone app. channel=" + cfg.channel,
+        "Set the relay address in the DSH settings panel (\"DSH Pocket\"), then pair the phone app. channel=" +
+        cfg.channel,
     );
     return state;
   }
 
-  // ---- 3. Push Kit（§6；未配置时优雅禁用，不影响主链路）--------------------
-  const push = new PushSender(cfg.push, log);
-  if (!pushConfigured(cfg.push)) {
-    log("info", "push.state disabled: " + pushUnavailableReason(cfg.push), { hint: "configure push.* in " + configPath });
+  const started = startLink();
+  if (started.ok) {
+    log("info", "remote control active", {
+      channel: cfg.channel,
+      relayUrl: cfg.relayUrl,
+      interceptApprovals: cfg.interceptApprovals,
+      interceptQuestions: cfg.interceptQuestions,
+      approvalTimeoutMs: cfg.approvalTimeoutMs,
+      dataDir: dataDir(),
+    });
   }
-
-  // ---- 4. 中继链路 + Host 桥接 ---------------------------------------------
-  /** @type {HostBridge|null} */
-  let bridge = null;
-  relay = new RelayClient({
-    relayUrl: cfg.relayUrl,
-    channel: cfg.channel,
-    secret: cfg.secret,
-    relayToken: cfg.relayToken,
-    role: "host",
-    log,
-    onStatus: (s, detail) => {
-      log(s === "ready" ? "info" : "info", "relay " + s + (detail ? ": " + detail : ""), {
-        relayUrl: cfg.relayUrl,
-        channel: cfg.channel,
-      });
-      if (s === "ready") bridge?.sendPushState();
-    },
-    onPeer: (joined, role) => {
-      log("info", "peer " + (joined ? "joined" : "left"), { role });
-    },
-    onFatal: (code, message) => {
-      // bad-hello / channel-full：协议级拒绝，重连无意义——停掉链路并大声说明
-      log("error", "relay rejected connection (fatal); disconnecting", { code, message, channel: cfg.channel });
-      relay.close();
-    },
-    onMessage: (plain) => {
-      bridge?.onPlainMessage(plain);
-    },
-  });
-
-  bridge = new HostBridge({ ctx, relay, push, config: cfg, log });
-  const detachBridge = bridge.attach();
-  relay.start();
-  state.relay = relay;
-  state.running = true;
-
-  log("info", "remote control active", {
-    channel: cfg.channel,
-    relayUrl: cfg.relayUrl,
-    interceptApprovals: cfg.interceptApprovals,
-    interceptQuestions: cfg.interceptQuestions,
-    approvalTimeoutMs: cfg.approvalTimeoutMs,
-    dataDir: dataDir(),
-  });
-
-  // ---- 5. 卸载清理（插件热卸载时释放 socket/定时器/监听）-------------------
-  ctx.effect(() => () => {
-    try {
-      relay.close();
-    } catch {
-      /* ignore */
-    }
-    try {
-      detachBridge();
-    } catch {
-      /* ignore */
-    }
-    log("info", "unloaded");
-  });
 
   return state;
 }
@@ -279,7 +337,7 @@ export class RemoteControlService extends TypertRemoteService {
         e,
       );
     }
-    for (const method of ["getPairing", "rotateSecret", "setHidden"]) {
+    for (const method of ["getPairing", "rotateSecret", "setHidden", "setRelayUrl"]) {
       try {
         markRemoteMethod(this, method, method);
       } catch (e) {
@@ -302,35 +360,22 @@ export class RemoteControlService extends TypertRemoteService {
       return { ok: false, error: { code: "not-ready", message: "插件尚未初始化。" } };
     }
     const cfg = host.cfg;
-    const value = {
-      relayUrl: typeof cfg.relayUrl === "string" ? cfg.relayUrl : "",
-      channel: typeof cfg.channel === "string" ? cfg.channel : "",
-      hidden: cfg.hidden === true,
-      qrSvg: "",
-      note: "",
-    };
-    if (value.hidden) {
-      value.note = "配对已隐藏：手机端请使用此前扫码保存的配对信息。";
-      return { ok: true, value };
+    if (cfg.hidden === true) {
+      return {
+        ok: true,
+        value: pairingValue(cfg, "配对已隐藏：手机端请使用此前扫码保存的配对信息。", false),
+      };
     }
+    // 未配置 relayUrl：给出明确指引（**不返回 URI/secret**）
     try {
-      const uri = buildPairingUri(cfg);
-      const rendered = renderPairing(uri);
-      value.qrSvg = rendered.svg;
-      // 落盘一份（供外部工具/备份使用）；失败不致命——设置页直接用内联 SVG。
-      try {
-        writePairingSvg(rendered.svg);
-      } catch (e) {
-        host.log("warn", "pairing.svg write failed", { error: String(e && e.message) });
-      }
-      return { ok: true, value };
+      buildPairingUri(cfg);
     } catch (e) {
-      // relayUrl 未配置等预期错误：给出明确指引（**不返回 URI/secret**）
       return {
         ok: false,
         error: { code: "pairing-unavailable", message: String(e && e.message) },
       };
     }
+    return { ok: true, value: pairingValue(cfg, "", true) };
   }
 
   /**
@@ -376,6 +421,115 @@ export class RemoteControlService extends TypertRemoteService {
     pairing.value.note = res.hidden === true ? "配对二维码已隐藏。" : "配对二维码已恢复显示。";
     return pairing;
   }
+
+  /**
+   * 设置中继地址（设置页输入框直改，v1.1.x）。
+   *
+   * 校验 → 落盘 → 热切换链路 → 回新的配对信息。
+   * 空串 = 清除中继地址（插件回到空转状态，不再连接中继）。
+   *
+   * @param {string} url 中继地址，如 ws://192.168.1.10:8788；空串 = 清除
+   * @returns {Promise<{ok:true,value:object}|{ok:false,error:{code:string,message:string}}>}
+   */
+  async setRelayUrl(url) {
+    const host = this._host;
+    if (!host || !host.cfg) {
+      return { ok: false, error: { code: "not-ready", message: "插件尚未初始化。" } };
+    }
+    if (typeof url !== "string") {
+      return { ok: false, error: { code: "bad-params", message: "中继地址必须是字符串。" } };
+    }
+    const raw = url.trim();
+    if (raw.length > 512) {
+      return { ok: false, error: { code: "bad-params", message: "中继地址过长（上限 512 字符）。" } };
+    }
+    if (raw !== "") {
+      if (!/^wss?:\/\//i.test(raw)) {
+        return {
+          ok: false,
+          error: { code: "bad-params", message: "中继地址必须以 ws:// 或 wss:// 开头（例如 ws://192.168.1.10:8788）。" },
+        };
+      }
+      let parsed = null;
+      try {
+        parsed = new URL(raw);
+      } catch {
+        parsed = null;
+      }
+      if (!parsed || !parsed.host) {
+        return {
+          ok: false,
+          error: { code: "bad-params", message: "中继地址不是合法的 URL（缺少主机名，例如 ws://192.168.1.10:8788）。" },
+        };
+      }
+    }
+
+    // 落盘（只把 relayUrl 写回磁盘配置；行内紧急覆盖不动）
+    try {
+      const fresh = loadConfig().config;
+      fresh.relayUrl = raw;
+      saveConfig(fresh);
+    } catch (e) {
+      return {
+        ok: false,
+        error: { code: "config-save-failed", message: "保存中继地址失败：" + String(e && e.message) },
+      };
+    }
+    // 内存同步 + 链路热切换
+    host.cfg.relayUrl = raw;
+    host.log("info", "relay address updated", { relayUrl: raw, cleared: raw === "" });
+
+    let note = "";
+    if (raw === "") {
+      // 清除：停掉链路，插件回到空转（不连接、不拦截）
+      host.stopLink?.();
+      note = "中继地址已清除，插件已停止连接中继（空转）。填写地址后可立即重新连接。";
+    } else {
+      const link = host.startLink ? host.startLink() : { ok: false, message: "链路控制不可用。" };
+      note = link.ok
+        ? link.mode === "reload"
+          ? "中继地址已更新，链路已用新地址重连。"
+          : "中继地址已更新，链路已启动。"
+        : "中继地址已保存，但链路未启动：" + (link.message || "未知原因");
+    }
+    const warn = loopbackWarning(raw);
+    if (warn) note = (note ? note + " " : "") + warn;
+
+    const value = pairingValue(host.cfg, note, raw !== "");
+    return { ok: true, value };
+  }
+}
+
+/**
+ * 组装配对信息（**不含 secret 明文**——secret 只存在于二维码图像里）。
+ *
+ * @param {any} cfg 插件配置
+ * @param {string} note 提示文案
+ * @param {boolean} withQr 是否产出二维码（无中继地址或已隐藏时不产出）
+ * @returns {{relayUrl:string, channel:string, hidden:boolean, qrSvg:string, note:string}}
+ */
+function pairingValue(cfg, note, withQr) {
+  const value = {
+    relayUrl: typeof cfg?.relayUrl === "string" ? cfg.relayUrl : "",
+    channel: typeof cfg?.channel === "string" ? cfg.channel : "",
+    hidden: cfg?.hidden === true,
+    qrSvg: "",
+    note: typeof note === "string" ? note : "",
+  };
+  if (!withQr || value.hidden) return value;
+  try {
+    const rendered = renderPairing(buildPairingUri(cfg));
+    value.qrSvg = rendered.svg;
+    // 落盘一份（供外部工具/备份使用）；失败不致命——设置页直接用内联 SVG。
+    try {
+      writePairingSvg(rendered.svg);
+    } catch {
+      /* ignore */
+    }
+  } catch (e) {
+    value.note = (value.note ? value.note + " " : "") + String(e && e.message);
+  }
+  return value;
 }
 
 export default RemoteControlService;

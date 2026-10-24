@@ -3,17 +3,19 @@
  *
  * Rendered by the DSH web shell through `window.__ModuleLoader__.load`. Registers a
  * "DSH Pocket" page in the Settings panel (`settings.section`) that shows:
- *   - the relay address + pairing channel and the link status,
+ *   - the relay address (editable inline — no file editing required) and the
+ *     pairing channel, plus the link status,
  *   - the pairing QR code (inline SVG produced by the Host half),
- *   - the actions: rotate the pairing key and hide / show the pairing.
+ *   - the actions: save the relay address, rotate the pairing key and
+ *     hide / show the pairing.
  *
  * The phone pairing flow is unchanged: the QR still encodes the same
  * `dshrc://pair?…` URI as before (contract §3.5) — only the entry point moved
  * from the `/remote-pairing` command into this settings page (v1.1.x).
  *
  * Host communication goes through the `remoteControl` Remote namespace
- * (`ctx.remote.remoteControl.getPairing() / rotateSecret() / setHidden(hidden)`),
- * published by the Host half in `index.js`.
+ * (`ctx.remote.remoteControl.getPairing() / setRelayUrl(url) / rotateSecret() /
+ * setHidden(hidden)`), published by the Host half in `index.js`.
  */
 /**
  * This package's client-module id. It is both the `__ModuleLoader__.load` id and
@@ -58,6 +60,9 @@ const CLIENT_ICON_MASK_URI =
 .rc-field{display:flex;flex-direction:column;gap:2px;min-width:0}
 .rc-label{font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary)}
 .rc-value{font-size:13px;line-height:18px;color:var(--dsw-alias-label-primary);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;word-break:break-all}
+.rc-input{box-sizing:border-box;height:30px;flex:1;min-width:240px;font:inherit;font-size:13px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);padding:0 10px}
+.rc-input:focus{outline:none;border-color:var(--dsw-alias-border-l1)}
+.rc-input::placeholder{color:var(--dsw-alias-label-tertiary)}
 .rc-qr{display:flex;justify-content:center;padding:8px 0}
 .rc-qr svg{width:220px;height:220px;max-width:100%;display:block;background:#fff;border-radius:10px;padding:8px}
 .rc-qr-empty{color:var(--dsw-alias-label-secondary);font-size:13px;padding:24px 0;text-align:center}
@@ -191,6 +196,32 @@ const CLIENT_ICON_MASK_URI =
             create: createPassthrough,
           },
         },
+        {
+          id: "dsh-remote-control#remoteControl/setRelayUrl",
+          service: "remoteControl",
+          namespace: "remoteControl",
+          method: "setRelayUrl",
+          invocation: { kind: "direct" },
+          parameters: [
+            {
+              name: "url",
+              wire: "url",
+              source: "json",
+              codec: {
+                mode: "strict",
+                typeSymbol: "dsh-remote-control#remoteControl/setRelayUrl:url",
+                schema: passthrough(),
+                create: createPassthrough,
+              },
+            },
+          ],
+          result: {
+            mode: "strict",
+            typeSymbol: "dsh-remote-control#PairingResult",
+            schema: passthrough(),
+            create: createPassthrough,
+          },
+        },
       ],
     };
 
@@ -262,6 +293,9 @@ const CLIENT_ICON_MASK_URI =
       function PairingPage() {
         const [state, setState] = React.useState({ loading: true, value: null, error: "", hint: "", hintKind: "" });
         const [busy, setBusy] = React.useState(false);
+        const [saving, setSaving] = React.useState(false);
+        // 中继地址输入框的草稿：null = 跟随宿主返回的值（没在编辑）
+        const [relayDraft, setRelayDraft] = React.useState(null);
 
         const load = React.useCallback(async function () {
           if (!remote) {
@@ -283,6 +317,47 @@ const CLIENT_ICON_MASK_URI =
         React.useEffect(() => {
           load();
         }, [load]);
+
+        // 配对状态刷新后，输入框回到「跟随宿主值」（用户正在编辑的草稿被丢弃）
+        React.useEffect(() => {
+          setRelayDraft(null);
+        }, [state.value]);
+
+        // 保存中继地址：成功 → 刷新整页配对状态 + 绿色提示；失败 → 红色提示（宿主原文）
+        const saveRelay = React.useCallback(
+          async function (draft) {
+            if (!remote) return;
+            setSaving(true);
+            let note = "";
+            try {
+              const res = unwrapRemote(await remote.setRelayUrl(draft));
+              if (!res.ok) {
+                setState((s) => ({ ...s, hint: res.message, hintKind: "error" }));
+                return;
+              }
+              note = String(res.value?.note || "");
+              // 用新值先更新界面，再整页刷新（二维码/频道以宿主为准）
+              setState({
+                loading: false,
+                value: res.value,
+                error: "",
+                hint: "中继地址已更新" + (note ? "：" + note : ""),
+                hintKind: /回环|loopback/i.test(note) ? "error" : "ok",
+              });
+              await load();
+              setState((s) => ({
+                ...s,
+                hint: "中继地址已更新" + (note ? "：" + note : ""),
+                hintKind: /回环|loopback/i.test(note) ? "error" : "ok",
+              }));
+            } catch (e) {
+              setState((s) => ({ ...s, hint: String((e && e.message) || e), hintKind: "error" }));
+            } finally {
+              setSaving(false);
+            }
+          },
+          [remote, load],
+        );
 
         const run = React.useCallback(
           async function (fn, okHint) {
@@ -328,6 +403,7 @@ const CLIENT_ICON_MASK_URI =
         const relayUrl = value.relayUrl || "";
         const channel = value.channel || "";
         const qrSvg = value.qrSvg || "";
+        const relayInput = relayDraft === null ? relayUrl : relayDraft;
 
         return React.createElement(
           "div",
@@ -354,14 +430,38 @@ const CLIENT_ICON_MASK_URI =
             "div",
             { className: "rc-card" },
             React.createElement("h3", { className: "rc-card-title" }, "配对信息"),
+            // 中继地址：可直接编辑保存（v1.1.x：不再要求用户改配置文件）
             React.createElement(
               "div",
-              { className: "rc-row" },
+              { className: "rc-field" },
+              React.createElement("span", { className: "rc-label" }, "中继地址"),
               React.createElement(
                 "div",
-                { className: "rc-field" },
-                React.createElement("span", { className: "rc-label" }, "中继地址"),
-                React.createElement("span", { className: "rc-value" }, relayUrl || "（未配置，请编辑插件 config.json）"),
+                { className: "rc-row" },
+                React.createElement("input", {
+                  type: "text",
+                  className: "rc-input",
+                  value: relayInput,
+                  placeholder: "ws://192.168.x.x:8788",
+                  spellCheck: false,
+                  autoComplete: "off",
+                  onChange: (e) => setRelayDraft(e && e.target ? e.target.value : ""),
+                }),
+                React.createElement(
+                  "button",
+                  {
+                    type: "button",
+                    className: "rc-btn",
+                    disabled: saving || busy,
+                    onClick: () => saveRelay(relayInput),
+                  },
+                  saving ? "保存中…" : "保存",
+                ),
+              ),
+              React.createElement(
+                "span",
+                { className: "rc-note" },
+                "留空即取消中继配置（插件停止连接）。手机需能访问该地址，填 localhost 手机连不上。",
               ),
             ),
             React.createElement(
@@ -391,7 +491,7 @@ const CLIENT_ICON_MASK_URI =
                     className: "rc-qr",
                     dangerouslySetInnerHTML: { __html: qrSvg },
                   })
-                : React.createElement("div", { className: "rc-qr-empty" }, "暂无二维码（请先配置中继地址）。"),
+                : React.createElement("div", { className: "rc-qr-empty" }, "填写中继地址并保存后，这里会显示手机配对二维码。"),
             React.createElement(
               "p",
               { className: "rc-note" },

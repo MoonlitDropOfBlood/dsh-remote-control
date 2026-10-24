@@ -7,6 +7,7 @@
 //   2. 渲染产物：矩阵 + SVG（设置面板注入 qrSvg；ASCII 供终端参考）。
 //   3. rotatePairingIdentity / setPairingHidden：轮换配对信息、隐藏/恢复配对
 //      （v1.1.x：入口是 DSH 设置面板的 Remote 方法，命令已删；逻辑留在这里复用）。
+//   4. isLoopbackRelayUrl / loopbackWarning：回环地址判定（手机连不上，必须醒目提示）。
 //
 // **安全**：URI/二维码内容含 secret 明文，**绝不写日志**——日志只允许 redactUri 的脱敏形式。
 import { spawn } from "node:child_process";
@@ -24,6 +25,46 @@ export function pairingSvgPath() {
 }
 
 /**
+ * 中继地址是否指向**本机回环**（127.0.0.1 / localhost / ::1）。
+ *
+ * 回环地址只在本机可达——手机扫码后连不上，界面必须醒目提示用户填局域网地址。
+ * 判定放在这里是为了让「设置页填写」「命令输出」等所有入口共用同一套规则。
+ *
+ * @param {string} url 中继地址（如 ws://192.168.1.10:8788）
+ * @returns {boolean}
+ */
+export function isLoopbackRelayUrl(url) {
+  const raw = typeof url === "string" ? url.trim() : "";
+  if (raw === "") return false;
+  let host = "";
+  try {
+    host = new URL(raw).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  return host === "127.0.0.1" || host === "localhost" || host === "::1" || host === "[::1]";
+}
+
+/**
+ * 回环地址的醒目警告文案（非回环返回空串）。
+ * @param {string} url
+ * @returns {string}
+ */
+export function loopbackWarning(url) {
+  if (!isLoopbackRelayUrl(url)) return "";
+  let host = "";
+  try {
+    host = new URL(String(url).trim()).hostname;
+  } catch {
+    host = String(url).trim();
+  }
+  return (
+    "警告：中继地址是本机回环地址（" + host + "），手机连不上——请填这台电脑在局域网里的地址" +
+    "（例如 ws://192.168.1.10:8788）。"
+  );
+}
+
+/**
  * 按契约 §3.5 组装配对 URI。
  * @param {{relayUrl:string, channel:string, secret:string, relayToken?:string}} cfg
  * @returns {string} dshrc://pair?...
@@ -32,9 +73,8 @@ export function buildPairingUri(cfg) {
   const relayUrl = typeof cfg?.relayUrl === "string" ? cfg.relayUrl.trim() : "";
   if (relayUrl === "") {
     throw new Error(
-      "relayUrl 尚未配置：请先在 config.json（" +
-        join(dataDir(), "config.json") +
-        "）里设置 relayUrl（如 wss://relay.example.com/ws），再生成配对二维码。",
+      "relayUrl 尚未配置：请在 DSH「设置 → DSH Pocket」分区里填写中继地址" +
+        "（例如 ws://192.168.1.10:8788），保存后即可扫码配对。",
     );
   }
   const channel = typeof cfg?.channel === "string" ? cfg.channel : "";

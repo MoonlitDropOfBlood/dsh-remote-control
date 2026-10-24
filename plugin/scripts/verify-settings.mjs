@@ -54,7 +54,7 @@ const { TYPERT } = await import("../typert.host.js");
 check("TYPERT.package 等于包名", TYPERT.package === pkg.name, TYPERT.package + " vs " + pkg.name);
 check("TYPERT.face 是 host", TYPERT.face === "host", TYPERT.face);
 check("TYPERT.schemas 是数组", Array.isArray(TYPERT.schemas));
-check("TYPERT.invocations 是数组且有 3 条", Array.isArray(TYPERT.invocations) && TYPERT.invocations.length === 3, String(TYPERT.invocations?.length));
+check("TYPERT.invocations 是数组且有 4 条", Array.isArray(TYPERT.invocations) && TYPERT.invocations.length === 4, String(TYPERT.invocations?.length));
 
 /** 收集 manifest 里所有 strict codec。 */
 function collectCodecs(manifest) {
@@ -130,6 +130,14 @@ for (const method of ["getPairing", "rotateSecret", "setHidden"]) {
   check("client 侧暴露 " + method + " 调用", clientSrc.includes(method + "()") || clientSrc.includes("remote." + method));
 }
 
+// v1.1.x：中继地址可直接编辑保存（不再让用户改 config.json）
+check("client 侧暴露 setRelayUrl 调用", clientSrc.includes("remote.setRelayUrl"));
+check("client 侧有中继地址输入框", /className:\s*"rc-input"/.test(clientSrc) && /placeholder:\s*"ws:\/\/192\.168\.x\.x:8788"/.test(clientSrc));
+check("client 侧有保存按钮", /"保存"/.test(clientSrc));
+check("client 侧已删除「请编辑插件 config.json」文案", !clientSrc.includes("请编辑插件 config.json"));
+check("client 侧已删除「暂无二维码（请先配置中继地址）」文案", !clientSrc.includes("暂无二维码（请先配置中继地址）"));
+check("client 侧 QR 空态文案已更新", clientSrc.includes("填写中继地址并保存后，这里会显示手机配对二维码"));
+
 // ============================================================================
 // 3. 图标 data-uri 与 icon.svg 同步
 // ============================================================================
@@ -149,7 +157,7 @@ check("client.js 的 CSS 用了 DSH 设计变量", clientSrc.includes("--dsw-ali
 check("index.js 默认导出类插件", /export default class RemoteControlService extends TypertRemoteService/.test(indexSrc));
 check("index.js 导出类本身（便于测试/引用）", /export class RemoteControlService extends TypertRemoteService/.test(indexSrc));
 check("类插件服务名为 remoteControl", /super\(ctx,\s*"remoteControl"\)/.test(indexSrc));
-for (const method of ["getPairing", "rotateSecret", "setHidden"]) {
+for (const method of ["getPairing", "rotateSecret", "setHidden", "setRelayUrl"]) {
   check("index.js 标记 Remote 方法 " + method, indexSrc.includes('"' + method + '"'));
 }
 check("index.js 仍保留函数式 apply 入口", /export function apply\(ctx, config\)/.test(indexSrc));
@@ -182,8 +190,8 @@ await service[Service.init]();
 check("类插件注册为 remoteControl 服务", service.name === "remoteControl", String(service.name));
 const marked = remoteMethods(service).map((m) => m.method).sort();
 check(
-  "三个 Remote 方法都被标记",
-  JSON.stringify(marked) === JSON.stringify(["getPairing", "rotateSecret", "setHidden"]),
+  "四个 Remote 方法都被标记",
+  JSON.stringify(marked) === JSON.stringify(["getPairing", "rotateSecret", "setHidden", "setRelayUrl"]),
   JSON.stringify(marked),
 );
 
@@ -218,6 +226,53 @@ check("rotateSecret 换了 channel", service._host.cfg.channel !== oldChannel);
 check("rotateSecret 换了 secret", service._host.cfg.secret !== oldSecret);
 check("rotate 后返回的仍是新配对信息", rotated.value?.channel === service._host.cfg.channel);
 check("rotate 后返回体仍无 secret 明文", !JSON.stringify(rotated).includes(oldSecret) && !JSON.stringify(rotated).includes(service._host.cfg.secret));
+
+// ---- setRelayUrl：设置页直改中继地址 --------------------------------------
+const { readFileSync: readFileSync2 } = await import("node:fs");
+const tempConfigPath = join(tmpHome, "remote-control", "config.json");
+
+// 非法值一律被拒（不落盘、不动链路）
+for (const bad of [
+  ["http://example.com/ws", "http 协议"],
+  ["not-a-url", "不是 URL"],
+  ["ftp://example.com/ws", "非 ws 协议"],
+  ["x".repeat(513), "超长"],
+]) {
+  const res = await service.setRelayUrl(bad[0]);
+  check("setRelayUrl 拒绝 " + bad[1], res.ok === false && res.error?.code === "bad-params", JSON.stringify(res).slice(0, 120));
+  check("setRelayUrl 拒绝 " + bad[1] + " 时有中文原因", String(res.error?.message).length > 0, String(res.error?.message));
+}
+const notString = await service.setRelayUrl(123);
+check("setRelayUrl 拒绝非字符串", notString.ok === false && notString.error?.code === "bad-params");
+check("被拒的地址没有落盘", !readFileSync2(tempConfigPath, "utf8").includes("example.com"));
+
+// 合法地址 → 落盘 + 内存更新 + 返回新二维码
+const GOOD_URL = "ws://127.0.0.1:9/ws"; // 回环 + 无人监听：连接立刻被拒，不碰外网
+const saved = await service.setRelayUrl(GOOD_URL);
+check("setRelayUrl 接受合法 ws:// 地址", saved.ok === true, JSON.stringify(saved).slice(0, 160));
+check("setRelayUrl 返回体 relayUrl 是新地址", saved.value?.relayUrl === GOOD_URL, String(saved.value?.relayUrl));
+check("setRelayUrl 返回体带新 qrSvg", String(saved.value?.qrSvg || "").includes("<svg"));
+check("setRelayUrl 返回体含 channel", !!saved.value?.channel);
+check("setRelayUrl 返回体没有 secret 明文", !JSON.stringify(saved).includes(service._host.cfg.secret));
+check("setRelayUrl 落盘了新地址", readFileSync2(tempConfigPath, "utf8").includes(GOOD_URL));
+check("setRelayUrl 内存 cfg.relayUrl 已更新", service._host.cfg.relayUrl === GOOD_URL, String(service._host.cfg.relayUrl));
+
+// 回环地址 → note 带醒目警告
+check("回环地址的 note 带警告", /回环/.test(String(saved.value?.note || "")), String(saved.value?.note));
+
+// 清空 → 取消配置，链路停掉
+const cleared = await service.setRelayUrl("");
+check("setRelayUrl('') 成功（清除配置）", cleared.ok === true, JSON.stringify(cleared).slice(0, 120));
+check("清除后返回体 relayUrl 为空串", cleared.value?.relayUrl === "");
+check("清除后不再返回二维码", !cleared.value?.qrSvg);
+check("清除后链路已停（relay 释放）", service._host.relay === null);
+check("清除已落盘", !readFileSync2(tempConfigPath, "utf8").includes(GOOD_URL));
+
+// 清除后再填 → 能重新把链路拉起来
+const again = await service.setRelayUrl("ws://127.0.0.1:9/ws");
+check("清除后重新填写可以再次保存", again.ok === true && again.value?.relayUrl === "ws://127.0.0.1:9/ws", JSON.stringify(again).slice(0, 120));
+check("重新填写后链路重新建立", service._host.relay !== null);
+check("重新填写后返回体仍无 secret 明文", !JSON.stringify(again).includes(service._host.cfg.secret));
 
 rmSync(tmpHome, { recursive: true, force: true });
 

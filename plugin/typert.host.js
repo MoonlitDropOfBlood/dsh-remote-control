@@ -117,16 +117,43 @@ export const TYPERT = {
       },
       sourceLocation: { file: "index.js", line: 1, column: 1 },
     },
+    {
+      id: "dsh-remote-control#remoteControl/setRelayUrl",
+      service: "remoteControl",
+      namespace: "remoteControl",
+      method: "setRelayUrl",
+      invocation: { kind: "direct" },
+      parameters: [
+        {
+          name: "url",
+          wire: "url",
+          source: "json",
+          codec: {
+            mode: "strict",
+            typeSymbol: "dsh-remote-control#remoteControl/setRelayUrl:url",
+            schema: z.string(),
+            create: createStringSchema,
+          },
+        },
+      ],
+      result: {
+        mode: "strict",
+        typeSymbol: "dsh-remote-control#PairingResult",
+        schema: pairingResultSchema,
+        create: createPairingResult,
+      },
+      sourceLocation: { file: "index.js", line: 1, column: 1 },
+    },
   ],
   model: {
     services: [
       {
         description:
-          "Remote-control pairing service: exposes the relay address, the pairing channel and the pairing QR code to the desktop settings panel, plus key rotation and pairing hide/show.",
+          "Remote-control pairing service: exposes the relay address, the pairing channel and the pairing QR code to the desktop settings panel, plus relay-address editing, key rotation and pairing hide/show.",
         summary: "Remote-control pairing service for the settings panel.",
         tags: [],
         jsDoc:
-          "/**\n * Remote-control pairing service: publishes the pairing QR code and the\n * rotate / hide operations to the desktop settings panel.\n */",
+          "/**\n * Remote-control pairing service: publishes the pairing QR code, the relay\n * address editor and the rotate / hide operations to the desktop settings panel.\n */",
         key: "remoteControl",
         exportName: "RemoteControlService",
         members: [
@@ -155,6 +182,15 @@ export const TYPERT = {
             summary: "Hide or re-show the pairing QR code in the settings panel.",
             jsDoc:
               "/**\n * Hide (or re-show) the pairing QR code in the settings panel and drop the\n * on-disk pairing.svg accordingly.\n * @param hidden - true hides the pairing, false shows it again.\n * @returns success with the resulting pairing payload or a business failure.\n */",
+          },
+          {
+            kind: "method",
+            name: "setRelayUrl",
+            signature: "@Remote('setRelayUrl') async setRelayUrl(url: string): Promise<PairingResult>",
+            summary:
+              "Set the relay address from the settings panel: validate, persist and hot-switch the relay link; an empty string clears it.",
+            jsDoc:
+              "/**\n * Set the relay address: the value is validated (ws:// or wss:// with a host,\n * at most 512 characters), persisted to config.json and pushed into the relay\n * link, which reconnects to the new address at once. An empty string clears\n * the address and idles the plugin.\n * @param url - the relay address, or an empty string to clear it.\n * @returns success with the fresh pairing payload or a business failure.\n */",
           },
         ],
         types: [

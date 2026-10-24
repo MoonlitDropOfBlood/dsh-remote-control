@@ -260,7 +260,12 @@ const CLIENT_ICON_MASK_URI =
           const pid = typeof snap.pid === "number" && snap.pid > 0 ? "（pid " + snap.pid + "）" : "";
           return "插件托管 · 运行中" + pid;
         }
-        return "插件托管 · 未运行";
+        return "插件托管 · 未运行（将自动重拉）";
+      }
+      // 端口上已有服务但不是插件起的 → 外部中继（插件不干预）
+      if (snap.external === true) {
+        const port = typeof snap.port === "number" && snap.port > 0 ? "（端口 " + snap.port + "）" : "";
+        return "外部中继 · 运行中" + port;
       }
       const detail = typeof snap.detail === "string" ? snap.detail : "";
       if (detail) return detail;
@@ -328,6 +333,8 @@ const CLIENT_ICON_MASK_URI =
         const [saving, setSaving] = React.useState(false);
         // 中继地址输入框的草稿：null = 跟随宿主返回的值（没在编辑）
         const [relayDraft, setRelayDraft] = React.useState(null);
+        // 宿主最近一次返回的中继地址：用来判断「宿主值真的变了」还是「只是轮询刷新」
+        const lastHostUrl = React.useRef(null);
 
         const load = React.useCallback(async function () {
           if (!remote) {
@@ -340,9 +347,29 @@ const CLIENT_ICON_MASK_URI =
               setState({ loading: false, value: null, error: res.message, hint: "", hintKind: "" });
               return;
             }
-            setState({ loading: false, value: res.value, error: "", hint: res.value.note || "", hintKind: "ok" });
+            const nextUrl = String((res.value && res.value.relayUrl) || "");
+            const hostChanged = lastHostUrl.current !== null && lastHostUrl.current !== nextUrl;
+            lastHostUrl.current = nextUrl;
+            // 宿主地址**真的变了**（保存成功/宿主侧改动）才让输入框回到跟随状态；
+            // 轮询刷新时地址没变 → 保留用户正在编辑的草稿。
+            if (hostChanged) setRelayDraft(null);
+            setState((s) => ({
+              loading: false,
+              value: res.value,
+              error: "",
+              // 轮询刷新**不要**覆盖用户的提示文案（保存后的绿色提示会被冲掉）
+              hint: hostChanged || s.hint === "" ? res.value.note || "" : s.hint,
+              hintKind: hostChanged || s.hint === "" ? "ok" : s.hintKind,
+            }));
           } catch (e) {
-            setState({ loading: false, value: null, error: String((e && e.message) || e), hint: "", hintKind: "" });
+            setState((s) => ({
+              loading: false,
+              // 轮询失败不清空已有内容（可能是瞬时断连）
+              value: s.value || null,
+              error: s.value ? "" : String((e && e.message) || e),
+              hint: s.hint,
+              hintKind: s.hintKind,
+            }));
           }
         }, [remote]);
 
@@ -350,10 +377,22 @@ const CLIENT_ICON_MASK_URI =
           load();
         }, [load]);
 
-        // 配对状态刷新后，输入框回到「跟随宿主值」（用户正在编辑的草稿被丢弃）
+        // 轻量轮询：让「中继进程」状态保持实时（托管的中继崩了/被换掉时能看出来），
+        // 15s 一次，页面不可见时不做无用功。
         React.useEffect(() => {
-          setRelayDraft(null);
-        }, [state.value]);
+          let timer = null;
+          const tick = () => {
+            if (typeof document !== "undefined" && document.hidden) return;
+            void load();
+          };
+          timer = setInterval(tick, 15_000);
+          return () => {
+            if (timer) clearInterval(timer);
+          };
+        }, [load]);
+
+        // 配对状态刷新后，输入框回到「跟随宿主值」——但**只在宿主地址真的变了**时
+        // （轮询刷新不能把用户正在编辑的草稿冲掉）；判断已在上面的 load() 里完成。
 
         // 保存中继地址：成功 → 刷新整页配对状态 + 绿色提示；失败 → 红色提示（宿主原文）
         const saveRelay = React.useCallback(

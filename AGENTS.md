@@ -24,7 +24,7 @@
 | [relay/](relay/AGENTS.md) | Node.js | 中继服务器：hello 校验、转发、离线缓存、限速、心跳 | `npm test`（10 用例） |
 | [app/](app/AGENTS.md) | ArkTS | HarmonyOS 手机 App（DevEco 工程） | `devecocli build` + linter-cli 0 ERROR |
 | [e2e/](e2e/AGENTS.md) | Node.js | 协议参考实现 + mock 两端 + 自动化联调 | `node auto-test.mjs` |
-| [docs/PROTOCOL.md](docs/PROTOCOL.md) | — | **线协议契约 v1.0.8（唯一事实源，三方共同合同）** | 改协议必须先改它 |
+| [docs/PROTOCOL.md](docs/PROTOCOL.md) | — | **线协议契约 v1.0.9（唯一事实源，三方共同合同）** | 改协议必须先改它 |
 
 ## 快速开始
 
@@ -36,8 +36,8 @@ cd relay && npm install && node server.js            # 中继（默认 8787；�
 
 ## 全局约定
 
-1. **协议以 docs/PROTOCOL.md 为准**（v1.0.8：在 v1.0.7 真实归档/模型选择/思考过程之上，
-   增补模型思考强度目录与会话中切换模型）。改任何一端的 wire 行为必须先改契约，三方同步。
+1. **协议以 docs/PROTOCOL.md 为准**（v1.0.9：在 v1.0.8 模型思考强度目录与会话中切换模型之上，
+   增补会话消息里的图片——§5.10「缩略图内联 + 大图按需拉取」）。改任何一端的 wire 行为必须先改契约，三方同步。
 2. **KAT 是硬验收**：契约 §7 测试向量（key/iv/ct/tag/hmac）在 plugin 与 app 各有一份自测，
    连接建立前执行，失败禁连。加密链路每一环（HKDF/AES/HMAC）都必须进 KAT。
 3. **git 提交**：`git -c user.name="dsh-remote-control" -c user.email="dev@localhost" commit`，

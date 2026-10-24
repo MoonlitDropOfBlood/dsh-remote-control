@@ -8,8 +8,8 @@
 /** 协议版本（契约 §5.1 hello.proto）。 */
 export const PROTO_VERSION: number = 1;
 
-/** 协议契约文档版本（v1.0.7：§5.8 模型目录、§5.9 Workspace 真实归档、reasoning 思考过程；关于页展示用）。 */
-export const CONTRACT_VERSION: string = 'v1.0.8';
+/** 协议契约文档版本（v1.0.9：§5.10 会话消息里的图片——缩略图内联 + 大图按需拉取；关于页展示用）。 */
+export const CONTRACT_VERSION: string = 'v1.0.9';
 
 /** 角色：host = PC 端 DSH 插件；client = 本 App。 */
 export const ROLE_HOST: string = 'host';

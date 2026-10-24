@@ -2,7 +2,8 @@
 
 > 状态：v1 契约（2026-10-20 由 Lead 冻结；**v1.0.6 于 2026-10-23 增补：会话时间线（工具步骤）
 > 与新建会话的「模式/权限」选择；v1.0.7 于 2026-10-24 增补：Workspace 真实归档同步
-> 与新建会话的模型选择；v1.0.8 于 2026-10-24 增补：模型思考强度目录与会话中切换模型**）。
+> 与新建会话的模型选择；v1.0.8 于 2026-10-24 增补：模型思考强度目录与会话中切换模型；
+> v1.0.9 于 2026-10-25 增补：会话消息里的图片（§5.10，缩略图内联 + 大图按需拉取）**）。
 > 三个实现（DSH 插件 / 中继服务器 / HarmonyOS App）
 > 都必须以本文档为准；任何协议改动必须先改本文档并通知 Lead。
 
@@ -128,6 +129,7 @@ dshrc://pair?r=<encodeURIComponent(relayUrl)>&c=<channel>&s=<secret>[&t=<encodeU
 | `session.prompt` | `{sessionId, text}` | `{accepted:bool}` | 立即返回；实际回复走事件流 |
 | `session.cancel` | `{sessionId}` | `{cancelled:bool}` | 取消当前运行的 turn |
 | `session.rename` | `{sessionId, title}` | `{title}` | |
+| `image.fetch` | `{imageId, maxEdge?:number}` | `{imageId, mediaType, width, height, data:"data:<mediaType>;base64,…"}` | **v1.0.9** 拉取图片大图（§5.10）：`maxEdge` 缺省 1600、上限 4096；插件等比缩放后回 data URI，单张 ≤ 1MiB（中继硬上限），失败回 `error`（不影响消息流） |
 | `approval.answer` | `{askId, decision:"approved"\|"rejected", note?}` | `{applied:bool}` | decision 只允许 approved/rejected |
 | `question.answer` | `{askId, answers:{ [questionId]: value }, freeText?}` | `{applied:bool}` | answers 结构见 §5.4 |
 | `push.register` | `{pushToken, platform:"harmonyos"}` | `{registered:bool}` | 手机拿到 Push Token 后上报 |
@@ -145,6 +147,7 @@ dshrc://pair?r=<encodeURIComponent(relayUrl)>&c=<channel>&s=<secret>[&t=<encodeU
 | `session.activity` | `{sessionId, updatedAt}` | 事件 `api-session/activity` |
 | `assistant.delta` | `{sessionId, text}` | 事件 `agent/assistant-stream`（文本增量；**按 sessionId 合并节流 ≤8 条/秒**） |
 | `assistant.reasoningDelta` | `{sessionId, text}` | **v1.0.7** `agent/assistant-stream` 的 `reasoning-delta` 思考增量；与文本分流，客户端合并进「思考过程」块 |
+| `assistant.image` | `{sessionId, image:ImageRef}` | **v1.0.9** 会话消息里的图片（§5.10）：源为 Host 会话事件的 `content` 块 `type:"image"`（附件引用） |
 | `tool.call` | `{sessionId, callId, name, arguments, ts}` | **v1.0.6** Host 会话事件 `tool/call`（模型发起一次工具调用） |
 | `tool.result` | `{sessionId, callId, status:"ok"\|"error", resultText, errorText?, ts}` | **v1.0.6** Host 会话事件 `tool/result`（工具调用结束；`resultText` 为结果文本，失败时 `errorText` 为原因） |
 | `system.message` | `{sessionId, kind:"system"\|"developer", text, ts}` | **v1.0.6** Host 会话事件 `system/message` / `developer/message`（系统提示注入等非对话内容） |
@@ -310,6 +313,46 @@ Host `sessionController.list` 本身仍不回归档标记，插件必须用
 - 插件订阅 `ctx.on("domain/changed", …)`；`domain==="workspace"` 且 `table===""` / `operation==="put"`
   时读取最新 `archivedSessionIds`，向手机广播 `session.archives` **全集**。桌面端与手机端的归档变化因此一致。
 - `archiveSupported=false` 表示宿主没有 Workspace 注册表或归档方法；客户端应隐藏/禁用归档动作并提示，不能退回本机归档。
+
+### 5.10 会话消息里的图片（v1.0.9）
+
+宿主会话消息的 `content` 块里图片是**附件引用**（不是内联 base64）：
+
+```json
+{ "type": "image", "attachment": { "attachmentId": "…", "mediaType": "image/png",
+                                    "bytes": 123456, "width": 800, "height": 600 } }
+```
+
+中继单帧上限 **1MiB**（密文帧），原图直传必然超限，故采用**「缩略图内联 + 原图按需拉取」**两段式：
+
+**ImageRef**（出现在 `ChatMessage.images[]` 与 `assistant.image` 事件 data 里）：
+
+```json
+{ "imageId": "…",            // 宿主 attachmentId（同会话内稳定）
+  "mediaType": "image/png",  // image/png | image/jpeg | image/webp | image/gif
+  "width": 800, "height": 600,
+  "bytes": 123456,           // 原始字节数（宿主侧）
+  "thumb": "data:image/jpeg;base64,…" }  // 缩略图 data URI（长边 ≤ 480、JPEG q75）
+```
+
+- `ChatMessage` **v1.0.9** 新增可选字段 `images:ImageRef[]`——旧插件不返该字段时客户端当空数组处理。
+- `assistant.image` 事件：图片随消息到达时推送 `{sessionId, image:ImageRef}`；
+  客户端把它挂到**该会话当前正在流式的 assistant 消息**上（无流式消息时按到达序单独成一条图片消息）。
+- 缩略图**必须**在事件/历史里内联（客户端才能立刻显示），但**必须**压缩到
+  **≤ 96KB base64**；超限时插件降质重压，仍超限则**只发元数据、thumb 留空**（客户端显示占位框）。
+- **大图浏览**：客户端点缩略图 → 发 `image.fetch`：
+
+| type | payload | 响应 value |
+|---|---|---|
+| `image.fetch` | `{imageId, maxEdge?:number}` | `{imageId, mediaType, width, height, data:"data:<mediaType>;base64,…"}` |
+
+  - `maxEdge` 缺省 1600（客户端放大时按需给更大值，上限 4096）。
+  - 插件按 `maxEdge` 等比缩放并压到 JPEG q85 后回 data URI；**单张回包 ≤ 1MiB**（中继硬上限），
+    超限时继续降质/降尺寸，仍超限回 `error`（客户端提示「原图过大，仅可看缩略图」）。
+  - 插件可缓存已缩放版本（同 `imageId` + `maxEdge`），重复查看不再重复压缩。
+  - `image.fetch` 失败**不得**影响会话其余功能（图片可选，不阻塞消息流）。
+- 客户端渲染口径：缩略图按 `width/height` 等比显示（最大宽度撑满气泡、最大高度 ≤ 320vp），
+  点击进大图浏览（全屏、支持双指缩放/拖动、关闭按钮）。
 
 ## 6. Push Kit（华为推送）旁路
 

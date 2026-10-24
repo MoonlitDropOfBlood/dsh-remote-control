@@ -86,6 +86,7 @@ struct MessageBubble {
       } else {
         // 助手：左对齐浅面卡片 + lv-markdown-in 渲染（标题/列表/表格/代码块/行内代码/
         // 引用/分割线全支持；text 随流式增量更新，库侧自带响应）。
+        // 宽度与「工作步骤」卡一致（铺满整行），不再压到 82%。
         Row() {
           Column() {
             Markdown({
@@ -93,12 +94,6 @@ struct MessageBubble {
               controller: this.mdController
             })
               .width('100%')
-            if (this.item.streaming) {
-              Text('▍')
-                .fontSize(FS_BODY)
-                .fontColor($r('app.color.brand_fill'))
-                .margin({ top: 2 })
-            }
             if (this.item.errorText.length > 0) {
               Text(this.item.errorText)
                 .fontSize(FS_SMALL)
@@ -106,9 +101,9 @@ struct MessageBubble {
                 .margin({ top: SP_1 })
             }
           }
-          .width('82%')
+          .width('100%')
           .alignItems(HorizontalAlign.Start)
-          .padding({ left: 12, right: 12, top: 10, bottom: 10 })
+          .padding({ left: SP_4, right: SP_2, top: SP_2, bottom: SP_2 })
           .backgroundColor($r('app.color.bg_layer_1'))
           .border({ width: HAIRLINE, color: $r('app.color.border_l1') })
           .borderRadius(RADIUS_BUBBLE)

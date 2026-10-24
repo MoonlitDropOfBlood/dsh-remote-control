@@ -14,6 +14,12 @@
 //   4. **Host 半边真跑一遍**：用临时 DSH_HOME 实例化类插件，走 [Service.init] →
 //      三个 Remote 方法被标记 → getPairing/rotateSecret/setHidden 的返回信封，
 //      并断言**返回体里没有 secret 明文**（只有二维码图像）。
+//   5. **combo 拼接安全**（2026-10-24 生产事故）：DSH web 服务器把所有 web client
+//      bundle **裸拼接**进同一个 combo <script>（buildComboScript，无作用域包裹）。
+//      顶层 const/let/class 会与其他 bundle 的同名声明相撞（我们与 token-stats 的
+//      const CLIENT_BUNDLE_ID 相撞，炸掉整个 combo，token-stats import failed）。
+//      client.js 必须整体包在 IIFE 里——与一个声明了同名顶层常量的「外来 bundle」
+//      双向拼接都要能编译通过。
 //
 // 用法：node scripts/verify-settings.mjs（在 plugin/ 目录下）
 import { readFileSync, mkdtempSync, rmSync } from "node:fs";
@@ -214,6 +220,34 @@ check("rotate 后返回的仍是新配对信息", rotated.value?.channel === ser
 check("rotate 后返回体仍无 secret 明文", !JSON.stringify(rotated).includes(oldSecret) && !JSON.stringify(rotated).includes(service._host.cfg.secret));
 
 rmSync(tmpHome, { recursive: true, force: true });
+
+// ---- 5. combo 拼接安全（2026-10-24 生产事故）---------------------------
+// buildComboScript 把所有 web client bundle 拼进同一个 <script>：
+// 任何顶层声明都可能与其他 bundle 撞名。client.js 必须是 IIFE 包裹的。
+{
+  const vm = await import("node:vm");
+  const foreign =
+    'const CLIENT_BUNDLE_ID = "@duke-dsh-plugins/dsh-token-stats";\n' +
+    'window.__ModuleLoader__.load({ id: CLIENT_BUNDLE_ID, factory: () => ({}) });\n';
+  let comboOk = true;
+  let comboErr = "";
+  try {
+    new vm.Script(foreign + clientSrc, { filename: "combo-foreign-first.js" });
+    new vm.Script(clientSrc + foreign, { filename: "combo-ours-first.js" });
+  } catch (e) {
+    comboOk = false;
+    comboErr = e.message;
+  }
+  check("combo 拼接安全（IIFE 包裹，与同名顶层外来 bundle 双向拼接均可编译）", comboOk, comboErr);
+  let body = clientSrc;
+  let stripped = null;
+  while (stripped !== body) {
+    stripped = body;
+    body = body.replace(/^\s*(?:\/\/[^\n]*\n|\/\*[\s\S]*?\*\/)/, "");
+  }
+  body = body.trimStart();
+  check("client.js 顶层零声明（IIFE 开头）", body.startsWith("(() => {") || body.startsWith("(function"), body.slice(0, 40));
+}
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

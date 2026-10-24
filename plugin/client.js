@@ -20,6 +20,13 @@
  * the HMR style owner (`data-plugin`) — client-modules keys style ownership off the
  * registered id, so the two must stay the same string.
  */
+// COMBO-SAFETY (2026-10-24 production incident): the DSH web server concatenates
+// every web client bundle into ONE combo <script> with NO scope wrapping
+// (client-modules buildComboScript). Any top-level const/let/class would collide
+// with the same name in another bundle (ours collided with token-stats' const
+// CLIENT_BUNDLE_ID and killed the whole combo). The whole file therefore lives
+// inside this IIFE: zero top-level declarations beyond the wrapper itself.
+(() => {
 const CLIENT_BUNDLE_ID = "@duke-dsh-plugins/dsh-remote-control";
 
 window.__ModuleLoader__.load({
@@ -445,3 +452,4 @@ const CLIENT_ICON_MASK_URI =
     return module.exports;
   },
 });
+})();

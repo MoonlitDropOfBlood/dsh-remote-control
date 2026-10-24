@@ -29,7 +29,7 @@ node --check index.js client.js typert.host.js lib/*.mjs scripts/*.mjs   # 语�
 node -e "import('./lib/protocol.mjs').then(m=>m.assertKat())"           # KAT
 node scripts/verify-qr.mjs && node scripts/verify-pairing.mjs           # QR/配对 API 回归（需 devDependencies）
 node scripts/verify-steps.mjs                                          # v1.0.8 步骤/模式/权限/归档/模型/思考/强度回归（无依赖，113 项）
-node scripts/verify-settings.mjs                                       # v1.1.x 设置页/manifest 结构自检 + Host 真跑一遍（66 项）
+node scripts/verify-settings.mjs                                       # v1.1.x 设置页/manifest/combo 自检 + Host 真跑一遍（68 项）
 node scripts/sync-client-icon.mjs                                      # 改了 icon.svg 后同步 client.js 的图标 data-uri
 ```
 
@@ -152,6 +152,14 @@ Remote 方法（返回 `{ok:true,value}` 或 `{ok:false,error:{code,message}}`�
 
 实测坑（改动前先读）：
 
+- **combo 拼接（2026-10-24 生产事故）**：DSH web 服务器把**所有** web client bundle **裸拼接**进
+  同一个 combo `<script>`（dsh-client-modules `buildComboScript`，无任何作用域包裹）。client.js
+  顶层一旦有 `const/let/class/function` 声明，就会与其他 bundle 的同名声明相撞——我们与
+  token-stats 的 `const CLIENT_BUNDLE_ID` 相撞，`Identifier has already been declared` 炸掉整个
+  combo，**别的插件**（token-stats）`import failed`，卸载我们才恢复。**client.js 必须整体包在
+  IIFE 里，顶层零声明**；`verify-settings.mjs` 的 combo 双向拼接编译检查 + IIFE 开头检查是常设
+  门禁，新增顶层声明会直接 FAIL。复现脚本 `scripts/repro-web-boot.mjs`（真实 loader + 真实
+  dsh-client-modules）。
 - **DSH 装载器 `unwrapExports` = `exports.default ?? exports`**：`default` 优先于具名 `apply`，
   所以类插件一旦存在，具名 `apply` 在 DSH 挂载路径上是死代码——两条路径共用
   `startRemoteHost(ctx, rowConfig)`，并用 `HOST_STATES`（WeakMap）做**同 ctx 幂等**，
@@ -166,4 +174,4 @@ Remote 方法（返回 `{ok:true,value}` 或 `{ok:false,error:{code,message}}`�
   `>svg:first-child{display:none}` + `::before` 用 currentColor mask 画自家图标。
 - **本包 CSS 标签要自己 `setAttribute("data-plugin", 包名)`**：`apply()` 是异步的，追加
   <style> 时 client-modules 的 `claimStyles(ownerId)` 扫描已经过去，不认领会被别的包收养。
-- 回归：`node scripts/verify-settings.mjs`（66 项，含 Host 半边真跑一遍）+ `node scripts/verify-pairing.mjs`（47 项）。
+- 回归：`node scripts/verify-settings.mjs`（68 项，含 combo 拼接安全 + Host 半边真跑一遍）+ `node scripts/verify-pairing.mjs`（47 项）。

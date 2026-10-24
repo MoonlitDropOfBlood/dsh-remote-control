@@ -16,6 +16,11 @@
       "buildFunction": "generatedHRouterConnectionsPageBuilder"
     },
     {
+      "name": "image_viewer",
+      "pageSourceFile": "src/main/ets/_generated/hrouter/ImageViewerPageGeneratedWrapper.ets",
+      "buildFunction": "generatedHRouterImageViewerPageBuilder"
+    },
+    {
       "name": "new_session",
       "pageSourceFile": "src/main/ets/_generated/hrouter/NewSessionPageGeneratedWrapper.ets",
       "buildFunction": "generatedHRouterNewSessionPageBuilder"

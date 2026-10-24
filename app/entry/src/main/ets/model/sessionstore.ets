@@ -24,12 +24,14 @@ import {
 import { DshrcLink, DshrcHostInfo, LinkPeers, LinkState, dshrcLink } from './link';
 import {
   DshrcMsg,
+  DshrcPayload,
   DshrcQuestion,
   DshrcSessionSummary,
   DshrcSubagentInfo,
   DshrcChatMessage,
   DshrcHistoryPage,
   DshrcCapabilities,
+  DshrcImageRef,
   DshrcModeOption,
   DshrcModelOption,
   DshrcModelSelection,
@@ -37,9 +39,11 @@ import {
   DshrcStepRecord,
   DshrcValue,
   MSG_EVENT,
+  MSG_IMAGE_FETCH,
   TOPIC_APPROVAL_REQUEST,
   TOPIC_APPROVAL_RESOLVED,
   TOPIC_ASSISTANT_DELTA,
+  TOPIC_ASSISTANT_IMAGE,
   TOPIC_ASSISTANT_REASONING_DELTA,
   TOPIC_ERROR,
   TOPIC_PUSH_STATE,
@@ -61,6 +65,14 @@ const TAG: string = 'dshrc-sessionstore';
 const PREF_NAME: string = 'dshrc_prefs';
 const KEY_PUSH_ENABLED: string = 'pushEnabled';
 const LOG_KEEP: number = 80;
+/** image.fetch 默认长边（契约 §5.10：maxEdge 缺省 1600、上限 4096）。 */
+const IMAGE_FETCH_DEFAULT_MAX_EDGE: number = 1600;
+/** image.fetch 长边上限（契约 §5.10）。 */
+const IMAGE_FETCH_MAX_EDGE: number = 4096;
+/** image.fetch 请求超时（ms）：大图压缩在宿主侧完成，可能略慢。 */
+const IMAGE_FETCH_TIMEOUT_MS: number = 20000;
+/** 大图内存缓存条目上限（超出按插入序淘汰最旧）。 */
+const IMAGE_CACHE_MAX: number = 24;
 
 /** 会话列表一行（契约 §5.3 SessionSummary 的可观察形态；v1.0.4 补 subagent/blank，
  *  v1.0.7 补 archived——Host 权威的 Workspace 归档标记）。 */
@@ -189,6 +201,8 @@ export class TimelineItem {
   @Trace resultText: string = '';
   @Trace turn: number = 0;
   @Trace step: number = 0;
+  /** v1.0.9：消息内图片（契约 §5.10）——空数组 = 该消息没有图片。 */
+  @Trace images: DshrcImageRef[] = [];
 
   constructor(id: string, kind: string, ts: number) {
     this.id = id;
@@ -368,6 +382,8 @@ export class SessionStore {
   private histMeta: Map<string, HistMeta> = new Map<string, HistMeta>();
   /** v1.0.8：各会话当前模型（源=session.model 请求 / session.modelChanged 事件）。 */
   private modelCache: Map<string, DshrcModelSelection> = new Map<string, DshrcModelSelection>();
+  /** v1.0.9：大图内存缓存（key = imageId + '@' + maxEdge），避免重复拉取。 */
+  private imageCache: Map<string, string> = new Map<string, string>();
   private chatSeq: number = 0;
   /** 在途刷新（并发刷新合并到同一个 Promise，v1.0.6：不再直接 resolve 假装已刷新）。 */
   private pendingRefresh: Promise<SessionRefreshResult> | null = null;
@@ -880,6 +896,8 @@ export class SessionStore {
       mi.role = msg.role;
       mi.text = msg.text;
       mi.seq = msg.seq;
+      // v1.0.9：历史消息里的图片（旧插件不返该字段 → 空数组）
+      mi.images = msg.images !== undefined ? msg.images : [];
       pageItems.push(mi);
     }
     for (let n: number = 0; n < steps.length; n++) {
@@ -1075,7 +1093,8 @@ export class SessionStore {
     this.notifyActive(sid);
   }
 
-  /** system.message 事件：追加一条系统/开发者消息（说明行，不占气泡）。 */
+  /**
+   * system.message 事件：追加一条系统/开发者消息（说明行，不占气泡）。 */
   private appendSystem(sid: string, kind: string, text: string, ts: number): void {
     if (sid.length === 0 || text.length === 0) {
       return;
@@ -1087,6 +1106,101 @@ export class SessionStore {
     si.text = text;
     items.push(si);
     this.notifyActive(sid);
+  }
+
+  // ---- 图片（契约 §5.10 v1.0.9）----
+
+  /**
+   * assistant.image 事件（契约 §5.10 v1.0.9）：图片挂到**该会话当前正在流式的
+   * assistant 消息**上；没有正在流式的 assistant 消息时，按到达顺序**单独成一条
+   * 图片消息**（kind='message'、role='assistant'、text 为空串、images 带这一张）。
+   * 同一 imageId 重复到达时幂等（不重复挂）。
+   */
+  private appendImage(sid: string, image: DshrcImageRef): void {
+    if (sid.length === 0 || image.imageId.length === 0) {
+      return;
+    }
+    const items: TimelineItem[] = this.cacheOf(sid);
+    for (let i: number = items.length - 1; i >= 0; i--) {
+      const it: TimelineItem = items[i];
+      if (it.isMessage() && it.role === 'assistant' && it.streaming) {
+        if (!this.hasImage(it, image.imageId)) {
+          it.images = it.images.concat([image]);
+        }
+        this.notifyActive(sid);
+        return;
+      }
+    }
+    this.chatSeq = this.chatSeq + 1;
+    const mi: TimelineItem = new TimelineItem('p' + this.chatSeq.toString(), 'message', Date.now());
+    mi.role = 'assistant';
+    mi.text = '';
+    mi.images = [image];
+    items.push(mi);
+    this.notifyActive(sid);
+  }
+
+  /** 该消息上是否已挂了同 id 的图片（幂等判定）。 */
+  private hasImage(it: TimelineItem, imageId: string): boolean {
+    for (let i: number = 0; i < it.images.length; i++) {
+      if (it.images[i].imageId === imageId) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * 拉取图片大图（契约 §5.1 image.fetch / §5.10 v1.0.9）。
+   *  - maxEdge 缺省 1600、上限 4096（超出按上限截断）；
+   *  - 命中内存缓存直接返回（避免重复压缩 / 重复传输）；
+   *  - **失败吞掉并回 null**（图片可选，绝不抛崩 UI）。
+   */
+  fetchImage(imageId: string, maxEdge?: number): Promise<string | null> {
+    if (imageId.length === 0) {
+      return Promise.resolve(null);
+    }
+    let edge: number = maxEdge !== undefined ? maxEdge : IMAGE_FETCH_DEFAULT_MAX_EDGE;
+    if (edge <= 0) {
+      edge = IMAGE_FETCH_DEFAULT_MAX_EDGE;
+    }
+    if (edge > IMAGE_FETCH_MAX_EDGE) {
+      edge = IMAGE_FETCH_MAX_EDGE;
+    }
+    const key: string = imageId + '@' + edge.toString();
+    const cached: string | undefined = this.imageCache.get(key);
+    if (cached !== undefined) {
+      return Promise.resolve(cached);
+    }
+    const p: DshrcPayload = { imageId: imageId, maxEdge: edge };
+    return this.link.request(MSG_IMAGE_FETCH, p, IMAGE_FETCH_TIMEOUT_MS).then((v: DshrcValue): string | null => {
+      const data: string = v.data !== undefined ? v.data : '';
+      if (data.length === 0) {
+        logDshrc(TAG, 'warn', 'image.fetch empty payload: ' + imageId);
+        return null;
+      }
+      this.putImageCache(key, data);
+      return data;
+    }).catch((e: Error): string | null => {
+      // 契约 §5.10：image.fetch 失败不得影响会话其余功能
+      logDshrc(TAG, 'warn', 'image.fetch failed: ' + e.message);
+      return null;
+    });
+  }
+
+  /** 大图内存缓存写入（超出上限按插入序淘汰最旧）。 */
+  private putImageCache(key: string, data: string): void {
+    this.imageCache.set(key, data);
+    while (this.imageCache.size > IMAGE_CACHE_MAX) {
+      const oldest: string[] = [];
+      this.imageCache.forEach((v: string, k: string): void => {
+        oldest.push(k);
+      });
+      if (oldest.length === 0) {
+        break;
+      }
+      this.imageCache.delete(oldest[0]);
+    }
   }
 
   private cacheOf(sid: string): TimelineItem[] {
@@ -1367,6 +1481,15 @@ export class SessionStore {
         const sidR2: string = data.sessionId !== undefined ? data.sessionId : '';
         if (data.text !== undefined) {
           this.appendReasoningDelta(sidR2, data.text);
+        }
+        break;
+      }
+      case TOPIC_ASSISTANT_IMAGE: {
+        // 契约 §5.10 v1.0.9：会话消息里的图片（挂当前流式 assistant 消息 / 单独成一条）
+        const sidImg: string = data.sessionId !== undefined ? data.sessionId : '';
+        const img: DshrcImageRef | undefined = data.image;
+        if (img !== undefined) {
+          this.appendImage(sidImg, img);
         }
         break;
       }

@@ -71,6 +71,7 @@ export const MSG_SESSION_ARCHIVE: string = 'session.archive'; // v1.0.7：Worksp
 export const MSG_SESSION_UNARCHIVE: string = 'session.unarchive'; // v1.0.7：从 Workspace 归档恢复
 export const MSG_SESSION_SELECT_MODEL: string = 'session.selectModel'; // v1.0.8：会话中切换模型/思考强度
 export const MSG_SESSION_MODEL: string = 'session.model'; // v1.0.8：查询会话当前模型
+export const MSG_IMAGE_FETCH: string = 'image.fetch'; // v1.0.9：拉取图片大图（§5.10）
 export const MSG_SESSION_PROMPT: string = 'session.prompt';
 export const MSG_SESSION_CANCEL: string = 'session.cancel';
 export const MSG_SESSION_RENAME: string = 'session.rename';
@@ -92,6 +93,7 @@ export const TOPIC_SESSION_ARCHIVES: string = 'session.archives'; // v1.0.7：Wo
 export const TOPIC_SESSION_MODEL_CHANGED: string = 'session.modelChanged'; // v1.0.8：会话模型/强度变化
 export const TOPIC_ASSISTANT_DELTA: string = 'assistant.delta';
 export const TOPIC_ASSISTANT_REASONING_DELTA: string = 'assistant.reasoningDelta'; // v1.0.7：思考增量
+export const TOPIC_ASSISTANT_IMAGE: string = 'assistant.image'; // v1.0.9：会话消息里的图片（§5.10）
 export const TOPIC_TOOL_CALL: string = 'tool.call'; // v1.0.6：工具调用开始
 export const TOPIC_TOOL_RESULT: string = 'tool.result'; // v1.0.6：工具调用结束
 export const TOPIC_SYSTEM_MESSAGE: string = 'system.message'; // v1.0.6：系统/开发者消息
@@ -164,6 +166,9 @@ export interface DshrcPayload {
   subagents?: DshrcSubagentInfo[];
   parentSessionId?: string;
   childSessionId?: string;
+  // image.fetch（§5.1 v1.0.9：拉图片大图）
+  imageId?: string;
+  maxEdge?: number;
   // approval / question（§5.1）
   askId?: string;
   decision?: string;
@@ -248,6 +253,14 @@ export interface DshrcValue {
   archivedSessionIds?: string[];
   // session.subagents（§5.1 v1.0.5）：子代理目录
   subagents?: DshrcSubagentInfo[];
+  // image.fetch 响应（§5.10 v1.0.9）：大图 data URI + 尺寸
+  data?: string;
+  mediaType?: string;
+  width?: number;
+  height?: number;
+  imageId?: string;
+  // assistant.image 事件（§5.10 v1.0.9）：单张图片引用
+  image?: DshrcImageRef;
 }
 
 /** session.history 的单条历史消息（契约 §5.1 v1.0.4 ChatMessage）。 */
@@ -257,6 +270,23 @@ export interface DshrcChatMessage {
   text: string;
   ts: number;
   seq: number; // host 日志持久序号（去重键）
+  /** v1.0.9：消息内图片（§5.10）——旧插件不返该字段时按空数组处理。 */
+  images?: DshrcImageRef[];
+}
+
+/**
+ * 会话消息里的图片引用（契约 §5.10 v1.0.9）。
+ *  出现在 ChatMessage.images[] 与 assistant.image 事件 data 里。
+ *  thumb 是**内联缩略图** data URI（长边 ≤ 480、JPEG q75，≤ 96KB base64）；
+ *  插件降质后仍超限时只发元数据、thumb 留空（客户端显示占位框）。
+ */
+export interface DshrcImageRef {
+  imageId: string; // 宿主 attachmentId（同会话内稳定）
+  mediaType: string; // image/png | image/jpeg | image/webp | image/gif
+  width: number; // 原图宽（px）
+  height: number; // 原图高（px）
+  bytes: number; // 原始字节数（宿主侧）
+  thumb: string; // 缩略图 data URI（可能为空串）
 }
 
 /** session.history 响应 value（契约 §5.1 v1.0.4）。 */

@@ -33,6 +33,8 @@
 
     { "name": "fill_hover", "value": "#0A17181C" },
     { "name": "fill_pressed", "value": "#1417181C" },
-    { "name": "scrim", "value": "#6617181C" }
+    { "name": "scrim", "value": "#6617181C" },
+
+    { "name": "image_viewer_bg", "value": "#000000" }
   ]
 }

@@ -37,6 +37,7 @@ import { Remote, TypertRemoteService } from "@deepseek-ai/dsh-typert-protocol";
 import { assertKat } from "./lib/protocol.mjs";
 import { loadConfig, saveConfig, dataDir } from "./lib/config.mjs";
 import { RelayClient } from "./lib/relay-client.mjs";
+import { RelaySupervisor } from "./lib/relay-supervisor.mjs";
 import { PushSender, pushConfigured, pushUnavailableReason } from "./lib/push.mjs";
 import { HostBridge } from "./lib/host-bridge.mjs";
 import {
@@ -146,6 +147,12 @@ export function startRemoteHost(ctx, rowConfig) {
     startLink: null,
     /** 停止并释放当前链路（清空中继地址时用）。 */
     stopLink: null,
+    /** 中继进程托管器（v1.1.1：本机中继随插件启动/停止）。 */
+    supervisor: null,
+    /** 托管状态快照（设置页展示）。 */
+    relayProcess: null,
+    /** 看门狗定时器（托管进程意外退出后自动重拉）。 */
+    relayWatchdog: null,
   };
   HOST_STATES.set(ctx, state);
 
@@ -176,6 +183,45 @@ export function startRemoteHost(ctx, rowConfig) {
       /* ignore */
     }
   }
+
+  // ---- 4b. 中继进程托管（v1.1.1）--------------------------------------------
+  // 中继是本方案的服务端，不该靠人手起：插件启动时把**本机**中继拉起来，
+  // 插件卸载/DSH 退出时收掉（只按 child handle 停自己起的那个进程）。
+  const supervisor = new RelaySupervisor({
+    log: (level, msg, extra) => log(level, "relay supervisor: " + msg, extra),
+  });
+  state.supervisor = supervisor;
+
+  /**
+   * 确保本机中继在跑（幂等）。中继没起来时链路客户端会自己退避重连，
+   * 所以这里不阻塞插件启动。
+   */
+  async function ensureRelayProcess() {
+    try {
+      const snapshot = await supervisor.ensure(state.cfg.relayUrl, {
+        autoStart: state.cfg.autoStartRelay !== false,
+        relayToken: state.cfg.relayToken,
+      });
+      state.relayProcess = snapshot;
+      if (snapshot.managed) {
+        log("info", snapshot.detail, { pid: snapshot.pid, port: snapshot.port });
+      } else if (snapshot.detail) {
+        log("info", snapshot.detail, { port: snapshot.port });
+      }
+    } catch (e) {
+      log("error", "relay supervisor failed", { error: String(e && e.message) });
+    }
+  }
+
+  // 看门狗：托管的中继意外退出（例如被外部杀掉）后自动重拉。
+  // 15s 一次；只在本机托管场景有意义，且 ensure() 本身幂等（端口占用就不重复起）。
+  state.relayWatchdog = setInterval(() => {
+    const snap = state.relayProcess;
+    if (!snap || !snap.managed) return;
+    if (snap.running) return;
+    void ensureRelayProcess();
+  }, 15_000);
+  if (typeof state.relayWatchdog.unref === "function") state.relayWatchdog.unref();
 
   /**
    * 建立中继链路：已有客户端 → 热更换（换地址立即重连）；没有 → 新建客户端 + 桥接。
@@ -241,11 +287,18 @@ export function startRemoteHost(ctx, rowConfig) {
 
   state.startLink = startLink;
   state.stopLink = stopLink;
+  state.ensureRelayProcess = ensureRelayProcess;
 
   // ---- 5. 卸载清理（插件热卸载时释放 socket/定时器/监听）-------------------
   // 无论当前是否在跑链路都要注册：设置页稍后起链路时同样要能收回资源。
   ctx.effect(() => () => {
     stopLink();
+    // v1.1.1：收掉**自己起的**中继子进程（只按 child handle 停，不按名字/端口杀）
+    if (state.relayWatchdog) {
+      clearInterval(state.relayWatchdog);
+      state.relayWatchdog = null;
+    }
+    void supervisor.stop();
     log("info", "unloaded");
   });
 
@@ -280,6 +333,10 @@ export function startRemoteHost(ctx, rowConfig) {
       dataDir: dataDir(),
     });
   }
+
+  // v1.1.1：中继进程随插件启动（不阻塞上面的链路建立——中继没起来时
+  // 链路客户端会自己退避重连，中继一上线就能连上）。
+  void ensureRelayProcess();
 
   return state;
 }
@@ -363,7 +420,7 @@ export class RemoteControlService extends TypertRemoteService {
     if (cfg.hidden === true) {
       return {
         ok: true,
-        value: pairingValue(cfg, "配对已隐藏：手机端请使用此前扫码保存的配对信息。", false),
+        value: withRelayProcess(pairingValue(cfg, "配对已隐藏：手机端请使用此前扫码保存的配对信息。", false), host),
       };
     }
     // 未配置 relayUrl：给出明确指引（**不返回 URI/secret**）
@@ -375,7 +432,7 @@ export class RemoteControlService extends TypertRemoteService {
         error: { code: "pairing-unavailable", message: String(e && e.message) },
       };
     }
-    return { ok: true, value: pairingValue(cfg, "", true) };
+    return { ok: true, value: withRelayProcess(pairingValue(cfg, "", true), host) };
   }
 
   /**
@@ -483,6 +540,9 @@ export class RemoteControlService extends TypertRemoteService {
     if (raw === "") {
       // 清除：停掉链路，插件回到空转（不连接、不拦截）
       host.stopLink?.();
+      // v1.1.1：地址清空 → 收掉托管的中继进程（否则会留一个没人用的中继）
+      void host.supervisor?.stop();
+      host.relayProcess = null;
       note = "中继地址已清除，插件已停止连接中继（空转）。填写地址后可立即重新连接。";
     } else {
       const link = host.startLink ? host.startLink() : { ok: false, message: "链路控制不可用。" };
@@ -491,12 +551,14 @@ export class RemoteControlService extends TypertRemoteService {
           ? "中继地址已更新，链路已用新地址重连。"
           : "中继地址已更新，链路已启动。"
         : "中继地址已保存，但链路未启动：" + (link.message || "未知原因");
+      // v1.1.1：地址变了 → 托管进程要跟着换（端口可能也变了）
+      void host.ensureRelayProcess?.();
     }
     const warn = loopbackWarning(raw);
     if (warn) note = (note ? note + " " : "") + warn;
 
     const value = pairingValue(host.cfg, note, raw !== "");
-    return { ok: true, value };
+    return { ok: true, value: withRelayProcess(value, host) };
   }
 }
 
@@ -515,6 +577,8 @@ function pairingValue(cfg, note, withQr) {
     hidden: cfg?.hidden === true,
     qrSvg: "",
     note: typeof note === "string" ? note : "",
+    /** v1.1.1：中继进程托管状态（设置页展示；老客户端忽略即可）。 */
+    relayProcess: null,
   };
   if (!withQr || value.hidden) return value;
   try {
@@ -529,6 +593,33 @@ function pairingValue(cfg, note, withQr) {
   } catch (e) {
     value.note = (value.note ? value.note + " " : "") + String(e && e.message);
   }
+  return value;
+}
+
+/**
+ * 给配对信息挂上**中继进程托管状态**（v1.1.1）。
+ *
+ * 设置页据此显示「中继进程：由插件托管 · 运行中（pid 1234）」之类的一行，
+ * 让用户知道中继是谁在管。快照取自 supervisor 的内存状态——不含任何敏感信息。
+ *
+ * @param {any} value pairingValue() 的结果
+ * @param {any} host  插件宿主状态
+ * @returns {any} 同一个 value（就地补字段）
+ */
+function withRelayProcess(value, host) {
+  const snap = host?.relayProcess;
+  value.relayProcess = {
+    /** 是否由插件托管（配置允许 + relayUrl 指向本机 + 找到中继程序）。 */
+    managed: snap?.managed === true,
+    /** 中继是否在跑（托管的子进程活着，或端口上已有服务）。 */
+    running: snap?.running === true,
+    /** 托管子进程 pid（未运行时 0）。 */
+    pid: typeof snap?.pid === "number" ? snap.pid : 0,
+    /** 监听端口（未托管时 0）。 */
+    port: typeof snap?.port === "number" ? snap.port : 0,
+    /** 人类可读的一句话状态。 */
+    detail: typeof snap?.detail === "string" ? snap.detail : "",
+  };
   return value;
 }
 

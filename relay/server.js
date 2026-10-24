@@ -510,4 +510,17 @@ if (isMain) {
   };
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+  // 父进程看门狗（仅当插件以 DSHRC_RELAY_PARENT_WATCHDOG=1 托管本进程时启用）：
+  // 父进程用 stdio 的 stdin 管道 spawn 本进程，父进程一旦退出管道即 EOF →
+  // 这里收到 'end' 就优雅关停，避免 DSH 崩溃/被杀后留下孤儿中继。
+  // 手工 `node server.js` 启动时该变量不存在，行为完全不变。
+  if (process.env.DSHRC_RELAY_PARENT_WATCHDOG === '1' && process.stdin) {
+    process.stdin.on('end', () => {
+      relay.log.info('parent process gone, shutting down');
+      relay.stop().then(() => process.exit(0));
+    });
+    // 不让 stdin 保持活跃引用拖住事件循环退出
+    process.stdin.resume();
+  }
 }

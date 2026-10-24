@@ -247,6 +247,26 @@ const CLIENT_ICON_MASK_URI =
       return { ok: false, message: err.message || err.code || "未知错误" };
     }
 
+    /**
+     * 中继进程托管状态 → 一行中文（v1.1.1）。
+     * 宿主没给这个字段（旧插件）时显示「由外部管理」，不报错。
+     * @param {any} snap 宿主返回的 relayProcess 快照
+     * @returns {string}
+     */
+    function relayProcessText(snap) {
+      if (!snap || typeof snap !== "object") return "由外部管理";
+      if (snap.managed === true) {
+        if (snap.running === true) {
+          const pid = typeof snap.pid === "number" && snap.pid > 0 ? "（pid " + snap.pid + "）" : "";
+          return "插件托管 · 运行中" + pid;
+        }
+        return "插件托管 · 未运行";
+      }
+      const detail = typeof snap.detail === "string" ? snap.detail : "";
+      if (detail) return detail;
+      return "由外部管理";
+    }
+
     async function apply(ctx) {
       try {
         await applyInner(ctx);
@@ -406,8 +426,7 @@ const CLIENT_ICON_MASK_URI =
               { className: "rc-loading" },
               React.createElement("span", { className: "rc-spinner" }),
               React.createElement("span", null, "正在读取配对信息…"),
-            ),
-          );
+            ),          );
         }
 
         const value = state.value || {};
@@ -416,7 +435,6 @@ const CLIENT_ICON_MASK_URI =
         const channel = value.channel || "";
         const qrSvg = value.qrSvg || "";
         const relayInput = relayDraft === null ? relayUrl : relayDraft;
-
         return React.createElement(
           "div",
           { className: "rc-page" },
@@ -484,6 +502,21 @@ const CLIENT_ICON_MASK_URI =
                 { className: "rc-field" },
                 React.createElement("span", { className: "rc-label" }, "配对频道"),
                 React.createElement("span", { className: "rc-value" }, channel || "（无）"),
+              ),
+            ),
+            // v1.1.1：中继进程托管状态（让用户知道中继是谁在管、是否在跑）
+            React.createElement(
+              "div",
+              { className: "rc-row" },
+              React.createElement(
+                "div",
+                { className: "rc-field" },
+                React.createElement("span", { className: "rc-label" }, "中继进程"),
+                React.createElement(
+                  "span",
+                  { className: "rc-value" },
+                  relayProcessText(value.relayProcess),
+                ),
               ),
             ),
           ),

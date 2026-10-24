@@ -36,6 +36,11 @@ PORT=8788 node server.js       # 本机起（联调常用 8788）
 - 端口解析允许 `PORT=0`（内核随机端口，测试用）——`intFromEnv` 的 `>0` 判断曾把 0
   回落 8787 导致测试端口冲突（实测坑），portFromEnv 单独处理。
 - 限速按 TCP 源地址（不读 header，防伪造）；反代同机部署会共享限速桶，README 有对策。
+- **父进程看门狗（v1.1.1）**：以 `DSHRC_RELAY_PARENT_WATCHDOG=1` 启动时，中继会监听
+  stdin 的 EOF——父进程（DSH 插件托管它）一旦退出，管道关闭 → 中继自己优雅 `stop()` 后退出，
+  **不留孤儿进程**。手工 `node server.js` 不带该变量，行为完全不变。
+  托管方见 `../plugin/lib/relay-supervisor.mjs`（只停自己 spawn 的那个 child handle，
+  绝不按进程名/端口批量杀）。
 
 ## 部署
 

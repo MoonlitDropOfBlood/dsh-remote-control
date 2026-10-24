@@ -53,6 +53,8 @@ export function defaultConfig() {
     enabled: true,
     /** 中继地址，如 wss://relay.example.com/ws；空串 = 未配置，插件空转。 */
     relayUrl: "",
+    /** v1.1.1：是否由插件托管本机中继进程（随插件启动/停止）。false = 保持旧行为（外部自己起）。 */
+    autoStartRelay: true,
     /** 中继自身鉴权 token（可选，部署方配置 RELAY_TOKEN 时填写）。 */
     relayToken: "",
     /** 配对 channel / secret（首次启动生成；手机端配对页输入同样值）。 */

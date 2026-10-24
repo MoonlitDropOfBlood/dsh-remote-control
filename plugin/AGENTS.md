@@ -14,6 +14,7 @@ typert.host.js        TYPERT Host manifest（package/face/invocations + strict c
 lib/protocol.mjs      信封 + HKDF-SHA256 + AES-256-GCM + assertKat()（契约 §3/§7）
 lib/config.mjs        %DSH_HOME%/remote-control/config.json 读写（首启生成 channel/secret、hidden 标记）
 lib/relay-client.mjs  中继 WS 客户端（退避重连/心跳/sid:seq 去重/reload 热更换）
+lib/relay-supervisor.mjs 中继进程托管（v1.1.1）：本机中继随插件启停；只停自己 spawn 的 child
 lib/host-bridge.mjs   Host 桥接：sessionController + api-session/agent 事件 + 审批/提问瀑布
 lib/images.mjs        会话消息里的图片（契约 §5.10）：image 块识别 + sharp 缩略图/大图
                       （imageBlocksOf / makeThumb / makeLarge / imageRefMeta）
@@ -34,6 +35,7 @@ node scripts/verify-qr.mjs && node scripts/verify-pairing.mjs           # QR/配
 node scripts/verify-steps.mjs                                          # v1.0.9 步骤/模式/权限/归档/模型/思考/强度 + 图片回归（无依赖，154 项）
 node scripts/verify-images.mjs                                         # v1.0.9 图片专项：元数据映射/缩略图降级/image.fetch 缓存与报错/帧预算守卫（无依赖，88 项）
 node scripts/verify-settings.mjs                                       # v1.1.x 设置页/manifest/combo/信封自检 + Host 真跑一遍（112 项）
+node scripts/verify-relay-supervisor.mjs                               # v1.1.1 中继进程托管：决策/端口占用不抢/启停/父进程看门狗（无依赖，30 项）
 node scripts/sync-client-icon.mjs                                      # 改了 icon.svg 后同步 client.js 的图标 data-uri
 ```
 
@@ -184,6 +186,31 @@ ESM 模块缓存不会重载源码（实测踩坑）。
   + `node scripts/verify-images.mjs` **88 项**（图片专项：元数据映射、缩略图降级阶梯、
   image.fetch 缓存命中/重启后报错、日志无 base64、**帧预算守卫**：剥缩略图 → 丢 images[] →
   overflow 回 error、预算常量关系、多图历史回包不超明文预算）。
+
+## v1.1.1：中继进程随插件托管（2026-10-25）
+
+中继是这套方案的**服务端**，不该靠人手 `node relay/server.js` 起。插件启动时把**本机**中继拉起来，
+插件卸载 / DSH 退出时收掉。实现见 `lib/relay-supervisor.mjs`。
+
+- **只托管本机中继**：`relayUrl` 指向 VPS/另一台机器 → **不 spawn**（那是别人的服务）。
+  判定 `isLocalHost()`：loopback + 本机所有网卡地址；公网地址一律不托管。
+- **端口已被占用就不抢**：TCP connect 探测到有人监听 → 不 spawn、不杀，只如实报告
+  「端口 N 已有服务监听」。外部自起的中继优先。
+- **只停自己起的进程**：SIGTERM → 宽限 3s → SIGKILL，**全程按 child handle**，
+  绝不按进程名/端口批量杀（曾因此误杀 DSH 后端，见全局记忆 process-cleanup-managed-jobs-only）。
+- **父子绑定不留孤儿**：子进程以 `DSHRC_RELAY_PARENT_WATCHDOG=1` 起，监听 stdin EOF；
+  DSH 进程一死管道关闭 → 中继自己优雅退出。手工 `node server.js` 不带该变量，行为不变。
+- **配置开关**：`config.json` 的 `autoStartRelay`（默认 true）；关掉 = 完全保持旧行为。
+- **入口解析**：`resolveRelayEntry()` 按 `<plugin>/../relay/server.js` →
+  `<plugin>/node_modules/dsh-remote-control-relay/server.js` → `DSHRC_RELAY_ENTRY` 顺序找。
+- **看门狗**：托管进程意外退出后 15s 内自动重拉（`ensure()` 幂等，不会重复起）。
+- **设置页可见**：`getPairing()` / `setRelayUrl()` 的 value 带 `relayProcess`
+  `{managed, running, pid, port, detail}`，设置页「中继进程」一行显示「插件托管 · 运行中（pid N）」。
+- **spawn 用 process.execPath**：DSH 后端是**独立 node.exe**（不是 Electron 主进程），
+  直接 spawn `process.execPath` 即可；Electron 宿主才需要 `ELECTRON_RUN_AS_NODE`。
+- 回归：`node scripts/verify-relay-supervisor.mjs` **30 项**（纯函数决策 / 远端不托管 /
+  autoStart=false 不托管 / 找不到入口不托管 / 端口占用不抢 / 真 spawn 桩中继并 stop /
+  父进程看门狗退出）。
 
 ## v1.1.x：配对入口搬进设置面板（2026-10-24）
 

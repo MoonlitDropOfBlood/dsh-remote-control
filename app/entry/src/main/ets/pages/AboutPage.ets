@@ -120,22 +120,16 @@ export struct AboutPage {
           Column() {
             // 品牌头
             Column() {
-              Stack() {
-                Text('DSH')
-                  .fontSize(15)
-                  .fontWeight(FontWeight.Bold)
-                  .fontColor($r('app.color.label_on_brand'))
-              }
-              .width(56)
-              .height(56)
-              .borderRadius(RADIUS_CARD)
-              .backgroundColor($r('app.color.brand_fill'))
+              Image($r('app.media.startIcon'))
+                .width(64)
+                .height(64)
+                .borderRadius(RADIUS_CARD)
               Text(APP_NAME)
                 .fontSize(FS_SUBTITLE)
                 .fontWeight(FontWeight.Bold)
                 .fontColor($r('app.color.label_primary'))
                 .margin({ top: SP_3 })
-              Text('HarmonyOS 手机远程控制 DeepSeek Harness')
+              Text('掌上的 DeepSeek Harness')
                 .fontSize(FS_SMALL)
                 .fontColor($r('app.color.label_secondary'))
                 .margin({ top: SP_1 })
@@ -218,7 +212,7 @@ export struct AboutPage {
                 .fontColor($r('app.color.label_primary'))
                 .width('100%')
                 .margin({ bottom: SP_2 })
-              Text('MIT License · © 2026 Duke / dsh-remote-control contributors')
+              Text('MIT License · © 2026 dsh / dsh-remote-control contributors')
                 .fontSize(FS_SMALL)
                 .fontColor($r('app.color.label_secondary'))
                 .width('100%')

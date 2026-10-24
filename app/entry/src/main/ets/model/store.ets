@@ -19,7 +19,7 @@ const KEY_SECRET: string = 'secret';
 const KEY_RELAY_TOKEN: string = 'relayToken';
 
 /** 应用名与版本（与 AppScope/app.json5 versionName 保持一致；hello.appVersion 与关于页展示用）。 */
-export const APP_NAME: string = 'dsh-remote-control';
+export const APP_NAME: string = 'DSH Pocket';
 export const APP_VERSION: string = '1.0.0';
 
 /** 配对配置（UI 与链路层共用的形状）。 */

@@ -2,7 +2,7 @@
   "string": [
     {
       "name": "module_desc",
-      "value": "dsh-remote-control entry module"
+      "value": "DSH Pocket entry module"
     },
     {
       "name": "EntryAbility_desc",
@@ -10,7 +10,7 @@
     },
     {
       "name": "EntryAbility_label",
-      "value": "dsh-remote-control"
+      "value": "DSH Pocket"
     }
   ]
 }

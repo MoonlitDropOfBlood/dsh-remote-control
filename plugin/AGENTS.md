@@ -207,8 +207,14 @@ node scripts/sync-client-icon.mjs                                      # 改了 
   判定 `isLocalHostResolved()`：loopback + 本机所有网卡地址 + **DNS 解析后的本机地址**；
   解析失败按「非本机」处理（保守）。
 - **端口已被占用就不抢**：TCP connect 探测 → 不 spawn、不杀，只如实报告
-  「端口 N 已有服务监听」（状态 `external:true`，看门狗据此不干预）。
+  「端口 N 已有服务监听」（状态 `external:true` / `reason:'external'`）。
   探测**同时看 127.0.0.1 与目标 host**——只探 127.0.0.1 会漏判「只绑了 LAN IP 的外部服务」。
+- **看门狗每轮都要重探端口（别信 external 标记）**：`external` **不是终态**——
+  占用者随时可能消失（插件热重载就是这种竞态：新实例启动看到端口被占 → 判 external，
+  随后旧实例被卸载把中继杀了）。故 `shouldRestartRelay()` 对 `reason:'external'` **返回 true**，
+  让 ensure() 再探一次：空了 → 插件接管；还占着 → 继续报 external。
+  状态另带 `reason`（not-configured / disabled / remote / no-entry / external / managed），
+  看门狗据此决定要不要探——远端/未配置不探（省掉无谓的 DNS 查询）。
 - **只停自己起的进程**：全程按 child handle，**绝不按进程名/端口批量杀**
   （曾因此误杀 DSH 后端，见全局记忆 process-cleanup-managed-jobs-only）。
 - **跨平台停止语义（实测差异）**：

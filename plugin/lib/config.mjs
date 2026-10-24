@@ -58,6 +58,8 @@ export function defaultConfig() {
     /** 配对 channel / secret（首次启动生成；手机端配对页输入同样值）。 */
     channel: "",
     secret: "",
+    /** 配对是否隐藏（设置页「隐藏配对」）：true 时界面不展示二维码。 */
+    hidden: false,
     /** approval.request / question.request 拦截开关（契约 §5.5）。 */
     interceptApprovals: true,
     interceptQuestions: true,

@@ -31,7 +31,7 @@
 ```bash
 cd relay && npm install && node server.js            # 中继（默认 8787；联调常用 8788）
 # DSH 插件：plugin_manager install_bundle → plugin/ （link 安装）
-# 配对：DSH 会话发 /remote-pairing → 手机 App 扫码
+# 配对：DSH「设置 → DSH Pocket」分区展示二维码 → 手机 App 扫码（v1.1.x 起；旧的 /remote-pairing 命令已删除）
 ```
 
 ## 全局约定
@@ -43,7 +43,7 @@ cd relay && npm install && node server.js            # 中继（默认 8787；�
 3. **git 提交**：`git -c user.name="dsh-remote-control" -c user.email="dev@localhost" commit`，
    提交信息英文祈使句，说清行为变化。
 4. **零公网部署是默认模式**：relay 跑在 PC 上，手机连 `ws://<PC-IP>:<port>`。
-   `/remote-pairing` 对 loopback 地址（127.0.0.1）会打警告。
+   设置页「DSH Pocket」分区对 loopback 地址（127.0.0.1）会打警告。
 5. 真机问题一律 `devecocli log --device <serial> --crash` 抓堆栈再修，不许猜。
 6. **进程安全**：临时服务分别用受管 background job 启动并按 job_id 停止，命令内不得再用 `&`
    脱离作业；禁止按进程名或端口批量强杀（曾因此误杀 DSH 后端）。详见 e2e/AGENTS.md。

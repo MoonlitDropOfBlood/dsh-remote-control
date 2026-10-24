@@ -6,42 +6,65 @@ Cordis 功能插件：把 DSH 的会话/审批/事件桥接到中继，供手机
 ## 结构
 
 ```
-index.js              Cordis 入口 apply(ctx, config)：KAT→配置→命令注册→装配→ctx.effect 清理
+index.js              Cordis 类插件入口：export default class RemoteControlService extends TypertRemoteService
+                      （服务名 remoteControl；[Service.init] 启动宿主链路 + 标记三个 Remote 方法；
+                        另保留函数式 apply(ctx, config) 供函数插件宿主使用，两条路共用 startRemoteHost）
+client.js             Web 半边：window.__ModuleLoader__.load → 注册「设置 → DSH Pocket」分区
+typert.host.js        TYPERT Host manifest（package/face/invocations + strict codec，每个 codec 带 create()）
 lib/protocol.mjs      信封 + HKDF-SHA256 + AES-256-GCM + assertKat()（契约 §3/§7）
-lib/config.mjs        %DSH_HOME%/remote-control/config.json 读写（首启生成 channel/secret）
+lib/config.mjs        %DSH_HOME%/remote-control/config.json 读写（首启生成 channel/secret、hidden 标记）
 lib/relay-client.mjs  中继 WS 客户端（退避重连/心跳/sid:seq 去重/reload 热更换）
 lib/host-bridge.mjs   Host 桥接：sessionController + api-session/agent 事件 + 审批/提问瀑布
-lib/pairing.mjs       /remote-pairing 命令：QR（SVG+ASCII）/rotate/hide（契约 §3.5）
+lib/pairing.mjs       配对核心：URI（§3.5）/QR（SVG+ASCII）/rotatePairingIdentity/setPairingHidden
 lib/qr.mjs            内嵌 QR 编码器（移植 Nayuki qrcodegen，MIT；byte 模式 ECC-M v1-10）
 lib/push.mjs          Push Kit REST（token 缓存 + messages:send，失败静默降级）
-scripts/verify-*.mjs  dev 验证脚本（jsqr 独立解码 + 命令全路径 mock）
+scripts/verify-*.mjs  dev 验证脚本（jsqr 独立解码 + 配对 API mock + 设置页结构自检）
+scripts/sync-client-icon.mjs  把 icon.svg 同步成 client.js 里的导航图标 CSS mask data-uri
 ```
 
 ## 构建与验收
 
 ```bash
-node --check index.js lib/*.mjs scripts/*.mjs          # 语法
-node -e "import('./lib/protocol.mjs').then(m=>m.assertKat())"   # KAT
-node scripts/verify-qr.mjs && node scripts/verify-pairing.mjs   # QR/命令回归（需 devDependencies）
-node scripts/verify-steps.mjs                                # v1.0.8 步骤/模式/权限/归档/模型/思考/强度回归（无依赖，113 项）
+node --check index.js client.js typert.host.js lib/*.mjs scripts/*.mjs   # 语法
+node -e "import('./lib/protocol.mjs').then(m=>m.assertKat())"           # KAT
+node scripts/verify-qr.mjs && node scripts/verify-pairing.mjs           # QR/配对 API 回归（需 devDependencies）
+node scripts/verify-steps.mjs                                          # v1.0.8 步骤/模式/权限/归档/模型/思考/强度回归（无依赖，113 项）
+node scripts/verify-settings.mjs                                       # v1.1.x 设置页/manifest 结构自检 + Host 真跑一遍（66 项）
+node scripts/sync-client-icon.mjs                                      # 改了 icon.svg 后同步 client.js 的图标 data-uri
 ```
 
 安装/重载（link 安装，磁盘即运行源码）：plugin_manager `install_bundle` → 本目录。
 **改代码后必须 remove_bundle + install_bundle 才生效**——set_plugin toggle 只重跑 apply，
 ESM 模块缓存不会重载源码（实测踩坑）。
 
+> **改了 `plugin/icon.svg` 一定要跑 `node scripts/sync-client-icon.mjs`**：client.js 是静态
+> 浏览器包（无打包器），拿不到包内文件，导航图标只能内联 data-uri。
+> `verify-settings.mjs` 会检查内联值与 icon.svg 是否一致（过期即 FAIL）。
+
+> **本地依赖联接（gitignored，新克隆后要重建）**：插件是 link 安装，Node 按**真实路径**
+> 解析依赖，所以要在 `plugin/node_modules/` 里联接 DSH 部署目录里的包，否则
+> `@deepseek-ai/cordis` / `@deepseek-ai/dsh-typert-protocol` / `zod` 解析不到：
+>
+> ```bash
+> cd plugin/node_modules
+> ln -sfn "<DSH>/node_modules/@deepseek-ai" @deepseek-ai
+> ln -sfn "<DSH>/node_modules/zod" zod
+> ```
+>
+> 联接必须指向**同一份** cordis/typert-protocol 实例（Service.init 符号、instanceof 判定
+> 都依赖同一模块实例）。
+
 ## 关键约定
 
 - **审批/提问瀑布（§5.5）fail-open**：`ctx.on("approval/request", …, {prepend:true})`，
   仅「手机在线且开关开」才拦截；**超时/出错/断线必须 `return next()` 放行桌面答案器**，
   绝不 fail-closed。这是安全底线，任何改动不得破坏。
-- **命令注册用 `ctx.inject(["commands"], scope => …)`**：直接 ctx.commands 在服务未就绪时
-  抛错被 try/catch 吞掉，命令静默消失（实测踩坑）。注册在所有早退路径之前。
 - **KAT 失败禁连**：assertKat 失败只打日志、不启动 relay——绝不带病上线。
 - peerDependencies/engines 用**双段版本范围**（如 `^0.1.5-rc.3 || ^0.2.0-rc.1 || ^0.2.1-rc.0`），
   否则插件被兼容性 gate 静默禁用。
-- 二维码/URI 含 secret 明文：**绝不写日志**（日志只允许 lib/pairing.mjs 的 redactUri 形式）。
-- relayUrl 是 loopback（127.0.0.1/localhost）时 /remote-pairing 必须打醒目警告（手机连不上）。
+- 二维码/URI 含 secret 明文：**绝不写日志**（日志只允许 lib/pairing.mjs 的 redactUri 形式）；
+  Remote 返回体里也**没有 secret 明文**——只有二维码图像。
+- relayUrl 是 loopback（127.0.0.1/localhost）时设置页必须打醒目警告（手机连不上）。
 
 ## Host API 速查（实测，契约附录 A）
 
@@ -104,3 +127,43 @@ ESM 模块缓存不会重载源码（实测踩坑）。
   `{sessionId, model}`（无 reasoningEffort 时省略该字段）。桌面端与手机端切换都会触发，天然归一。
 - 回归：`node scripts/verify-steps.mjs` 目前 **113 项**（新增 efforts 映射、selectModel 成功/拒绝、
   model 查询 null→追踪、modelChanged 广播）。
+
+## v1.1.x：配对入口搬进设置面板（2026-10-24）
+
+**`/remote-pairing` 命令已删除**，配对入口改成 DSH 设置面板里的「DSH Pocket」分区
+（`docs/PROTOCOL.md` 的配对 URI 格式**没变**，只是入口换了地方）。
+
+三层结构：
+
+| 文件 | 角色 |
+|---|---|
+| `index.js` | **类插件** `export default class RemoteControlService extends TypertRemoteService`（服务名 `remoteControl`）。`[Service.init]()` 里启动宿主链路（`startRemoteHost`）并把三个方法标记成 Remote 导出。 |
+| `typert.host.js` | **TYPERT Host manifest**：`package` 必须等于 package.json 的 name，`face:"host"`，三个 invocation（`getPairing` / `rotateSecret` / `setHidden`）。 |
+| `client.js` | **Web 半边**：`window.__ModuleLoader__.load({id: <包名>, factory})` → `ctx.slots.inject("settings.section", …)` 注册 `{id:"remote-control", order:40, label:()=>"DSH Pocket"}`，并 `ctx.remote.$mount(CLIENT_REMOTE)` 挂自己的 Remote 命名空间。 |
+
+Remote 方法（返回 `{ok:true,value}` 或 `{ok:false,error:{code,message}}`）：
+
+- `getPairing()` → `{relayUrl, channel, hidden, qrSvg, note}`——**返回体里没有 secret 明文**，
+  secret 只在二维码图像里；`hidden=true` 时不返回二维码、只给一句说明。
+- `rotateSecret()` → 换 channel+secret 并落盘、旧 secret 不保留、`relay.reload()` 热更换链路；
+  成功后回新的配对信息。
+- `setHidden(hidden)` → 落盘 `config.json` 的 `hidden` 字段；隐藏时删掉盘上 `pairing.svg`，
+  恢复时重建。
+
+实测坑（改动前先读）：
+
+- **DSH 装载器 `unwrapExports` = `exports.default ?? exports`**：`default` 优先于具名 `apply`，
+  所以类插件一旦存在，具名 `apply` 在 DSH 挂载路径上是死代码——两条路径共用
+  `startRemoteHost(ctx, rowConfig)`，并用 `HOST_STATES`（WeakMap）做**同 ctx 幂等**，
+  不会起两条中继链路。
+- **每个 strict codec 都必须有 `create()` 工厂**（typert-loader 的 `requireStrictCodec`
+  和客户端 remote store 都会拒收没有工厂的 codec）——没有工厂 = manifest 整个不注册 =
+  所有 Remote 调用静默失败。`verify-settings.mjs` 会用**真实的 validateTypertManifest** 校验。
+- **client 包的 `id` 必须等于包名**：`__ModuleLoader__.load` 的 id 同时是 HMR 样式归属
+  （`data-plugin`）的键；不一致时 `removeOwnedStyles(thatId)` 会把本包的样式剥掉。
+- **`settings.section` 没有 icon 字段**：外壳给所有外部分区画通用齿轮。照抄 token-stats 的
+  做法：给本包的导航行打 `data-dsh-remote-control-settings-nav` 标记，CSS 里
+  `>svg:first-child{display:none}` + `::before` 用 currentColor mask 画自家图标。
+- **本包 CSS 标签要自己 `setAttribute("data-plugin", 包名)`**：`apply()` 是异步的，追加
+  <style> 时 client-modules 的 `claimStyles(ownerId)` 扫描已经过去，不认领会被别的包收养。
+- 回归：`node scripts/verify-settings.mjs`（66 项，含 Host 半边真跑一遍）+ `node scripts/verify-pairing.mjs`（47 项）。

@@ -1,6 +1,11 @@
-# dsh-remote-control — Host-only bundle: no Web UI client, no Typert surface.
-# The plugin runs entirely on the Host plane so its `approval/request` and
-# `user-questions/request` waterfall listeners see every live agent.
+# dsh-remote-control — Host bundle + Web client (v1.1.x).
+#
+# The Host half runs on the Host plane so its `approval/request` and
+# `user-questions/request` waterfall listeners see every live agent; the Web
+# client half (client.js, exported as "./client") renders the "DSH Pocket"
+# settings page with the pairing QR. The Host half also publishes the
+# `remoteControl` Typert service (typert.host.js, exported as "./typert") that
+# the settings page calls.
 - insert:
   - id: dsh-remote-control
     name: '@duke-dsh-plugins/dsh-remote-control'

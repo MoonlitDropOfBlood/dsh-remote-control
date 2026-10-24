@@ -134,9 +134,11 @@ grep -rnE "@State|@Prop|@Link|@ObjectLink|@Observed[^V]|@Provide|@Consume|@Watch
 - 当前值：`store.sessionModel`（`session.model` 拉取 + `session.modelChanged` 事件实时覆盖；
   null = 插件无记录 → 回退显示目录默认）。下一次 prompt 组装即用新模型，运行中 turn 不受影响。
 
-### 品牌（2026-10-24，v2）
+### 品牌（2026-10-24，v3 鲸鱼版）
 - 应用名 **DSH Pocket**（AppScope app_name、EntryAbility_label、APP_NAME）；bundleName 不变。
-- 图标 = DSH 插件家族风格：44×44 rx11 圆角方块 + `#4D6BFE→#00B8A9` 对角渐变 + 白色圆头线条
-  （手机+终端光标+信号弧）+ 底部半透明波浪（家族签名）。源文件 `tools/icon/*.svg`，
-  用 `node tools/icon/render-icons.mjs`（resvg）重渲染 layered background/foreground（1024）与
-  startIcon（288）；plugin/icon.svg 同款。改图标只改 SVG 再重跑脚本，勿手改 PNG。
+- 图标 = DSH 插件家族风格：44×44 rx11 圆角方块 + `#4D6BFE→#00B8A9` 对角渐变 + 底部半透明波浪
+  （家族签名）+ **官方 DSH 鲸鱼剪影**（源 `dsh-desktop/build/whale.svg`，整体染白，居中悬于波浪上方）。
+- 源文件 `tools/icon/*.svg`；管线 = `node tools/icon/compose-whale.mjs`（从 whale 源合成
+  foreground/full/plugin 图标 + 留档 whale-orig.svg）→ `node tools/icon/render-icons.mjs`（resvg 渲
+  染 layered background/foreground 1024 + startIcon 288）。改图标只改脚本再重跑，勿手改 PNG；
+  plugin/icon.svg 由 compose 脚本生成，勿手改。

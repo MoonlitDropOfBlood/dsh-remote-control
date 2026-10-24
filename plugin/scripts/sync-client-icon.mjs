@@ -22,9 +22,15 @@ const END = "// ==== END GENERATED ICON ====";
 
 /**
  * icon.svg → alpha mask 用的 SVG（只留图形，白色=不透明）。
- * @param {string} svg
- * @returns {string}
+ * viewBox 裁剪到图形包围盒（MASK_CROP_VIEW_BOX）：48 网格里鲸鱼只占中部
+ * ~55%，若沿用整个 viewBox，16–20px 的导航槽里鲸鱼本体只剩 ~9px（2026-10-24
+ * 用户反馈「图标太小」）。裁剪后同一槽位里鲸鱼放大约一倍。
+ * 图形几何（tools/icon/compose-whale.mjs）：鲸鱼 x 11–37 / y 10.5–29.6，
+ * 波浪 x 10–38 / y≈37.7–40.3 —— 裁剪框 "8 8 32 34" 留 ~2.5 单位呼吸边。
+ * 改动 icon 几何时同步更新此常量。
  */
+const MASK_CROP_VIEW_BOX = "8 8 32 34";
+
 export function maskAssetFrom(svg) {
   const body = svg
     // 去掉注释
@@ -34,12 +40,11 @@ export function maskAssetFrom(svg) {
     // 去掉底板矩形（<rect …/>）——它是渐变底板，不该进 mask
     .replace(/<rect\b[^>]*\/>/g, "")
     .trim();
-  const viewBox = /viewBox="([^"]+)"/.exec(svg)?.[1] ?? "0 0 48 48";
   // 只取根 <svg> 的内部内容（否则会套出两层 <svg>）
   const inner = /<svg\b[^>]*>([\s\S]*)<\/svg>/.exec(body)?.[1] ?? body;
   return (
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="' +
-    viewBox +
+    MASK_CROP_VIEW_BOX +
     '" fill="none">' +
     inner +
     "</svg>"

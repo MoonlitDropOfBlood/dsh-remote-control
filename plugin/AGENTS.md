@@ -35,7 +35,7 @@ node scripts/verify-qr.mjs && node scripts/verify-pairing.mjs           # QR/配
 node scripts/verify-steps.mjs                                          # v1.0.9 步骤/模式/权限/归档/模型/思考/强度 + 图片回归（无依赖，154 项）
 node scripts/verify-images.mjs                                         # v1.0.9 图片专项：元数据映射/缩略图降级/image.fetch 缓存与报错/帧预算守卫（无依赖，88 项）
 node scripts/verify-settings.mjs                                       # v1.1.x 设置页/manifest/combo/信封自检 + Host 真跑一遍（112 项）
-node scripts/verify-relay-supervisor.mjs                               # v1.1.1 中继进程托管：决策/端口占用不抢/启停/父进程看门狗（无依赖，30 项）
+node scripts/verify-relay-supervisor.mjs                               # v1.1.1 中继进程托管：决策/端口占用不抢/启停/看门狗/跨平台（无依赖，71 项）
 node scripts/sync-client-icon.mjs                                      # 改了 icon.svg 后同步 client.js 的图标 data-uri
 ```
 
@@ -187,30 +187,49 @@ ESM 模块缓存不会重载源码（实测踩坑）。
   image.fetch 缓存命中/重启后报错、日志无 base64、**帧预算守卫**：剥缩略图 → 丢 images[] →
   overflow 回 error、预算常量关系、多图历史回包不超明文预算）。
 
-## v1.1.1：中继进程随插件托管（2026-10-25）
+## v1.1.1：中继进程随插件托管（2026-10-25，跨平台）
 
 中继是这套方案的**服务端**，不该靠人手 `node relay/server.js` 起。插件启动时把**本机**中继拉起来，
 插件卸载 / DSH 退出时收掉。实现见 `lib/relay-supervisor.mjs`。
 
 - **只托管本机中继**：`relayUrl` 指向 VPS/另一台机器 → **不 spawn**（那是别人的服务）。
-  判定 `isLocalHost()`：loopback + 本机所有网卡地址；公网地址一律不托管。
-- **端口已被占用就不抢**：TCP connect 探测到有人监听 → 不 spawn、不杀，只如实报告
-  「端口 N 已有服务监听」。外部自起的中继优先。
-- **只停自己起的进程**：SIGTERM → 宽限 3s → SIGKILL，**全程按 child handle**，
-  绝不按进程名/端口批量杀（曾因此误杀 DSH 后端，见全局记忆 process-cleanup-managed-jobs-only）。
-- **父子绑定不留孤儿**：子进程以 `DSHRC_RELAY_PARENT_WATCHDOG=1` 起，监听 stdin EOF；
-  DSH 进程一死管道关闭 → 中继自己优雅退出。手工 `node server.js` 不带该变量，行为不变。
+  判定 `isLocalHostResolved()`：loopback + 本机所有网卡地址 + **DNS 解析后的本机地址**；
+  解析失败按「非本机」处理（保守）。
+- **端口已被占用就不抢**：TCP connect 探测 → 不 spawn、不杀，只如实报告
+  「端口 N 已有服务监听」（状态 `external:true`，看门狗据此不干预）。
+  探测**同时看 127.0.0.1 与目标 host**——只探 127.0.0.1 会漏判「只绑了 LAN IP 的外部服务」。
+- **只停自己起的进程**：全程按 child handle，**绝不按进程名/端口批量杀**
+  （曾因此误杀 DSH 后端，见全局记忆 process-cleanup-managed-jobs-only）。
+- **跨平台停止语义（实测差异）**：
+  - **POSIX（Linux/macOS）**：`child.kill('SIGTERM')` 会触发子进程 signal handler → 中继优雅关闭；
+  - **Windows**：`child.kill('SIGTERM')` 直接 TerminateProcess（**硬杀，不走 handler**）→
+    所以停止走 **stdin 管道下 `shutdown` 命令**（中继自己 `relay.stop()`），宽限 3s 后才 SIGKILL。
+    POSIX 上两者都发（命令 + 信号），中继侧停止是**幂等**的。
+- **跨平台启动**：spawn 用 `process.execPath`；宿主若是 **Electron**（macOS 的 DSH 常打包成 .app）
+  必须注入 `ELECTRON_RUN_AS_NODE=1`，否则会再开一个应用实例。Windows 版 DSH 后端是独立
+  node.exe（`process.versions.electron` 为空），不受影响。
+- **父子绑定不留孤儿**：子进程带 `DSHRC_RELAY_PARENT_WATCHDOG=1`，监听 stdin ——EOF（父进程死了）
+  即优雅退出；手工 `node server.js` 不带该变量，行为完全不变。
+- **unref 时机（S5）**：子进程的 stdio 管道会吊住宿主事件循环 → 启动确认后 `unref()`；
+  但**必须在启动确认之后** unref（否则父进程没有 ref 句柄时 await 永不落定），
+  且 `stop()` 等待退出期间要临时 `ref()` 回来。
+- **改端口要换进程（S1）**：`ensure()` 比较「子进程实际监听端口」与目标端口，不同则先停旧再起新。
+- **并发 ensure 去重（S3）**：in-flight 锁（复用同一个 pending promise）；
+  子进程 exit 回调按**归属**判断（`this.child === child`），否则败者的回调会把胜者句柄清掉 → 孤儿。
+- **崩溃后要重拉（S2）**：子进程退出时状态保持 `managed:true / running:false`，
+  看门狗读**实时**状态（`shouldRestartRelay()` 纯函数，有单测）→ 15s 内重拉。
+- **卸载用 dispose 而非 stop（S4）**：`dispose()` 置位「永久停用」，
+  在途 ensure 完成后不会再把中继拉起来（否则插件已卸载却留下没人管的中继）。
 - **配置开关**：`config.json` 的 `autoStartRelay`（默认 true）；关掉 = 完全保持旧行为。
-- **入口解析**：`resolveRelayEntry()` 按 `<plugin>/../relay/server.js` →
-  `<plugin>/node_modules/dsh-remote-control-relay/server.js` → `DSHRC_RELAY_ENTRY` 顺序找。
-- **看门狗**：托管进程意外退出后 15s 内自动重拉（`ensure()` 幂等，不会重复起）。
+- **入口解析**：`resolveRelayEntry()` 按 `DSHRC_RELAY_ENTRY` → `<plugin>/../relay/server.js`
+  → `<plugin>/node_modules/dsh-remote-control-relay/server.js` 顺序找；
+  **非仓库布局的安装**（bundle 安装不含 relay/）要用 `DSHRC_RELAY_ENTRY` 或关掉托管。
 - **设置页可见**：`getPairing()` / `setRelayUrl()` 的 value 带 `relayProcess`
-  `{managed, running, pid, port, detail}`，设置页「中继进程」一行显示「插件托管 · 运行中（pid N）」。
-- **spawn 用 process.execPath**：DSH 后端是**独立 node.exe**（不是 Electron 主进程），
-  直接 spawn `process.execPath` 即可；Electron 宿主才需要 `ELECTRON_RUN_AS_NODE`。
-- 回归：`node scripts/verify-relay-supervisor.mjs` **30 项**（纯函数决策 / 远端不托管 /
-  autoStart=false 不托管 / 找不到入口不托管 / 端口占用不抢 / 真 spawn 桩中继并 stop /
-  父进程看门狗退出）。
+  `{managed, running, pid, port, detail, external}`，设置页「中继进程」一行显示「插件托管 · 运行中（pid N）」。
+- 回归：`node scripts/verify-relay-supervisor.mjs` **71 项**（纯函数决策 / 远端不托管 /
+  autoStart=false / 找不到入口 / 端口占用不抢 / **真 relay/server.js 的看门狗与 shutdown 通道** /
+  手工启动行为不变 / 改端口换进程 / 并发 ensure 只 spawn 一次 / 崩溃后重拉 /
+  dispose 后不拉起 / unref 时机 / 跨平台 env 与停止语义 / 看门狗判定纯函数）。
 
 ## v1.1.x：配对入口搬进设置面板（2026-10-24）
 

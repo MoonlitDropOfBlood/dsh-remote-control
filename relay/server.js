@@ -504,7 +504,12 @@ if (isMain) {
       relay.log.error('failed to start', { err: String(err && err.message) });
       process.exit(1);
     });
+  // 停止是**幂等**的：POSIX 上父进程可能同时发 SIGTERM 与 stdin 的 shutdown 命令，
+  // 两条路径都会走到这里 → 只执行一次真正的 stop()。
+  let stopping = false;
   const shutdown = (sig) => {
+    if (stopping) return;
+    stopping = true;
     relay.log.info(`received ${sig}, shutting down`);
     relay.stop().then(() => process.exit(0));
   };
@@ -515,10 +520,27 @@ if (isMain) {
   // 父进程用 stdio 的 stdin 管道 spawn 本进程，父进程一旦退出管道即 EOF →
   // 这里收到 'end' 就优雅关停，避免 DSH 崩溃/被杀后留下孤儿中继。
   // 手工 `node server.js` 启动时该变量不存在，行为完全不变。
+  //
+  // 另支持父进程经 stdin 下 `shutdown` 命令做**优雅停止**：
+  // Windows 上 child.kill('SIGTERM') 是硬杀（不走 signal handler），
+  // 所以插件优先走这条命令通道，让中继自己 close 掉 ws 连接（手机端看到正常 close 而非 RST）。
   if (process.env.DSHRC_RELAY_PARENT_WATCHDOG === '1' && process.stdin) {
+    let buf = '';
+    process.stdin.on('data', (chunk) => {
+      buf += String(chunk);
+      let idx = buf.indexOf('\n');
+      while (idx >= 0) {
+        const line = buf.slice(0, idx).trim();
+        buf = buf.slice(idx + 1);
+        if (line === 'shutdown') {
+          shutdown('shutdown command');
+          return;
+        }
+        idx = buf.indexOf('\n');
+      }
+    });
     process.stdin.on('end', () => {
-      relay.log.info('parent process gone, shutting down');
-      relay.stop().then(() => process.exit(0));
+      shutdown('parent process gone');
     });
     // 不让 stdin 保持活跃引用拖住事件循环退出
     process.stdin.resume();

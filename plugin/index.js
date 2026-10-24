@@ -37,7 +37,7 @@ import { Remote, TypertRemoteService } from "@deepseek-ai/dsh-typert-protocol";
 import { assertKat } from "./lib/protocol.mjs";
 import { loadConfig, saveConfig, dataDir } from "./lib/config.mjs";
 import { RelayClient } from "./lib/relay-client.mjs";
-import { RelaySupervisor } from "./lib/relay-supervisor.mjs";
+import { RelaySupervisor, shouldRestartRelay } from "./lib/relay-supervisor.mjs";
 import { PushSender, pushConfigured, pushUnavailableReason } from "./lib/push.mjs";
 import { HostBridge } from "./lib/host-bridge.mjs";
 import {
@@ -189,6 +189,11 @@ export function startRemoteHost(ctx, rowConfig) {
   // 插件卸载/DSH 退出时收掉（只按 child handle 停自己起的那个进程）。
   const supervisor = new RelaySupervisor({
     log: (level, msg, extra) => log(level, "relay supervisor: " + msg, extra),
+    // 状态一变就刷新宿主快照（审计 S2）：子进程崩溃时由 supervisor 主动通知，
+    // 否则设置页会一直显示「运行中（已死的 pid）」。
+    onStatus: (snapshot) => {
+      state.relayProcess = snapshot;
+    },
   });
   state.supervisor = supervisor;
 
@@ -214,11 +219,11 @@ export function startRemoteHost(ctx, rowConfig) {
   }
 
   // 看门狗：托管的中继意外退出（例如被外部杀掉）后自动重拉。
-  // 15s 一次；只在本机托管场景有意义，且 ensure() 本身幂等（端口占用就不重复起）。
+  // 15s 一次；**判定走 shouldRestartRelay()**（纯函数，有单测覆盖）——
+  // 审计指出：原来读 ensure() 时刻的静态快照 → 子进程退出后快照仍是 running=true
+  // → 永不重拉，设置页还显示「运行中（已死的 pid）」。
   state.relayWatchdog = setInterval(() => {
-    const snap = state.relayProcess;
-    if (!snap || !snap.managed) return;
-    if (snap.running) return;
+    if (!shouldRestartRelay(supervisor.status)) return;
     void ensureRelayProcess();
   }, 15_000);
   if (typeof state.relayWatchdog.unref === "function") state.relayWatchdog.unref();
@@ -298,7 +303,9 @@ export function startRemoteHost(ctx, rowConfig) {
       clearInterval(state.relayWatchdog);
       state.relayWatchdog = null;
     }
-    void supervisor.stop();
+    // **dispose 而非 stop**（审计 S4）：dispose 置位「永久停用」，
+    // 在途的 ensure 完成后不会再把中继拉起来（原来 stop 后在途 ensure 仍会 spawn → 孤儿）。
+    void supervisor.dispose();
     log("info", "unloaded");
   });
 

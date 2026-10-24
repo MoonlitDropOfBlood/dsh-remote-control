@@ -40,8 +40,19 @@ node scripts/sync-client-icon.mjs                                      # 改了 
 ```
 
 安装/重载（link 安装，磁盘即运行源码）：plugin_manager `install_bundle` → 本目录。
-**改代码后必须 remove_bundle + install_bundle 才生效**——set_plugin toggle 只重跑 apply，
-ESM 模块缓存不会重载源码（实测踩坑）。
+**改代码后必须重载插件才生效**——只改磁盘上的文件**不会**让运行中的 DSH 换代码
+（实测：touch 插件源文件后运行中的实例毫无反应；watcher 不覆盖插件的 node_modules 路径）。
+
+| 操作 | 加载新代码？ | 依据 |
+|---|---|---|
+| 只改文件（不重载） | ❌ | 实测无反应；cordis loader 是裸 `import(url)` → 命中 ESM 缓存 |
+| `set_plugin` 关→开 | ✅ | plugin-manager 的 `setPlugin` → `reload()` → `hmr.reconcileProfile()` |
+| `remove_bundle` + `install_bundle` | ✅ | 同上走 `reload()`；HMR 先 `evict()` 掉 ESM 缓存条目再重新 import |
+| 重启 DSH 桌面端 | ✅ | 进程重启，缓存自然清空 |
+
+> HMR 的 `evict()`：`Map.prototype.delete.call(internal.loadCache, url)` 把 ESM 缓存条目**整条**
+> 删掉（Node 的 `LoadCache` 一个 URL 下有 ESM/CJS 两种 job，只删一种会残留），
+> 下次 `import()` 才重新求值文件。**只改文件不重载 = 永远跑旧代码。**
 
 > **改了 `plugin/icon.svg` 一定要跑 `node scripts/sync-client-icon.mjs`**：client.js 是静态
 > 浏览器包（无打包器），拿不到包内文件，导航图标只能内联 data-uri。

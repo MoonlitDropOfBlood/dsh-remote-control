@@ -30,7 +30,7 @@ node --check index.js client.js typert.host.js lib/*.mjs scripts/*.mjs   # 语�
 node -e "import('./lib/protocol.mjs').then(m=>m.assertKat())"           # KAT
 node scripts/verify-qr.mjs && node scripts/verify-pairing.mjs           # QR/配对 API 回归（需 devDependencies）
 node scripts/verify-steps.mjs                                          # v1.0.8 步骤/模式/权限/归档/模型/思考/强度回归（无依赖，113 项）
-node scripts/verify-settings.mjs                                       # v1.1.x 设置页/manifest/combo 自检 + Host 真跑一遍（107 项）
+node scripts/verify-settings.mjs                                       # v1.1.x 设置页/manifest/combo/信封自检 + Host 真跑一遍（112 项）
 node scripts/sync-client-icon.mjs                                      # 改了 icon.svg 后同步 client.js 的图标 data-uri
 ```
 
@@ -170,6 +170,13 @@ Remote 方法（返回 `{ok:true,value}` 或 `{ok:false,error:{code,message}}`�
 
 实测坑（改动前先读）：
 
+- **Remote 返回是双层信封（2026-10-24 二维码全空事故）**：typert 网关把宿主方法的返回**再包一层**
+  ——浏览器端 `remote.xxx()` 拿到的 `res.value` 才是宿主 `{ok, value|error}`。客户端拆包必须
+  **拆两层**（token-stats unwrapRemote 注释原话「双层信封解包」）。单层拆包的症状极有迷惑性：
+  **宿主侧全部真实生效**（轮换/隐藏/保存都落盘），但页面拿到的 value 是内层信封对象 →
+  relayUrl/channel/hidden/qrSvg 全 undefined → 渲染全空、从不报错。
+  `verify-settings.mjs` 会把 unwrapRemote 源码提取出来真跑四种形态（双层成功/双层业务错误/
+  单层兼容/垃圾输入），改拆包逻辑必须过这组用例。
 - **combo 拼接（2026-10-24 生产事故）**：DSH web 服务器把**所有** web client bundle **裸拼接**进
   同一个 combo `<script>`（dsh-client-modules `buildComboScript`，无任何作用域包裹）。client.js
   顶层一旦有 `const/let/class/function` 声明，就会与其他 bundle 的同名声明相撞——我们与
@@ -192,5 +199,5 @@ Remote 方法（返回 `{ok:true,value}` 或 `{ok:false,error:{code,message}}`�
   `>svg:first-child{display:none}` + `::before` 用 currentColor mask 画自家图标。
 - **本包 CSS 标签要自己 `setAttribute("data-plugin", 包名)`**：`apply()` 是异步的，追加
   <style> 时 client-modules 的 `claimStyles(ownerId)` 扫描已经过去，不认领会被别的包收养。
-- 回归：`node scripts/verify-settings.mjs`（**107 项**，含 combo 拼接安全 + Host 半边真跑一遍
-  + setRelayUrl 校验/落盘/清除/回环警告）+ `node scripts/verify-pairing.mjs`（47 项）。
+- 回归：`node scripts/verify-settings.mjs`（**112 项**，含双层信封解包用例 + combo 拼接安全 +
+  Host 半边真跑一遍 + setRelayUrl 校验/落盘/清除/回环警告）+ `node scripts/verify-pairing.mjs`（47 项）。

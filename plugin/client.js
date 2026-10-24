@@ -225,13 +225,25 @@ const CLIENT_ICON_MASK_URI =
       ],
     };
 
-    /** 把 Host 返回的 {ok,value|error} 信封拆开。 */
+    /**
+     * 双层信封解包（2026-10-24 修复二维码/频道/中继地址全空不显示）：
+     * remote 网关返回 res.value = host 方法的 { ok, value|error } —— 网关在
+     * 宿主返回外又包了一层，必须拆两层（token-stats unwrapRemote 同款，其注释
+     * 原话「双层信封解包」）。此前单层拆包把内层信封整个当成了数据，页面
+     * relayUrl/channel/hidden/qrSvg 全部 undefined → 渲染全空；而宿主侧
+     * 真实生效（密钥轮换/隐藏/保存地址都落了盘），症状是「按钮有效但界面无反应」。
+     * 兼容：若某路径未包第二层（res.value 没有 ok 字段），按单层处理。
+     */
     function unwrapRemote(res) {
       if (!res || typeof res !== "object") {
         return { ok: false, message: "宿主返回了无法识别的结果。" };
       }
-      if (res.ok === true) return { ok: true, value: res.value || {} };
-      const err = res.error || {};
+      const inner =
+        res.value && typeof res.value === "object" && "ok" in res.value
+          ? res.value
+          : res;
+      if (inner.ok === true) return { ok: true, value: inner.value || {} };
+      const err = inner.error || {};
       return { ok: false, message: err.message || err.code || "未知错误" };
     }
 

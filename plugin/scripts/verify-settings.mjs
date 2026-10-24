@@ -304,5 +304,47 @@ rmSync(tmpHome, { recursive: true, force: true });
   check("client.js 顶层零声明（IIFE 开头）", body.startsWith("(() => {") || body.startsWith("(function"), body.slice(0, 40));
 }
 
+// ---- 7. unwrapRemote 双层信封（2026-10-24 二维码全空事故）--------------
+// remote 网关把宿主返回再包一层：客户端拿到 res.value = host 的 {ok,value|error}。
+// unwrapRemote 必须拆两层——单层拆包会把内层信封当数据，页面全空而宿主侧
+// 真实生效（按钮有效但界面无反应）。这里把函数源码从 client.js 里提取出来
+// 真跑三种形态：双层成功 / 双层业务错误 / 单层兼容。
+{
+  const start = clientSrc.indexOf("function unwrapRemote(");
+  let unwrapSrc = "";
+  if (start >= 0) {
+    let depth = 0;
+    let i = clientSrc.indexOf("{", start);
+    for (; i < clientSrc.length; i++) {
+      if (clientSrc[i] === "{") depth++;
+      else if (clientSrc[i] === "}") {
+        depth--;
+        if (depth === 0) break;
+      }
+    }
+    unwrapSrc = clientSrc.slice(start, i + 1);
+  }
+  const vm = await import("node:vm");
+  let unwrap = null;
+  let extractOk = false;
+  try {
+    unwrap = vm.runInNewContext(`(${unwrapSrc})`);
+    extractOk = typeof unwrap === "function";
+  } catch {
+    extractOk = false;
+  }
+  check("unwrapRemote 可从 client.js 提取并实例化", extractOk, unwrapSrc ? "提取的源码不可执行" : "client.js 里找不到 unwrapRemote");
+  if (extractOk) {
+    const okDouble = unwrap({ ok: true, value: { ok: true, value: { relayUrl: "ws://x", channel: "C", hidden: false, qrSvg: "<svg" } } });
+    check("双层成功信封拆出真数据", okDouble.ok === true && okDouble.value?.relayUrl === "ws://x" && okDouble.value?.qrSvg === "<svg", JSON.stringify(okDouble).slice(0, 120));
+    const errDouble = unwrap({ ok: true, value: { ok: false, error: { code: "bad-params", message: "地址不合法" } } });
+    check("双层业务错误拆出原文", errDouble.ok === false && errDouble.message === "地址不合法", JSON.stringify(errDouble).slice(0, 120));
+    const single = unwrap({ ok: true, value: { a: 1 } });
+    check("单层信封兼容（value 无 ok 字段时直取）", single.ok === true && single.value?.a === 1, JSON.stringify(single).slice(0, 120));
+    const junk = unwrap("nonsense");
+    check("非对象响应回错误", junk.ok === false && typeof junk.message === "string" && junk.message.length > 0, JSON.stringify(junk).slice(0, 120));
+  }
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

@@ -18,7 +18,7 @@ import { EVT_PENDING_NAV } from '../model/events';
 import { ConnectionStore, RemoteProfile, connectionStore } from '../model/connections';
 import { dshrcLink, LinkState } from '../model/link';
 import { openApprovalQueue, openConnections, openNewSession, openSessionDetail } from '../model/routes';
-import { PendingNav, SessionRow, SessionStore, sessionStore } from '../model/sessionstore';
+import { PendingNav, SessionListItem, SessionRefreshResult, SessionStore, sessionStore } from '../model/sessionstore';
 import {
   FS_BODY,
   FS_CAPTION,
@@ -37,23 +37,37 @@ import {
   relTime
 } from '../model/theme';
 
-/** 单张会话卡（列表项；只显示根会话——subagent 入口在父会话详情页，契约 §5.3 v1.0.5）。 */
+/**
+ * 单张会话卡（列表项；只显示根会话——subagent 入口在父会话详情页，契约 §5.3 v1.0.5）。
+ *
+ * v1.0.6（修「刷新后数据没有变化」）：入参改成**简单原始字段**的 @Param
+ * （官方 Repeat 迁移示例5 的写法：`ChildComponent({ data: repeatItem.item.message })`
+ * ——向子组件传被观察的原始字段，而不是整个同引用对象）：
+ *  - 父组件 build 直接读取数据项的字段并建立依赖；
+ *  - 子组件只消费原始类型，不依赖「跨组件观察同一个可变对象」这一不稳定路径。
+ * 数据源仍是 store.listItems() 产出的**不可变投影**（每次重建都是新实例），
+ * 保证 Repeat 能识别到「数据确实变了」。
+ */
 @ComponentV2
 export struct SessionCard {
-  @Require @Param row: SessionRow;
+  @Require @Param sessionId: string = '';
+  @Require @Param title: string = '';
+  @Require @Param cwd: string = '';
+  @Require @Param running: boolean = false;
+  @Require @Param updatedAt: number = 0;
   @Event onOpen: (sessionId: string) => void;
 
   build() {
     Column() {
       Row() {
-        Text(this.row.title.length > 0 ? this.row.title : this.row.sessionId)
+        Text(this.title.length > 0 ? this.title : this.sessionId)
           .fontSize(FS_BODY)
           .fontWeight(FontWeight.Medium)
           .fontColor($r('app.color.label_primary'))
           .layoutWeight(1)
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
-        if (this.row.running) {
+        if (this.running) {
           Row() {
             Circle({ width: 6, height: 6 }).fill($r('app.color.brand_fill'))
             Text('运行中')
@@ -79,8 +93,8 @@ export struct SessionCard {
       .width('100%')
       .alignItems(VerticalAlign.Center)
 
-      if (this.row.cwd.length > 0) {
-        Text(this.row.cwd)
+      if (this.cwd.length > 0) {
+        Text(this.cwd)
           .fontSize(FS_SMALL)
           .fontColor($r('app.color.label_secondary'))
           .width('100%')
@@ -90,7 +104,7 @@ export struct SessionCard {
       }
 
       Row() {
-        Text(relTime(this.row.updatedAt))
+        Text(relTime(this.updatedAt))
           .fontSize(FS_CAPTION)
           .fontColor($r('app.color.label_tertiary'))
           .layoutWeight(1)
@@ -108,7 +122,7 @@ export struct SessionCard {
     .borderRadius(RADIUS_CARD)
     .border({ width: HAIRLINE, color: $r('app.color.border_l1') })
     .onClick((): void => {
-      this.onOpen(this.row.sessionId);
+      this.onOpen(this.sessionId);
     })
   }
 }
@@ -120,6 +134,10 @@ struct Index {
   @Local store: SessionStore = sessionStore;
   @Local conn: ConnectionStore = connectionStore;
   @Local refreshing: boolean = false;
+  /** 列表投影缓存的版本（对应 store.listVersion；-1 = 尚未构建）。 */
+  private projVersion: number = -1;
+  /** 列表投影缓存（不可变 items；数据没变时复用同一数组 → Repeat 不做无谓 diff）。 */
+  private projItems: SessionListItem[] = [];
 
   aboutToAppear(): void {
     // hrouter：把本 Navigation 的栈注册为默认栈；页面跳转统一走 model/routes.ets。
@@ -184,7 +202,25 @@ struct Index {
     this.conn.activate(ctx, active.id);
   }
 
-  /** 下拉刷新：拉 session.list，完成后收起刷新态。 */
+  /**
+   * 列表数据源（不可变投影 + 缓存）。
+   *
+   * v1.0.6 修复「刷新后数据没有变化」：
+   *  - 数据源是 store.listItems() 产出的**新实例**（纯原始字段）——Repeat 以
+   *    item 引用判断「数据是否变化」，复用可变实例会被判定为「没变」；
+   *  - 按 store.listVersion 缓存：数据没变就不重建（数组身份稳定 → Repeat 不做无谓 diff），
+   *    数据一变就整体重建（排序 / blank / subagent 过滤随之重算）。
+   */
+  private listItems(): SessionListItem[] {
+    const v: number = this.store.listVersion;
+    if (v !== this.projVersion) {
+      this.projVersion = v;
+      this.projItems = this.store.listItems();
+    }
+    return this.projItems;
+  }
+
+  /** 下拉刷新：拉 session.list，完成后收起刷新态；失败明确提示（不假装已刷新）。 */
   private doRefresh(): void {
     if (this.store.linkState !== 'online') {
       promptAction.showToast({ message: '未连接，请先在右上角「连接」里选择远程', duration: 2500 });
@@ -192,8 +228,12 @@ struct Index {
       return;
     }
     this.refreshing = true;
-    this.store.refreshSessions().then((): void => {
+    this.store.refreshSessions().then((res: SessionRefreshResult): void => {
       this.refreshing = false;
+      if (!res.ok) {
+        const msg: string = res.skipped ? '未连接主机，未刷新' : ('刷新失败：' + res.error);
+        promptAction.showToast({ message: msg, duration: 3000 });
+      }
     });
   }
 
@@ -219,21 +259,6 @@ struct Index {
     }
     const n: string = p.name.trim();
     return n.length > 0 ? n : '未配置';
-  }
-
-  /** 列表行（store.sessions 的 @Trace 读取会被 V2 追踪，列表随事件实时刷新）。
-   *  显示规则（契约 §5.3 v1.0.5）：只显示根会话（非 subagent）且非 blank；
-   *  subagent 的入口在父会话详情页的子代理目录区；updatedAt 降序。 */
-  private visibleSessions(): SessionRow[] {
-    const out: SessionRow[] = [];
-    for (const row of this.store.sessions) {
-      if (row.blank || row.isSubagent()) {
-        continue;
-      }
-      out.push(row);
-    }
-    out.sort((a: SessionRow, b: SessionRow): number => b.updatedAt - a.updatedAt);
-    return out;
   }
 
   /** 顶栏：左标题 + 右上角连接信息胶囊（状态点 + 状态 + 当前远程名）。 */
@@ -297,6 +322,24 @@ struct Index {
     })
   }
 
+  /** 错误横幅：刷新失败 / 链路错误必须看得见（不假装已刷新）。 */
+  @Builder
+  errorBanner() {
+    Row() {
+      Text('! ' + this.store.lastError)
+        .fontSize(FS_SMALL)
+        .fontColor($r('app.color.state_error'))
+        .layoutWeight(1)
+        .maxLines(2)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+    }
+    .width('100%')
+    .padding({ left: SP_3, right: SP_3, top: SP_2 + 2, bottom: SP_2 + 2 })
+    .backgroundColor($r('app.color.state_error_tint'))
+    .borderRadius(RADIUS_CTRL)
+    .margin({ bottom: SP_3 })
+  }
+
   /** 空态（在线 / 离线两套文案）。 */
   @Builder
   emptyState() {
@@ -322,28 +365,42 @@ struct Index {
     Navigation(this.navPathStack) {
       Column() {
         this.topBar()
+        if (this.store.lastError.length > 0) {
+          this.errorBanner()
+        }
         if (this.store.pendingCount() > 0) {
           this.pendingBanner()
         }
         Refresh({ refreshing: this.refreshing }) {
           List({ space: SP_2 }) {
-            if (this.visibleSessions().length === 0) {
+            if (this.listItems().length === 0) {
               ListItem() {
                 this.emptyState()
               }
             } else {
-              Repeat(this.visibleSessions())
-                .each((cell: RepeatItem<SessionRow>): void => {
+              // v1.0.6：懒加载模式（virtualScroll）——官方文档：全量加载模式下
+              // 「页面刷新取决于键值变化，key 相同即使数据改变也不刷新」，且 >30 条
+              // 全量加载耗时长（真实宿主有 100+ 会话）。懒加载模式下「键值变化或
+              // 数据变化均会触发页面刷新」。
+              Repeat(this.listItems())
+                .each((cell: RepeatItem<SessionListItem>): void => {
                   ListItem() {
+                    // 传**原始字段**给卡片（官方 Repeat 迁移示例5 的写法）：
+                    // 父 build 直接读取数据项字段建立依赖，子组件只消费原始类型。
                     SessionCard({
-                      row: cell.item,
+                      sessionId: cell.item.sessionId,
+                      title: cell.item.title,
+                      cwd: cell.item.cwd,
+                      running: cell.item.running,
+                      updatedAt: cell.item.updatedAt,
                       onOpen: (sid: string): void => {
                         this.openSession(sid);
                       }
                     })
                   }
                 })
-                .key((row: SessionRow): string => row.sessionId)
+                .key((item: SessionListItem): string => item.sessionId)
+                .virtualScroll({ totalCount: this.listItems().length })
             }
           }
           .width('100%')

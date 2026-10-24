@@ -93,6 +93,42 @@ export class SessionRow {
   }
 }
 
+/**
+ * 会话列表的**不可变投影**（列表 UI 的数据源，v1.0.6 修复）。
+ *
+ * 为什么不用可变的 SessionRow 实例直接喂给 Repeat：
+ *  - Repeat 按「当前索引处的 item 是否变化」判断要不要刷新页面（懒加载模式），
+ *    全量加载模式更是**只看 key**——key 相同就不刷新。
+ *  - session.list 刷新时若复用同一批 SessionRow 实例（原地 apply），item 引用不变，
+ *    框架判定「数据没变」→ **列表不刷新**（用户看到的「刷新后数据没有变化」）。
+ *  - 因此这里每次都产出**新实例 + 纯原始字段**，让变化可被稳定观测。
+ */
+export interface SessionListItem {
+  sessionId: string;
+  title: string;
+  cwd: string;
+  running: boolean;
+  updatedAt: number;
+}
+
+/** 刷新结果（诚实反馈：真正应用了 / 失败 / 被跳过——失败不假装已刷新）。 */
+export interface SessionRefreshResult {
+  /** true = 已拉到并应用了新的会话列表。 */
+  ok: boolean;
+  /** 应用后的会话行数（失败时为当前行数）。 */
+  count: number;
+  /** 失败原因（ok=false 且 skipped=false 时有值）。 */
+  error: string;
+  /** true = 未连接主机，本次没有发请求（不算刷新成功）。 */
+  skipped: boolean;
+}
+
+/** 构造刷新结果（显式类型，避免对象字面量推断问题）。 */
+function makeRefreshResult(ok: boolean, count: number, error: string, skipped: boolean): SessionRefreshResult {
+  const r: SessionRefreshResult = { ok: ok, count: count, error: error, skipped: skipped };
+  return r;
+}
+
 /** 父会话详情页的子代理目录一行（契约 §5.6 SubagentInfo，v1.0.5）。 */
 @ObservedV2
 export class SubagentRow {
@@ -264,6 +300,10 @@ export class SessionStore {
   // ---- 会话 ----
   @Trace sessions: SessionRow[] = [];
   @Trace refreshing: boolean = false;
+  /** 会话列表数据版本号：任何影响列表展示的变化都自增（页面据此重建不可变投影）。
+   *  v1.0.6：Repeat 靠 item 引用判断「数据是否变化」，行实例原地复用会被判定为
+   *  「没变」→ 列表不刷新；版本号 + 不可变投影（listItems）一起解决。 */
+  @Trace listVersion: number = 0;
   @Trace activeId: string = '';
   /** 会话时间线（契约 §5.7 v1.0.6）：消息 + 工作步骤 + 系统消息，按 seq 升序、直播项在末尾。 */
   @Trace timeline: TimelineItem[] = [];
@@ -304,6 +344,8 @@ export class SessionStore {
   private cache: Map<string, TimelineItem[]> = new Map<string, TimelineItem[]>();
   private histMeta: Map<string, HistMeta> = new Map<string, HistMeta>();
   private chatSeq: number = 0;
+  /** 在途刷新（并发刷新合并到同一个 Promise，v1.0.6：不再直接 resolve 假装已刷新）。 */
+  private pendingRefresh: Promise<SessionRefreshResult> | null = null;
 
   private constructor() {
     this.link.onState = (s: LinkState): void => {
@@ -366,23 +408,72 @@ export class SessionStore {
 
   // ---- 会话列表 ----
 
-  /** session.list 拉取（连接成功 / 下拉刷新调用）；返回 Promise 供刷新动画收尾，永不 reject。 */
-  refreshSessions(): Promise<void> {
-    if (this.link.getState() !== 'online' || this.refreshing) {
-      return Promise.resolve();
+  /**
+   * session.list 拉取（连接成功 / 下拉刷新调用）。
+   *
+   * v1.0.6 修复（用户反馈「刷新后数据没有变化」）：
+   *  - 未连接 → 返回 skipped（**不假装已刷新**）；
+   *  - 已有刷新在途 → **合并**到同一个在途 Promise（不再直接 resolve：
+   *    否则下拉动画提前结束、后续刷新被吞，调用方无法区分「刷过」与「被跳过」）；
+   *  - 失败 → 返回 ok=false + 错误原因（UI 显式提示，不静默）。
+   */
+  refreshSessions(): Promise<SessionRefreshResult> {
+    if (this.link.getState() !== 'online') {
+      return Promise.resolve(makeRefreshResult(false, this.sessions.length, '未连接主机', true));
+    }
+    const pending: Promise<SessionRefreshResult> | null = this.pendingRefresh;
+    if (pending !== null) {
+      return pending;
     }
     this.refreshing = true;
-    return this.link.sessionList().then((list: DshrcSessionSummary[]): void => {
-      this.applySessionList(list);
-      this.refreshing = false;
-    }).catch((e: Error): void => {
-      this.refreshing = false;
-      this.lastError = e.message;
-      logDshrc(TAG, 'warn', 'session.list failed: ' + e.message);
-    });
+    const p: Promise<SessionRefreshResult> = this.link.sessionList().then(
+      (list: DshrcSessionSummary[]): SessionRefreshResult => {
+        this.applySessionList(list);
+        this.lastError = '';
+        this.refreshing = false;
+        this.pendingRefresh = null;
+        return makeRefreshResult(true, this.sessions.length, '', false);
+      },
+      (e: Error): SessionRefreshResult => {
+        const msg: string = e.message;
+        this.lastError = '刷新会话列表失败：' + msg;
+        logDshrc(TAG, 'warn', 'session.list failed: ' + msg);
+        this.refreshing = false;
+        this.pendingRefresh = null;
+        return makeRefreshResult(false, this.sessions.length, msg, false);
+      }
+    );
+    this.pendingRefresh = p;
+    return p;
   }
 
-  /** session.list 结果整体替换（保留既有行实例，避免页面状态被重建）。 */
+  /**
+   * 会话列表的**不可变投影**（列表 UI 的数据源）：
+   *  - 只显示根会话（非 blank、非 subagent——契约 §5.3 v1.0.5）；
+   *  - updatedAt 降序；
+   *  - 每项都是**新实例**（纯原始字段）：Repeat 以 item 引用判断「数据是否变化」，
+   *    复用同一批可变实例会被判定为「没变」→ 列表不刷新。
+   */
+  listItems(): SessionListItem[] {
+    const out: SessionListItem[] = [];
+    for (const row of this.sessions) {
+      if (row.blank || row.isSubagent()) {
+        continue;
+      }
+      const item: SessionListItem = {
+        sessionId: row.sessionId,
+        title: row.title,
+        cwd: row.cwd,
+        running: row.running,
+        updatedAt: row.updatedAt
+      };
+      out.push(item);
+    }
+    out.sort((a: SessionListItem, b: SessionListItem): number => b.updatedAt - a.updatedAt);
+    return out;
+  }
+
+  /** session.list 结果整体替换（复用既有行实例，详情页持有的引用继续实时更新）。 */
   private applySessionList(list: DshrcSessionSummary[]): void {
     const next: SessionRow[] = [];
     for (let i: number = 0; i < list.length; i++) {
@@ -396,6 +487,7 @@ export class SessionStore {
       }
     }
     this.sessions = next;
+    this.listVersion = this.listVersion + 1;
     this.pruneCache();
   }
 
@@ -1032,6 +1124,7 @@ export class SessionStore {
           } else {
             this.sessions = this.sessions.concat([new SessionRow(added)]);
           }
+          this.listVersion = this.listVersion + 1;
         }
         break;
       }
@@ -1045,6 +1138,7 @@ export class SessionStore {
             }
           }
           this.sessions = next;
+          this.listVersion = this.listVersion + 1;
           this.pruneCache();
         }
         break;
@@ -1054,6 +1148,7 @@ export class SessionStore {
         const row2: SessionRow | undefined = this.findRow(sid2);
         if (row2 !== undefined) {
           row2.running = data.running === true;
+          this.listVersion = this.listVersion + 1;
         }
         break;
       }
@@ -1062,6 +1157,7 @@ export class SessionStore {
         const row3: SessionRow | undefined = this.findRow(sid3);
         if (row3 !== undefined && data.updatedAt !== undefined) {
           row3.updatedAt = data.updatedAt;
+          this.listVersion = this.listVersion + 1;
         }
         break;
       }
@@ -1110,6 +1206,7 @@ export class SessionStore {
         const row5: SessionRow | undefined = this.findRow(sid5);
         if (row5 !== undefined) {
           row5.running = false;
+          this.listVersion = this.listVersion + 1;
         }
         const errText: string = data.status === 'error'
           ? (data.error !== undefined ? data.error : '回复出错') : '';

@@ -16,11 +16,24 @@
 //      迟到的手机回答回 applied:false。
 //   4. 新建会话的模式与权限（§5.8）：session.capabilities 目录 +
 //      session.create 的 agentPreset / permission 字段。
+//   5. v1.0.9（§5.10）：会话消息里的图片——历史消息带 images[]（内联缩略图）、
+//      直播 assistant.image 事件、image.fetch 拉大图。
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { createRequire } from "node:module";
 import { msg, sanitizeEnvelope } from "./protocol.mjs";
 import { ASSISTANT_THROTTLE_PER_SEC } from "./config.mjs";
+import {
+  LARGE_MAX_BASE64,
+  THUMB_DATA_URI_PREFIX,
+  attachmentRefOf,
+  clampMaxEdge,
+  imageBlocksOf,
+  imageRefMeta,
+  makeLarge,
+  makeThumb,
+} from "./images.mjs";
 
 /** 从本包 package.json 读版本；失败给 unknown（不抛出）。 */
 function pluginVersion() {
@@ -81,6 +94,9 @@ const HISTORY_MAX_LIMIT = 200;
 /**
  * 内容块 → 纯文本（契约 §5.7 / 附录 B）。
  * text 块取 text 拼接；image/file 给占位符；reasoning/tool-call 等忽略。
+ *
+ * 注意：这是**工具结果**口径（§5.7 StepRecord.resultText）——工具结果里的图片没有
+ * 独立的渲染通道，占位符是有用信息。会话消息正文用 messageText（§5.10：图片单独渲染）。
  * @param {unknown} blocks ContentBlock[]
  * @returns {string}
  */
@@ -97,6 +113,29 @@ export function contentText(blocks) {
       text += "[文件]";
     }
     // reasoning / tool-call / tool-addition / tool-removal / 未知块：跳过
+  }
+  return text;
+}
+
+/**
+ * 会话消息正文文本（契约 §5.10）：**图片块不占位**。
+ *
+ * 图片在 ChatMessage.images[] 里单独渲染（客户端画缩略图气泡），正文里再写一遍
+ * "[图片]" 会出现重复的假文字。file 块仍保留占位符（文件没有独立渲染通道）。
+ * @param {unknown} blocks ContentBlock[]
+ * @returns {string}
+ */
+export function messageText(blocks) {
+  if (!Array.isArray(blocks)) return "";
+  let text = "";
+  for (const block of blocks) {
+    if (!block || typeof block !== "object") continue;
+    if (block.type === "text" && typeof block.text === "string") {
+      text += block.text;
+    } else if (block.type === "file") {
+      text += "[文件]";
+    }
+    // image：单独渲染（§5.10），不占位；reasoning / tool-call 等：跳过
   }
   return text;
 }
@@ -131,8 +170,12 @@ export function reasoningText(blocks) {
  *   - 只收 append-origin 表面事件（surfaceOp==='append'）——replace 副本是
  *     模型可见的压缩影子，不是人看的逐字记录（宿主 surface 语义）；
  *   - user 只收 source.kind==='user' 的真人输入（agent.inject 的注入跳过）；
- *   - ContentBlock 只取 type==='text' 的纯文本（reasoning/tool-call 跳过，
- *     image/file 给占位符）；空文本一律跳过（不产生空泡）；
+ *   - ContentBlock 只取 type==='text' 的纯文本（reasoning/tool-call 跳过）；
+ *     **image 块不占位**（v1.0.9 §5.10：图片单独渲染，见 messageText）；
+ *   - v1.0.9（§5.10）：消息里有 image 块时，ChatMessage 追加 `images: ImageRef[]`
+ *     （只带元数据，thumb 由上层 attachThumbs 补）；**纯图片消息（无正文）也要成条**，
+ *     否则手机端永远看不到这张图；
+ *   - 没有任何内容的消息跳过（不产生空泡）；
  *   - 任何不认识的形态返回 []（跳过），绝不抛出。
  * @returns {object[]} ChatMessage[]
  */
@@ -169,9 +212,13 @@ export function mapHistoryMessages(sessionId, record) {
       out.push({ id: `${sessionId}:${seq}:reasoning`, role: "reasoning", text: thinking, ts, seq });
     }
   }
-  const text = contentText(content);
-  if (text.trim() !== "") {
-    out.push({ id: `${sessionId}:${seq}`, role, text, ts, seq });
+  const text = messageText(content);
+  // v1.0.9（§5.10）：图片单独成字段，**不带缩略图**（纯函数读不到附件字节）
+  const images = imageBlocksOf(content).map((ref) => imageRefMeta(ref));
+  if (text.trim() !== "" || images.length > 0) {
+    const message = { id: `${sessionId}:${seq}`, role, text, ts, seq };
+    if (images.length > 0) message.images = images;
+    out.push(message);
   }
   return out;
 }
@@ -186,6 +233,128 @@ export function mapHistoryMessage(sessionId, record) {
     if (message.role !== "reasoning") return message;
   }
   return null;
+}
+
+// ---------------------------------------------------------------------------
+// v1.0.9：会话消息里的图片（契约 §5.10）——附件读字节 + 缩略图补齐
+// ---------------------------------------------------------------------------
+
+/**
+ * 取宿主附件服务（服务名 `attachments`；本地后端 dsh-attachment-local）。
+ * ctx.get 对不存在的服务会抛，故 try/catch + ctx[name] 直取兜底。
+ * @param {any} ctx Cordis ctx
+ * @returns {any|null} 附件服务或 null（宿主没装附件后端）
+ */
+export function attachmentsOf(ctx) {
+  try {
+    const svc = ctx?.get?.("attachments");
+    if (svc) return svc;
+  } catch {
+    /* 服务未注册 */
+  }
+  try {
+    const svc = ctx?.attachments;
+    return svc ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 读一张附件的**原始字节**。
+ *
+ * 优先 `attachments.readImage(ref, signal)`（本地后端有实现，返回 {ref, data} 或裸字节，
+ * 且带完整性校验）；不可用/失败时回退 `readFileSync(imageHostPath(ref))`
+ * （宿主文件系统绝对路径；非文件后端时 imageHostPath 返回 undefined）。
+ * @param {any} attachments 附件服务
+ * @param {any} ref 宿主附件引用
+ * @param {AbortSignal} [signal]
+ * @returns {Promise<Buffer|null>} 字节；读不到返回 null
+ */
+export async function readAttachmentBytes(attachments, ref, signal) {
+  if (!attachments || !ref) return null;
+  try {
+    if (typeof attachments.readImage === "function") {
+      const out = await attachments.readImage(ref, signal);
+      const data = out && typeof out === "object" && "data" in out ? out.data : out;
+      const bytes = toBuffer(data);
+      if (bytes && bytes.length > 0) return bytes;
+    }
+  } catch {
+    /* 落到回退路径 */
+  }
+  try {
+    if (typeof attachments.imageHostPath === "function") {
+      const path = attachments.imageHostPath(ref);
+      if (typeof path === "string" && path !== "") {
+        const bytes = readFileSync(path);
+        if (bytes.length > 0) return bytes;
+      }
+    }
+  } catch {
+    /* 读不到就是读不到（上层降级） */
+  }
+  return null;
+}
+
+/** 各种字节形态 → Buffer。 */
+function toBuffer(input) {
+  if (input === null || input === undefined) return null;
+  if (Buffer.isBuffer(input)) return input;
+  if (input instanceof Uint8Array) return Buffer.from(input.buffer, input.byteOffset, input.byteLength);
+  if (input instanceof ArrayBuffer) return Buffer.from(input);
+  if (typeof input === "object" && input.data !== undefined && input.data !== null) return toBuffer(input.data);
+  return null;
+}
+
+/**
+ * 给消息里的图片补**内联缩略图**（契约 §5.10）。
+ *
+ * mapHistoryMessages 是纯函数（拿不到附件字节），只产元数据；这里负责读字节 +
+ * 压缩，并把 base64 ≤96KB 的 JPEG data URI 写回 image.thumb。
+ *
+ * 降级（**绝不抛**）：附件服务缺失 / 读不到字节 / sharp 不可用 / 压不进 96KB
+ * → thumb 留空，客户端显示占位框；图片功能失败**不影响**消息流其余内容。
+ *
+ * 预算（重要）：一页历史可能有几十张图，每张 96KB 内联会**顶爆中继的 1MiB 帧**
+ * （帧里还有 base64 密文的 4/3 放大）。所以整页缩略图有**总预算**
+ * （默认 LARGE_MAX_BASE64）；超预算的后续图片只发元数据（thumb 留空）。
+ *
+ * @param {object[]} messages ChatMessage[]
+ * @param {any} ctx Cordis ctx（用来取 attachments 服务）
+ * @param {{budgetBytes?:number}} [options]
+ * @returns {Promise<object[]>} 同一个 messages 数组
+ */
+export async function attachThumbs(messages, ctx, options) {
+  const list = Array.isArray(messages) ? messages : [];
+  if (list.length === 0) return list;
+  const attachments = attachmentsOf(ctx);
+  if (!attachments) return list;
+  const budget = Number.isSafeInteger(options?.budgetBytes) ? options.budgetBytes : LARGE_MAX_BASE64;
+  let used = 0;
+  for (const message of list) {
+    const images = Array.isArray(message?.images) ? message.images : [];
+    for (const image of images) {
+      if (!image || typeof image !== "object") continue;
+      if (typeof image.thumb === "string" && image.thumb !== "") continue;
+      if (used >= budget) continue; // 整页预算用尽 → 只发元数据
+      const ref = attachmentRefOf(image);
+      if (!ref) continue;
+      try {
+        const bytes = await readAttachmentBytes(attachments, ref, undefined);
+        if (!bytes) continue;
+        const thumb = await makeThumb(bytes, image.mediaType);
+        if (thumb === "") continue;
+        const size = thumb.length - THUMB_DATA_URI_PREFIX.length;
+        if (used + size > budget) continue; // 这张塞不进去 → 只发元数据
+        image.thumb = thumb;
+        used += size;
+      } catch {
+        /* 缩略图失败：只发元数据 */
+      }
+    }
+  }
+  return list;
 }
 
 // ---------------------------------------------------------------------------
@@ -602,6 +771,10 @@ export class HostBridge {
   #pending = new Map(); // askId -> { resolve, kind, sessionId, timer, abortHandler, signal }
   #titles = new Map(); // sessionId -> title（turn.end 推送文案用）
   #pushToken = ""; // 手机 push.register 上报的 token（内存态）
+  // v1.0.9（§5.10）：imageId -> 宿主附件引用（image.fetch 用；插件重启后为空）
+  #imageRefs = new Map();
+  // v1.0.9（§5.10）：`${imageId}:${maxEdge}` -> 已缩放的大图（避免重复压缩）
+  #imageCache = new Map();
   #disposers = [];
   #hostName = "";
   #dshVersion = "";
@@ -737,7 +910,12 @@ export class HostBridge {
         this.#sendEvent("session.modelChanged", { sessionId, model: selection });
         return;
       }
-      // 其余事件（assistant/message、user/message、turn/*、step/* …）忽略
+      if (type === "assistant/message") {
+        // v1.0.9（§5.10）：助手消息里的图片 → 广播 assistant.image（带内联缩略图）
+        this.#emitAssistantImages(sessionId, event);
+        return;
+      }
+      // 其余事件（user/message、turn/*、step/* …）忽略
     });
 
     // --- v1.0.7（§5.9）：Workspace 归档变化 → 广播归档全集 ---
@@ -859,6 +1037,154 @@ export class HostBridge {
     void cfg;
   }
 
+  // ---- v1.0.9：会话消息里的图片（契约 §5.10）-------------------------------
+
+  /**
+   * 记下 imageId → 宿主附件引用（image.fetch 要用原始字节）。
+   * 插件重启后这张表是空的——此时 image.fetch 回明确错误（不是崩溃）。
+   * @param {object[]} images ImageRef[]
+   */
+  #rememberImages(images) {
+    for (const image of Array.isArray(images) ? images : []) {
+      const imageId = typeof image?.imageId === "string" ? image.imageId : "";
+      if (imageId === "") continue;
+      const ref = attachmentRefOf(image);
+      if (ref) this.#imageRefs.set(imageId, ref);
+    }
+  }
+
+  /**
+   * assistant/message 事件里的图片 → 广播 `assistant.image`（契约 §5.2/§5.10）。
+   *
+   * 缩略图必须**内联**（客户端立刻显示），所以这里要读字节 + 压缩（异步）；
+   * 压缩失败/附件读不到 → thumb 留空，只发元数据（客户端画占位框）。
+   * @param {string} sessionId
+   * @param {any} event 宿主会话事件
+   */
+  #emitAssistantImages(sessionId, event) {
+    try {
+      // 与历史同口径：只收 append 表面事件（replace 是模型可见的影子副本）
+      if (event?.surfaceOp !== "append") return;
+      const refs = imageBlocksOf(event?.data?.message?.content);
+      if (refs.length === 0) return;
+      void this.#sendAssistantImages(sessionId, refs);
+    } catch (e) {
+      this.#log("warn", "assistant image bridge error", { sessionId, error: errText(e) });
+    }
+  }
+
+  /**
+   * 逐张生成缩略图并广播 assistant.image。
+   * @param {string} sessionId
+   * @param {object[]} refs 宿主附件引用
+   */
+  async #sendAssistantImages(sessionId, refs) {
+    const attachments = attachmentsOf(this.#ctx);
+    for (const ref of refs) {
+      const image = imageRefMeta(ref);
+      if (image.imageId === "") continue;
+      this.#imageRefs.set(image.imageId, ref);
+      try {
+        const bytes = await readAttachmentBytes(attachments, ref, undefined);
+        if (bytes) image.thumb = await makeThumb(bytes, image.mediaType);
+      } catch (e) {
+        // 只发元数据（thumb 留空）——图片失败不影响消息流
+        this.#log("warn", "assistant image thumb failed", { sessionId, imageId: image.imageId, error: errText(e) });
+      }
+      // 注意：日志里**绝不**输出 data URI / base64（可能含敏感图片内容）
+      this.#log("info", "assistant.image", {
+        sessionId,
+        imageId: image.imageId,
+        mediaType: image.mediaType,
+        width: image.width,
+        height: image.height,
+        bytes: image.bytes,
+        thumbBytes: image.thumb.length,
+      });
+      this.#sendEvent("assistant.image", { sessionId, image });
+    }
+  }
+
+  /**
+   * 契约 §5.1 image.fetch：拉取大图（等比缩放 + JPEG q85，base64 ≤ 1MiB 预算）。
+   *
+   * 失败**不影响**会话其余功能（图片可选，不阻塞消息流）：一切失败都回 error。
+   * @param {object} m 入站信封
+   */
+  async #rImageFetch(m) {
+    const p = m.payload ?? {};
+    const imageId = typeof p.imageId === "string" ? p.imageId.trim() : "";
+    if (imageId === "") {
+      this.#reply(m, errorOf(m, "bad-params", "imageId required"));
+      return;
+    }
+    const maxEdge = clampMaxEdge(p.maxEdge);
+    const ref = this.#imageRefs.get(imageId);
+    if (!ref) {
+      // 插件重启后缓存为空（或该图不在本次会话里）——回明确文案，不崩
+      this.#reply(
+        m,
+        errorOf(
+          m,
+          "image-not-found",
+          "图片不可用，请重新加载会话后再试（插件重启后图片缓存已清空）。",
+        ),
+      );
+      return;
+    }
+    const cacheKey = `${imageId}:${maxEdge}`;
+    const cached = this.#imageCache.get(cacheKey);
+    if (cached !== undefined) {
+      this.#reply(m, resultOf(m, cached));
+      return;
+    }
+    try {
+      const attachments = attachmentsOf(this.#ctx);
+      if (!attachments) {
+        this.#reply(m, errorOf(m, "service-unavailable", "attachments service unavailable"));
+        return;
+      }
+      const bytes = await readAttachmentBytes(attachments, ref, this.#signal(30_000));
+      if (!bytes) {
+        this.#reply(m, errorOf(m, "image-read-failed", "无法读取该图片的原始字节。"));
+        return;
+      }
+      const out = await makeLarge(bytes, ref.mediaType, maxEdge);
+      const value = {
+        imageId,
+        mediaType: out.mediaType,
+        width: out.width,
+        height: out.height,
+        data: out.data,
+      };
+      this.#imageCache.set(cacheKey, value);
+      this.#pruneImageCache();
+      // 日志只打 imageId/尺寸/字节数——**绝不**输出 data URI / base64
+      this.#log("info", "image.fetch served", {
+        imageId,
+        maxEdge,
+        width: out.width,
+        height: out.height,
+        sourceBytes: bytes.length,
+        dataBytes: out.data.length,
+      });
+      this.#reply(m, resultOf(m, value));
+    } catch (e) {
+      this.#log("warn", "image.fetch failed", { imageId, maxEdge, error: errText(e) });
+      this.#reply(m, errorOf(m, "image-encode-failed", errText(e)));
+    }
+  }
+
+  /** 大图缓存上限（避免长期运行把内存吃满）。 */
+  #pruneImageCache() {
+    const limit = 32;
+    while (this.#imageCache.size > limit) {
+      const oldest = this.#imageCache.keys().next();
+      if (oldest.done) break;
+      this.#imageCache.delete(oldest.value);
+    }
+  }
+
   // ---- assistant.delta 节流 -------------------------------------------------
 
   #queueDelta(sessionId, text) {
@@ -954,6 +1280,9 @@ export class HostBridge {
           return await this.#rSessionCancel(m);
         case "session.rename":
           return await this.#rSessionRename(m);
+        case "image.fetch":
+          // v1.0.9（§5.10）：拉取大图（缩略图已内联，这里按需给原图）
+          return await this.#rImageFetch(m);
         case "approval.answer":
           return this.#rApprovalAnswer(m);
         case "question.answer":
@@ -1117,6 +1446,8 @@ export class HostBridge {
         // v1.0.7：一条事件可能产出「思考 + 正文」两条（mapHistoryMessages）
         for (const mapped of mapHistoryMessages(sessionId, record)) {
           messages.push(mapped);
+          // v1.0.9（§5.10）：记下 imageId → 附件引用（image.fetch 要用原始字节）
+          this.#rememberImages(mapped.images);
           if (mapped.seq < oldestSeq) oldestSeq = mapped.seq;
         }
       }
@@ -1124,6 +1455,8 @@ export class HostBridge {
         // 本页无可聊消息（全被过滤）→ 用页内最老事件 seq 续翻，避免卡页
         oldestSeq = oldestEventSeq === Number.MAX_SAFE_INTEGER ? 0 : oldestEventSeq;
       }
+      // v1.0.9（§5.10）：缩略图必须内联（客户端立刻显示）——这里补齐
+      await attachThumbs(messages, this.#ctx);
       // v1.0.6（§5.7）：工作步骤（工具调用）——旧客户端只读 messages，不受影响
       const steps = mapHistorySteps(page?.records ?? []);
       this.#reply(m, resultOf(m, { messages, steps, hasMore: page?.hasMore === true, oldestSeq }));

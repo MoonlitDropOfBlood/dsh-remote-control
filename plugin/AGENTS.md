@@ -15,6 +15,8 @@ lib/protocol.mjs      信封 + HKDF-SHA256 + AES-256-GCM + assertKat()（契约 
 lib/config.mjs        %DSH_HOME%/remote-control/config.json 读写（首启生成 channel/secret、hidden 标记）
 lib/relay-client.mjs  中继 WS 客户端（退避重连/心跳/sid:seq 去重/reload 热更换）
 lib/host-bridge.mjs   Host 桥接：sessionController + api-session/agent 事件 + 审批/提问瀑布
+lib/images.mjs        会话消息里的图片（契约 §5.10）：image 块识别 + sharp 缩略图/大图
+                      （imageBlocksOf / makeThumb / makeLarge / imageRefMeta）
 lib/pairing.mjs       配对核心：URI（§3.5）/QR（SVG+ASCII）/rotatePairingIdentity/setPairingHidden
                       /isLoopbackRelayUrl+loopbackWarning（回环地址判定与警告文案）
 lib/qr.mjs            内嵌 QR 编码器（移植 Nayuki qrcodegen，MIT；byte 模式 ECC-M v1-10）
@@ -29,7 +31,8 @@ scripts/sync-client-icon.mjs  把 icon.svg 同步成 client.js 里的导航图�
 node --check index.js client.js typert.host.js lib/*.mjs scripts/*.mjs   # 语法
 node -e "import('./lib/protocol.mjs').then(m=>m.assertKat())"           # KAT
 node scripts/verify-qr.mjs && node scripts/verify-pairing.mjs           # QR/配对 API 回归（需 devDependencies）
-node scripts/verify-steps.mjs                                          # v1.0.8 步骤/模式/权限/归档/模型/思考/强度回归（无依赖，113 项）
+node scripts/verify-steps.mjs                                          # v1.0.9 步骤/模式/权限/归档/模型/思考/强度 + 图片回归（无依赖，154 项）
+node scripts/verify-images.mjs                                         # v1.0.9 图片专项：元数据映射/缩略图降级/image.fetch 缓存与报错（无依赖，77 项）
 node scripts/verify-settings.mjs                                       # v1.1.x 设置页/manifest/combo/信封自检 + Host 真跑一遍（112 项）
 node scripts/sync-client-icon.mjs                                      # 改了 icon.svg 后同步 client.js 的图标 data-uri
 ```
@@ -129,6 +132,50 @@ ESM 模块缓存不会重载源码（实测踩坑）。
   `{sessionId, model}`（无 reasoningEffort 时省略该字段）。桌面端与手机端切换都会触发，天然归一。
 - 回归：`node scripts/verify-steps.mjs` 目前 **113 项**（新增 efforts 映射、selectModel 成功/拒绝、
   model 查询 null→追踪、modelChanged 广播）。
+
+## v1.0.9：会话消息里的图片（2026-10-25，契约 §5.10）
+
+宿主会话消息的 content 块里图片是**附件引用**（不是内联 base64）：
+
+```json
+{ "type": "image", "attachment": { "attachmentId": "…", "mediaType": "image/png",
+                                    "bytes": 123456, "width": 800, "height": 600 } }
+```
+
+中继单帧上限 **1MiB**（且帧里是 base64 密文，明文还要 ×4/3），所以走契约的两段式：
+**缩略图内联 + 大图按需拉取**。
+
+| 位置 | 做什么 |
+|---|---|
+| `lib/images.mjs` | 纯加工：`imageBlocksOf` / `imageRefMeta` / `makeThumb` / `makeLarge` / `clampMaxEdge` |
+| `lib/host-bridge.mjs` | `mapHistoryMessages` 给 ChatMessage 追加 `images:ImageRef[]`；`attachThumbs(messages, ctx)` 补内联缩略图；`session/event` 总闸广播 `assistant.image`；`image.fetch` 请求处理 |
+
+- **正文不再写 "[图片]" 占位符**（图片单独渲染）。`mapHistoryMessages` 改用新的
+  `messageText()`；`contentText()` **保持原样**（那是 §5.7 工具结果 `resultText` 的口径，
+  工具结果里的图片没有独立渲染通道，占位符仍有用）。
+- **ImageRef** = `{imageId(=宿主 attachmentId), mediaType, width, height, bytes, thumb}`；
+  宿主附件引用挂在**不可枚举的 symbol** 上（`imageRefMeta`/`attachmentRefOf`），
+  插件内部能读字节，**绝不进 wire JSON**。
+- **缩略图**：长边 ≤480、JPEG q75，base64 **必须 ≤96KB**；超限沿阶梯降质/降尺寸，
+  仍超限 → **thumb 留空只发元数据**（客户端画占位框）。PNG/GIF 统一转 JPEG
+  （GIF 只取首帧）。**整页历史有总预算**（`LARGE_MAX_BASE64`），否则一页几十张图会顶爆中继帧。
+- **大图**：`image.fetch {imageId, maxEdge?}` → `{imageId, mediaType, width, height, data}`；
+  `maxEdge` 缺省 1600、上限 4096；等比缩放 + JPEG q85，base64 预算 750KB
+  （契约说 ≤1MiB，但 1MiB 是**密文帧**上限，明文要留 4/3 余量）；压不进去回 `error`。
+- **sharp 不在插件自己的 node_modules 里**（link 安装 + 依赖不打包）：用 `createRequire`
+  从 **DSH 部署目录**（`<APPDATA>/DeepSeek Harness Desktop/dsh/node_modules/sharp`）动态解析；
+  解析不到就**降级**（只发元数据、thumb 留空），**绝不抛异常崩掉插件**。
+  `lib/images.mjs` 的 `setSharpResolver()` 是**单测注入点**（生产不调用）。
+- **附件服务**：`ctx.get("attachments")`（本地后端 dsh-attachment-local）。
+  读字节优先 `readImage(ref, signal)`（返回 `{ref, data}`，带完整性校验），
+  不可用时回退 `readFileSync(imageHostPath(ref))`。
+- **imageId → 附件引用缓存**在 HostBridge 内存里（历史消息 + 直播图片两处登记）；
+  **插件重启后为空** → `image.fetch` 回 `image-not-found`（文案提示先加载会话历史），不崩。
+- **日志绝不输出 data URI / base64**（可能含敏感图）：只打 imageId、字节数、尺寸。
+- 回归：`node scripts/verify-steps.mjs` 目前 **154 项**（新增 image 块识别、ImageRef 形状、
+  无 "[图片]" 占位符、缩略图超限降级/整页预算、image.fetch 校验与缓存、assistant.image 广播）
+  + `node scripts/verify-images.mjs` **77 项**（图片专项：元数据映射、缩略图降级阶梯、
+  image.fetch 缓存命中/重启后报错、日志无 base64）。
 
 ## v1.1.x：配对入口搬进设置面板（2026-10-24）
 

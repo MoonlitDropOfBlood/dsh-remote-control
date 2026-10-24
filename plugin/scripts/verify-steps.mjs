@@ -32,7 +32,20 @@ import {
   mapHistoryMessages,
   reasoningText,
   contentText,
+  messageText,
+  attachThumbs,
 } from "../lib/host-bridge.mjs";
+import {
+  IMAGE_MEDIA_TYPES,
+  LARGE_MAX_BASE64,
+  LARGE_MAX_EDGE,
+  THUMB_MAX_BASE64,
+  imageBlocksOf,
+  loadSharp,
+  makeLarge,
+  makeThumb,
+  setSharpResolver,
+} from "../lib/images.mjs";
 
 let pass = 0;
 let fail = 0;
@@ -856,6 +869,298 @@ function eventsOf(sent, topic) {
   check("mapReasoningEfforts：name 回退 id + description 空串", mapReasoningEfforts([{ id: "a" }])[0]?.name === "a" && mapReasoningEfforts([{ id: "a" }])[0]?.description === "", JSON.stringify(mapReasoningEfforts([{ id: "a" }])));
   check("parseModelSelection：无效回 null", parseModelSelection({ provider: "a" }) === null && parseModelSelection("x") === null, "null");
   check("mapModelSelection：省略空 reasoningEffort", mapModelSelection({ provider: "a", model: "b", reasoningEffort: "" })?.reasoningEffort === undefined, JSON.stringify(mapModelSelection({ provider: "a", model: "b" })));
+}
+
+// ===========================================================================
+// 场景 9（v1.0.9）：会话消息里的图片（契约 §5.10 / §5.1 image.fetch）
+//
+// 用桩数据（假 attachments 服务 + 假 sharp）驱动真正的 HostBridge 与
+// lib/images.mjs，不依赖真机/真宿主。覆盖：
+//   1. image 块识别（imageBlocksOf）与 ImageRef 形状；
+//   2. mapHistoryMessages 不再产生 "[图片]" 占位符（图片单独渲染）；
+//   3. 缩略图超限降级（降质/降尺寸），压不进则只发元数据（thumb 留空）；
+//   4. sharp 不可用时降级（不抛异常）；
+//   5. assistant.image 直播事件（带内联缩略图）；
+//   6. image.fetch 校验（非法/未知 imageId 回 error）与缩放缓存。
+// ===========================================================================
+{
+  const refA = { attachmentId: "sha256:aaa", mediaType: "image/png", bytes: 1234, width: 800, height: 600, name: "a.png" };
+  const refB = { attachmentId: "sha256:bbb", mediaType: "image/jpeg", bytes: 42, width: 20, height: 10 };
+  const mixedContent = [
+    { type: "text", text: "看图" },
+    { type: "image", attachment: refA },
+    { type: "reasoning", text: "r" },
+    { type: "image", attachment: refB },
+    { type: "file", attachment: { attachmentId: "sha256:fff", name: "a.txt", bytes: 3 } },
+  ];
+
+  // --- 1. image 块识别 ---
+  const blocks = imageBlocksOf(mixedContent);
+  check("imageBlocksOf：取出全部 image 块的 attachment 引用", blocks.length === 2 && blocks[0] === refA && blocks[1] === refB, JSON.stringify(blocks.map((b) => b.attachmentId)));
+  check("imageBlocksOf：非数组回空数组", imageBlocksOf(null).length === 0 && imageBlocksOf("x").length === 0 && imageBlocksOf(undefined).length === 0, "[]");
+  check("imageBlocksOf：没有 attachment 的 image 块跳过", imageBlocksOf([{ type: "image" }, { type: "text", text: "t" }]).length === 0, "[]");
+  check("imageBlocksOf：非 image 块不误判", imageBlocksOf([{ type: "file", attachment: { attachmentId: "x" } }]).length === 0, "[]");
+  check("IMAGE_MEDIA_TYPES：四种宿主图片类型", IMAGE_MEDIA_TYPES.length === 4 && IMAGE_MEDIA_TYPES.includes("image/webp") && IMAGE_MEDIA_TYPES.includes("image/gif"), JSON.stringify(IMAGE_MEDIA_TYPES));
+
+  // --- 2. ChatMessage.images[]（ImageRef 形状）+ 正文不再有 "[图片]" ---
+  const imgMsgs = mapHistoryMessages("s", {
+    event: { type: "assistant/message", seq: 5, time: 11, surfaceOp: "append", data: { message: { content: mixedContent } } },
+  });
+  check("mapHistoryMessages：图片消息带 images[]", imgMsgs.length === 2 && Array.isArray(imgMsgs[1].images) && imgMsgs[1].images.length === 2, JSON.stringify(imgMsgs));
+  const ir = imgMsgs[1]?.images?.[0];
+  check(
+    "ImageRef 形状（imageId/mediaType/width/height/bytes/thumb）",
+    ir?.imageId === "sha256:aaa" && ir?.mediaType === "image/png" && ir?.width === 800 &&
+      ir?.height === 600 && ir?.bytes === 1234 && ir?.thumb === "",
+    JSON.stringify(ir),
+  );
+  check("ImageRef：附件引用不进 wire JSON", !JSON.stringify(imgMsgs[1]).includes("attachmentId"), JSON.stringify(imgMsgs[1]));
+  check("mapHistoryMessages：正文不再出现 [图片] 占位符", !imgMsgs[1]?.text?.includes("[图片]"), JSON.stringify(imgMsgs[1]?.text));
+  check("mapHistoryMessages：正文保留 file 占位符", imgMsgs[1]?.text === "看图[文件]", JSON.stringify(imgMsgs[1]?.text));
+  check("messageText：图片块不占位", messageText(mixedContent) === "看图[文件]", messageText(mixedContent));
+  check("contentText：工具结果口径仍给图片占位符（§5.7 不变）", contentText([{ type: "image" }]) === "[图片]", contentText([{ type: "image" }]));
+
+  // 纯图片消息（无正文）也要成条，否则手机端看不到这张图
+  const onlyImg = mapHistoryMessages("s", {
+    event: { type: "user/message", seq: 6, time: 12, surfaceOp: "append", data: { source: { kind: "user" }, content: [{ type: "image", attachment: refA }] } },
+  });
+  check("mapHistoryMessages：纯图片消息也成条", onlyImg.length === 1 && onlyImg[0].text === "" && onlyImg[0].images?.length === 1, JSON.stringify(onlyImg));
+  const noImg = mapHistoryMessages("s", {
+    event: { type: "user/message", seq: 7, time: 13, surfaceOp: "append", data: { source: { kind: "user" }, content: [{ type: "text", text: "hi" }] } },
+  });
+  check("mapHistoryMessages：无图片不产 images 字段", noImg.length === 1 && noImg[0].images === undefined, JSON.stringify(noImg));
+
+  // --- 3./4. 真实 sharp（有就用，没有就跳过；不依赖） ---
+  const realSharp = loadSharp();
+  if (realSharp) {
+    try {
+      const png = await realSharp({ create: { width: 900, height: 600, channels: 3, background: { r: 20, g: 120, b: 200 } } }).png().toBuffer();
+      const thumb = await makeThumb(png, "image/png");
+      check(
+        "真实 sharp：缩略图是 JPEG data URI 且 ≤96KB base64",
+        thumb.startsWith("data:image/jpeg;base64,") && thumb.length - "data:image/jpeg;base64,".length <= THUMB_MAX_BASE64,
+        thumb.slice(0, 48),
+      );
+      const big = await makeLarge(png, "image/png", 1600);
+      check(
+        "真实 sharp：大图 data URI、长边不放大、≤1MiB",
+        big.data.startsWith("data:image/jpeg;base64,") && big.width === 900 && big.height === 600 && big.data.length <= 1024 * 1024,
+        JSON.stringify({ w: big.width, h: big.height, len: big.data.length }),
+      );
+    } catch (e) {
+      check("真实 sharp：图片往返", false, String(e && e.message));
+    }
+  }
+
+  // --- 假 sharp：可控输出尺寸，用来验证降级阶梯 ---
+  const fakeCalls = [];
+  const fakeSharp = (sizeFor) => (input, opts) => {
+    const state = { edge: 0, quality: 0, animated: opts?.animated === true };
+    const api = {
+      rotate() { return api; },
+      resize(o) { state.edge = Math.min(o.width, o.height); return api; },
+      jpeg(o) { state.quality = o.quality; return api; },
+      async toBuffer(o) {
+        fakeCalls.push({ ...state });
+        const bytes = Math.max(1, Math.floor(sizeFor(state)));
+        const data = Buffer.alloc(bytes, 0x41);
+        if (o?.resolveWithObject) {
+          return { data, info: { width: state.edge, height: state.edge, format: "jpeg", size: bytes } };
+        }
+        return data;
+      },
+    };
+    return api;
+  };
+
+  // 缩略图：q75 压不进 96KB → 自动降质到 q60
+  fakeCalls.length = 0;
+  setSharpResolver(() => fakeSharp((s) => s.quality * 1000));
+  const thumb2 = await makeThumb(Buffer.from("raw"), "image/png");
+  check(
+    "makeThumb：超 96KB 自动降质重压",
+    thumb2.startsWith("data:image/jpeg;base64,") && thumb2.length - "data:image/jpeg;base64,".length <= THUMB_MAX_BASE64 &&
+      fakeCalls.length === 2 && fakeCalls[0].quality === 75 && fakeCalls[1].quality === 60,
+    JSON.stringify(fakeCalls),
+  );
+  check("makeThumb：长边 ≤480", fakeCalls[0].edge === 480, JSON.stringify(fakeCalls[0]));
+
+  // 缩略图：怎么压都超限 → 返回 ''（只发元数据）
+  fakeCalls.length = 0;
+  setSharpResolver(() => fakeSharp(() => 5_000_000));
+  const thumb3 = await makeThumb(Buffer.from("raw"), "image/png");
+  check("makeThumb：压不进 96KB 返回空串（只发元数据）", thumb3 === "", JSON.stringify(thumb3));
+
+  // sharp 不可用 → 降级不抛
+  setSharpResolver(() => null);
+  const thumb4 = await makeThumb(Buffer.from("raw"), "image/png");
+  check("makeThumb：sharp 不可用返回空串（不抛）", thumb4 === "", JSON.stringify(thumb4));
+  let largeThrew = false;
+  try {
+    await makeLarge(Buffer.from("raw"), "image/png", 1600);
+  } catch {
+    largeThrew = true;
+  }
+  check("makeLarge：sharp 不可用抛错（上层回 error）", largeThrew, "no throw");
+
+  // 大图：先降质
+  fakeCalls.length = 0;
+  setSharpResolver(() => fakeSharp((s) => s.quality * 10000));
+  const big2 = await makeLarge(Buffer.from("raw"), "image/png", 1600);
+  check(
+    "makeLarge：超预算自动降质且 ≤1MiB 预算",
+    big2.data.startsWith("data:image/jpeg;base64,") && big2.data.length - "data:image/jpeg;base64,".length <= LARGE_MAX_BASE64,
+    JSON.stringify(fakeCalls),
+  );
+  // 大图：只降质压不进去 → 降尺寸
+  fakeCalls.length = 0;
+  setSharpResolver(() => fakeSharp((s) => s.edge * 1000));
+  const big3 = await makeLarge(Buffer.from("raw"), "image/png", 1600);
+  check(
+    "makeLarge：降质无用时降尺寸且 ≤1MiB 预算",
+    big3.data.startsWith("data:image/jpeg;base64,") && big3.data.length - "data:image/jpeg;base64,".length <= LARGE_MAX_BASE64,
+    JSON.stringify(fakeCalls),
+  );
+  // 大图：怎么都压不进去 → 抛错
+  setSharpResolver(() => fakeSharp(() => 50_000_000));
+  let largeThrew2 = false;
+  try {
+    await makeLarge(Buffer.from("raw"), "image/png", 1600);
+  } catch {
+    largeThrew2 = true;
+  }
+  check("makeLarge：实在压不进去抛错（上层回 error）", largeThrew2, "no throw");
+
+  // maxEdge 归一化（缺省 1600、上限 4096）
+  fakeCalls.length = 0;
+  setSharpResolver(() => fakeSharp(() => 1000));
+  await makeLarge(Buffer.from("raw"), "image/png", 999999);
+  check("makeLarge：maxEdge 上限 4096", fakeCalls[0].edge === LARGE_MAX_EDGE, JSON.stringify(fakeCalls[0]));
+  fakeCalls.length = 0;
+  await makeLarge(Buffer.from("raw"), "image/png", undefined);
+  check("makeLarge：maxEdge 缺省 1600", fakeCalls[0].edge === 1600, JSON.stringify(fakeCalls[0]));
+
+  // --- 5./6. 桥接层：历史内联缩略图 + assistant.image 事件 + image.fetch ---
+  const imgCalls = [];
+  const attachments = {
+    async readImage(ref) {
+      imgCalls.push(ref.attachmentId);
+      return { ref, data: Buffer.from("raw-image-bytes") };
+    },
+    imageHostPath() {
+      return undefined;
+    },
+  };
+  const imgEvents = [
+    {
+      type: "user/message",
+      seq: 1,
+      time: 100,
+      surfaceOp: "append",
+      data: { source: { kind: "user" }, content: [{ type: "text", text: "看图" }, { type: "image", attachment: refA }] },
+    },
+  ];
+  const imgRelay = makeRelay();
+  const imgCtx = makeCtx({
+    attachments,
+    sessionController: {
+      async inspect() { return { events: imgEvents }; },
+      async page() { return { records: imgEvents.map((e) => ({ event: e })), hasMore: false }; },
+      async list() { return { items: [] }; },
+    },
+  });
+  const imgBridge = new HostBridge({
+    ctx: imgCtx,
+    relay: imgRelay,
+    push: { configured: false, notify: async () => ({ ok: true }) },
+    config: CFG,
+    log,
+  });
+  imgBridge.attach();
+
+  // 缩略图走假 sharp（可控体积）
+  setSharpResolver(() => fakeSharp(() => 1000));
+
+  await imgBridge.dispatch({ id: "img-hist", type: "session.history", ts: Date.now(), payload: { sessionId: "s-img" } });
+  const hist = lastResult(imgRelay.sent, "img-hist");
+  const hImg = hist?.value?.messages?.[0]?.images?.[0];
+  check("session.history：消息带 images[] 且缩略图已内联", typeof hImg?.thumb === "string" && hImg.thumb.startsWith("data:image/jpeg;base64,"), JSON.stringify(hImg));
+  check("session.history：缩略图 ≤96KB base64", (hImg?.thumb?.length ?? 0) - "data:image/jpeg;base64,".length <= THUMB_MAX_BASE64, String(hImg?.thumb?.length));
+  check("session.history：正文没有 [图片] 占位符", !JSON.stringify(hist?.value?.messages).includes("[图片]"), JSON.stringify(hist?.value?.messages));
+
+  // 整页缩略图预算：一页很多图时不能顶爆中继的 1MiB 帧
+  const manyMessages = [];
+  for (let i = 0; i < 5; i++) {
+    const one = mapHistoryMessages("s", {
+      event: { type: "user/message", seq: 100 + i, time: 1, surfaceOp: "append", data: { source: { kind: "user" }, content: [{ type: "image", attachment: { ...refA, attachmentId: "sha256:page" + i } }] } },
+    })[0];
+    manyMessages.push(one);
+  }
+  setSharpResolver(() => fakeSharp(() => 50_000)); // 每张 ~66KB base64（单张合格，但一页装不下）
+  await attachThumbs(manyMessages, imgCtx, { budgetBytes: 100_000 });
+  const inlined = manyMessages.filter((m) => m.images[0].thumb !== "").length;
+  check("attachThumbs：整页预算用尽后只发元数据（不顶爆中继帧）", inlined === 1, JSON.stringify(inlined));
+  check("attachThumbs：没有附件服务时不抛（只发元数据）", (await attachThumbs(manyMessages, makeCtx({}))).length === 5, "n/a");
+
+  // image.fetch：非法 imageId
+  await imgBridge.dispatch({ id: "img-bad", type: "image.fetch", ts: Date.now(), payload: { imageId: "" } });
+  check("image.fetch：空 imageId 回 bad-params", lastResult(imgRelay.sent, "img-bad")?.error?.code === "bad-params", JSON.stringify(lastResult(imgRelay.sent, "img-bad")));
+
+  // image.fetch：未知 imageId（插件重启后缓存为空）
+  await imgBridge.dispatch({ id: "img-miss", type: "image.fetch", ts: Date.now(), payload: { imageId: "sha256:nope" } });
+  const miss = lastResult(imgRelay.sent, "img-miss");
+  check("image.fetch：未知 imageId 回 image-not-found 且文案明确", miss?.error?.code === "image-not-found" && String(miss?.error?.message).length > 0, JSON.stringify(miss));
+
+  // image.fetch：命中已知图片
+  const readsBefore = imgCalls.length;
+  await imgBridge.dispatch({ id: "img-ok", type: "image.fetch", ts: Date.now(), payload: { imageId: "sha256:aaa" } });
+  const ok = lastResult(imgRelay.sent, "img-ok");
+  check(
+    "image.fetch：回 {imageId,mediaType,width,height,data}",
+    ok?.value?.imageId === "sha256:aaa" && ok?.value?.mediaType === "image/jpeg" &&
+      typeof ok?.value?.width === "number" && typeof ok?.value?.height === "number" &&
+      String(ok?.value?.data).startsWith("data:image/jpeg;base64,"),
+    JSON.stringify({ ...ok?.value, data: String(ok?.value?.data).slice(0, 32) }),
+  );
+  check("image.fetch：大图 base64 ≤1MiB", String(ok?.value?.data).length <= 1024 * 1024, String(ok?.value?.data?.length));
+
+  // image.fetch：同 (imageId,maxEdge) 命中缓存 → 不再读附件
+  const readsAfter = imgCalls.length;
+  await imgBridge.dispatch({ id: "img-ok2", type: "image.fetch", ts: Date.now(), payload: { imageId: "sha256:aaa" } });
+  check("image.fetch：同 imageId+maxEdge 命中缓存（不再读附件）", imgCalls.length === readsAfter && readsAfter > readsBefore, JSON.stringify({ readsBefore, readsAfter, now: imgCalls.length }));
+
+  // image.fetch：maxEdge 超上限 → 钳到 4096
+  fakeCalls.length = 0;
+  await imgBridge.dispatch({ id: "img-edge", type: "image.fetch", ts: Date.now(), payload: { imageId: "sha256:aaa", maxEdge: 999999 } });
+  check("image.fetch：maxEdge 钳到 4096", fakeCalls[0]?.edge === LARGE_MAX_EDGE, JSON.stringify(fakeCalls[0]));
+
+  // 直播：assistant/message 里的图片 → assistant.image 事件（带内联缩略图）
+  imgRelay.sent.length = 0;
+  imgCtx.emit("session/event", { id: "s-img" }, {
+    type: "assistant/message",
+    seq: 9,
+    time: 200,
+    surfaceOp: "append",
+    data: { turn: 1, step: 1, message: { content: [{ type: "text", text: "图来了" }, { type: "image", attachment: refB }] } },
+  });
+  await new Promise((r) => setTimeout(r, 30));
+  const imgEventsOut = eventsOf(imgRelay.sent, "assistant.image");
+  check(
+    "assistant.image：直播推送且缩略图内联",
+    imgEventsOut.length === 1 && imgEventsOut[0]?.sessionId === "s-img" &&
+      imgEventsOut[0]?.image?.imageId === "sha256:bbb" &&
+      String(imgEventsOut[0]?.image?.thumb).startsWith("data:image/jpeg;base64,"),
+    JSON.stringify(imgEventsOut),
+  );
+  check("assistant.image：ImageRef 字段齐全", imgEventsOut[0]?.image?.mediaType === "image/jpeg" && imgEventsOut[0]?.image?.width === 20 && imgEventsOut[0]?.image?.height === 10 && imgEventsOut[0]?.image?.bytes === 42, JSON.stringify(imgEventsOut[0]?.image));
+  check("assistant.image：附件引用不进 wire JSON", !JSON.stringify(imgEventsOut).includes("attachmentId"), JSON.stringify(imgEventsOut));
+
+  // 日志里绝不出现 base64 / data URI
+  const logBlob = logs.join("\n");
+  check("日志不含 base64 / data URI", !logBlob.includes("base64") && !logBlob.includes("data:image"), "leak");
+
+  imgBridge.dispose();
+  setSharpResolver(null);
 }
 
 console.log("");

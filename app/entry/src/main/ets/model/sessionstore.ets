@@ -382,6 +382,11 @@ export class SessionStore {
   /** v1.0.7：宿主是否支持 Workspace 真实归档（false → 禁用归档动作，不做本机假归档）。 */
   @Trace archiveSupported: boolean = false;
   @Trace capabilitiesLoaded: boolean = false;
+  /**
+   * v1.1.2：宿主「繁忙时的发送行为」（'queue' | 'steer'）——**只读**。
+   * 手机端不提供切换：发消息走哪种行为由 DSH 设置决定（用户明确要求）。
+   */
+  @Trace busyEnter: string = 'queue';
   /** v1.0.8：当前活动会话的模型/思考强度（null = 未知，UI 回退目录默认）。 */
   @Trace sessionModel: DshrcModelSelection | null = null;
 
@@ -715,6 +720,8 @@ export class SessionStore {
       this.models = caps.models;
       this.defaultModelId = caps.defaultModelId;
       this.archiveSupported = caps.archiveSupported;
+      // v1.1.2：宿主「繁忙时的发送行为」（只读跟随，手机端不提供切换）
+      this.busyEnter = caps.busyEnter === 'steer' ? 'steer' : 'queue';
       this.capabilitiesLoaded = true;
     }).catch((e: Error): void => {
       // 旧插件无此请求 → 能力目录为空（客户端隐藏选择区，不报错）
@@ -723,8 +730,28 @@ export class SessionStore {
       this.models = [];
       this.defaultModelId = '';
       this.archiveSupported = false;
+      this.busyEnter = 'queue';
       this.capabilitiesLoaded = true;
       logDshrc(TAG, 'info', 'session.capabilities unavailable: ' + e.message);
+    });
+  }
+
+  /**
+   * 拉该会话的待执行消息快照（契约 §5.2 v1.1.2）。
+   *
+   * 为什么必须「拉」：`session.queue` 事件只在**队列变化时**推。手机端断线重连后
+   * 若队列在断线期间变过，光靠事件永远补不上 → 用户看到「排队列表空的，
+   * 桌面端明明排着一条」。故打开会话时拉一次全量快照（与事件同形状）。
+   */
+  loadQueue(sid: string): Promise<void> {
+    if (sid.length === 0 || this.link.getState() !== 'online') {
+      return Promise.resolve();
+    }
+    return this.link.sessionQueue(sid).then((items: DshrcQueueItem[]): void => {
+      this.applyQueueSnapshot(sid, items);
+    }).catch((e: Error): void => {
+      // 旧插件无此请求 → 队列显示为空（不报错，不阻塞会话）
+      logDshrc(TAG, 'info', 'session.queue unavailable: ' + e.message);
     });
   }
 

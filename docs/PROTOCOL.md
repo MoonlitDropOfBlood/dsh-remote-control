@@ -6,7 +6,11 @@
 > v1.0.9 于 2026-10-25 增补：会话消息里的图片（§5.10，缩略图内联 + 大图按需拉取）；
 > v1.1.0 于 2026-10-25 增补：§5.10.1 图片的第二来源——present 投递的文件（deliverables/presented）；
 > **v1.1.1 于 2026-10-25 增补：§5.10.2 交付物图片进历史（不再「一闪而过」）、
-> §5.2 新事件 `session.queue`（待执行消息/排队显示）、§5.1 `session.prompt` 增 `mode:queue|steer`）。
+> §5.2 新事件 `session.queue`（待执行消息/排队显示）**。
+> **v1.1.2 于 2026-10-25 修订**：投递行为（排队/插话）**由宿主设置决定**——
+> `session.prompt` **不再收客户端的 mode**（传了也忽略），插件读宿主「繁忙时的发送行为」
+> （`ui-conversation.busyEnter`）；`session.capabilities` 增 `busyEnter`（只读）；
+> 新增请求 `session.queue`（拉取队列快照，断线重连后补状态）。
 > 三个实现（DSH 插件 / 中继服务器 / HarmonyOS App）
 > 都必须以本文档为准；任何协议改动必须先改本文档并通知 Lead。
 
@@ -124,12 +128,13 @@ dshrc://pair?r=<encodeURIComponent(relayUrl)>&c=<channel>&s=<secret>[&t=<encodeU
 | `session.subagentPrompt` | `{parentSessionId, childSessionId, text}` | `{accepted:bool}` | **v1.0.5** 向 **continuable** 子代理发消息（delivery:'queue'）；one-shot 子代理返回 `unsupported` 错误。回复走同一事件流（sessionId=child） |
 | `session.subagentCancel` | `{parentSessionId, childSessionId}` | `{accepted:bool}` | **v1.0.5** 取消 continuable 子代理当前 turn（interruptByParent；accepted=信号已受理，非已停止） |
 | `session.create` | `{title?, cwd?, agentPreset?, permission?, model?}` | `{sessionId, agentPreset?, model?, modelError?}` | cwd 缺省用主机默认工作目录。**v1.0.6**：`agentPreset` / `permission` = 模式与权限（§5.8）。**v1.0.7**：`model:{provider,model,reasoningEffort?}` = 模型选择；Host 在创建后、首条 prompt 前 `selectModel`。会话已创建但模型设置失败时仍回成功并带 `modelError`，客户端不得重复创建 |
-| `session.capabilities` | `{}` | `{presets:[ModeOption], permissions:[PermissionOption], defaultPreset?, defaultPermission?, models:[ModelOption], defaultModelId?, archiveSupported:bool}` | **v1.0.6** 模式与权限目录。**v1.0.7** 增加模型目录与真实归档能力标记（§5.8/§5.9）。**v1.0.8** `ModelOption.efforts` 暴露该模型可选思考强度（§5.8）；宿主未提供对应能力时 models 为空 / archiveSupported=false，客户端隐藏对应选择区，不得报错 |
+| `session.capabilities` | `{}` | `{presets:[ModeOption], permissions:[PermissionOption], defaultPreset?, defaultPermission?, models:[ModelOption], defaultModelId?, archiveSupported:bool, busyEnter:'queue'\|'steer'}` | **v1.0.6** 模式与权限目录。**v1.0.7** 增加模型目录与真实归档能力标记（§5.8/§5.9）。**v1.0.8** `ModelOption.efforts` 暴露该模型可选思考强度（§5.8）；宿主未提供对应能力时 models 为空 / archiveSupported=false，客户端隐藏对应选择区，不得报错。**v1.1.2** 增补 `busyEnter`：宿主「繁忙时的发送行为」——**只读**（客户端不得提供切换），宿主读不到时按 'queue' |
 | `session.archive` | `{sessionId, stopActivity?:bool}` | `{sessionId, archived:true}` | **v1.0.7** 写入 Workspace 真实归档集合；`stopActivity=true` 时按 Host 语义停止运行活动，缺省为 false |
 | `session.unarchive` | `{sessionId}` | `{sessionId, archived:false}` | **v1.0.7** 从 Workspace 归档集合恢复；幂等 |
 | `session.selectModel` | `{sessionId, model:ModelSelection}` | `{model:ModelSelection}` | **v1.0.8** 对**已存在会话**切换模型/思考强度；插件调 `sessionController.selectModel({sessionId,…})`。Host 拒绝时回 `error`（原文带出），成功回归一化后的 selection，并视为一次 `model/selection`（同样触发 `session.modelChanged`） |
 | `session.model` | `{sessionId}` | `{model:ModelSelection\|null}` | **v1.0.8** 查询会话当前模型/思考强度。插件从 `model/selection` 会话事件维护内存态；插件重启后无记录时回 `null`（客户端回退展示目录默认），**不得臆造** |
-| `session.prompt` | `{sessionId, text, mode?:'queue'\|'steer'}` | `{accepted:bool}` | 立即返回；实际回复走事件流。**v1.1.1** 增补 `mode`：`queue`（缺省：追加到当前 turn 之后执行）/`steer`（插入正在运行的 turn）。宿主拒绝 steer 时回 error，客户端可退回 queue |
+| `session.prompt` | `{sessionId, text}` | `{accepted:bool, mode:'queue'\|'steer'}` | 立即返回；实际回复走事件流。**v1.1.2 起投递行为由宿主设置决定**：客户端**不传** mode（传了也**忽略**）。插件读宿主「繁忙时的发送行为」（`ui-conversation.busyEnter`：排队发送/插话发送），agent 忙时按设置投递、空闲时总是 queue；宿主拒绝插话时插件**自动退回 queue**（消息不丢）。回包的 `mode` 是**实际**使用的投递行为 |
+| `session.queue` | `{sessionId}` | `{sessionId, items:[{itemId, text, target:'next-turn'\|'next-step'}]}` | **v1.1.2** 拉取该会话**当前**待执行消息的全量快照。与 §5.2 的 `session.queue` 事件同形状：事件只在**变化时**推，客户端断线重连后必须拉一次才能补上断线期间变过的队列 |
 | `session.cancel` | `{sessionId}` | `{cancelled:bool}` | 取消当前运行的 turn |
 | `session.rename` | `{sessionId, title}` | `{title}` | |
 | `image.fetch` | `{imageId, maxEdge?:number}` | `{imageId, mediaType, width, height, data:"data:<mediaType>;base64,…"}` | **v1.0.9** 拉取图片大图（§5.10）：`maxEdge` 缺省 1600、上限 4096；插件等比缩放后回 data URI，单张 ≤ 1MiB（中继硬上限），失败回 `error`（不影响消息流） |

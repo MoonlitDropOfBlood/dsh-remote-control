@@ -59,6 +59,15 @@ const DELIVERED_MAX_BYTES = 20 * 1024 * 1024;
 const QUEUE_MAX_ITEMS = 200;
 
 /**
+ * 宿主「繁忙时的发送行为」设置的命名空间与字段（契约 §5.1 v1.1.2）。
+ *
+ * 与 DSH 桌面端 composer 读的是**同一处**（ui-conversation 插件的 user-settings 文档，
+ * 字段 busyEnter：'queue' | 'steer'，缺省 'queue'）。
+ * 手机端不提供切换——发消息走哪种行为由宿主设置决定。
+ */
+const BUSY_ENTER_NAMESPACE = "ui-conversation";
+
+/**
  * present 投递文件的 imageId：`d` + sha1(path+turn) 前 16 位。
  *
  * 命名空间与宿主附件 id（随机 uuid）不冲突；同一文件在同一 turn 里稳定，
@@ -841,6 +850,8 @@ export class HostBridge {
   #deliveredEntries = new Map();
   // v1.1.1（§5.10.2）：交付物图片的缩略图缓存 imageId -> data URI（避免每次历史刷新都重压）
   #deliveredThumbs = new Map();
+  // v1.1.2（§5.1）：运行中的会话（api-session/status 维护）——「繁忙时的发送行为」只在忙时有意义
+  #runningSessions = new Set();
   #disposers = [];
   #hostName = "";
   #dshVersion = "";
@@ -887,10 +898,18 @@ export class HostBridge {
       // 会话没了，它的待执行列表与交付物历史条目也没有意义了（避免内存泄漏）
       this.#queues.delete(key);
       this.#deliveredEntries.delete(key);
+      this.#runningSessions.delete(key);
       this.#sendEvent("session.removed", { sessionId: key });
     });
     this.#on("api-session/status", (sessionId, running) => {
-      this.#sendEvent("session.status", { sessionId: String(sessionId), running: running === true });
+      // v1.1.2：记运行态——「繁忙时的发送行为」只在 agent 忙时才有意义（§5.1）
+      const key = String(sessionId);
+      if (running === true) {
+        this.#runningSessions.add(key);
+      } else {
+        this.#runningSessions.delete(key);
+      }
+      this.#sendEvent("session.status", { sessionId: key, running: running === true });
     });
     this.#on("api-session/activity", (sessionId, updatedAt) => {
       this.#sendEvent("session.activity", { sessionId: String(sessionId), updatedAt: Number(updatedAt) || 0 });
@@ -1118,14 +1137,37 @@ export class HostBridge {
    * items 为空数组 = 「没有待执行消息」——也要发，客户端靠它清掉排队列表。
    */
   #broadcastQueue(sessionId, target) {
-    const items = (this.#queues.get(sessionId) ?? []).map((item) => ({
+    const items = this.#queueItemsOf(sessionId);
+    // 日志只打 sessionId / 条数 / target——绝不输出消息正文（可能含敏感内容）
+    this.#log("info", "session.queue", { sessionId, count: items.length, target });
+    this.#sendEvent("session.queue", { sessionId, items });
+  }
+
+  /** 该会话当前待执行消息的 wire 形状（itemId/text/target，不含内部用的 rpcId）。 */
+  #queueItemsOf(sessionId) {
+    return (this.#queues.get(sessionId) ?? []).map((item) => ({
       itemId: item.itemId,
       text: item.text,
       target: item.target,
     }));
-    // 日志只打 sessionId / 条数 / target——绝不输出消息正文（可能含敏感内容）
-    this.#log("info", "session.queue", { sessionId, count: items.length, target });
-    this.#sendEvent("session.queue", { sessionId, items });
+  }
+
+  /**
+   * 请求 `session.queue`：拉取该会话**当前**的待执行消息。
+   *
+   * 为什么要有「拉」这一路：事件只在**变化时**推。手机端断线重连后，
+   * 若队列在断线期间变过（或断线前就有排队），光靠事件永远补不上
+   * ——用户会看到「排队列表空着，但桌面端明明排着一条」。
+   * 故客户端打开会话时拉一次全量快照（与事件同形状）。
+   */
+  #rSessionQueue(m) {
+    const p = m.payload ?? {};
+    const sessionId = typeof p.sessionId === "string" ? p.sessionId : "";
+    if (sessionId === "") {
+      this.#reply(m, errorOf(m, "bad-params", "sessionId required"));
+      return;
+    }
+    this.#reply(m, resultOf(m, { sessionId, items: this.#queueItemsOf(sessionId) }));
   }
 
   /** 归档集合（宿主没有 Workspace 注册表 → null，表示「不知道」而不是「空」）。 */
@@ -1648,6 +1690,8 @@ export class HostBridge {
           return await this.#rSessionSelectModel(m);
         case "session.model":
           return this.#rSessionModel(m);
+        case "session.queue":
+          return this.#rSessionQueue(m);
         case "session.archive":
           return await this.#rSessionArchive(m);
         case "session.unarchive":
@@ -2107,8 +2151,57 @@ export class HostBridge {
         models: models.models,
         defaultModelId: models.defaultModelId,
         archiveSupported: this.#archiveSupported(),
+        // v1.1.2：宿主「繁忙时的发送行为」设置（排队发送/插话发送）。
+        // 客户端**只读不选**——发消息走哪种行为由宿主的设置决定（用户明确要求）。
+        busyEnter: this.#busyEnterMode(),
       }),
     );
+  }
+
+  /**
+   * 宿主「繁忙时的发送行为」设置（契约 §5.1 v1.1.2）。
+   *
+   * DSH 桌面端的 composer 也读同一个设置（`ui-conversation` 命名空间的 `busyEnter` 字段，
+   * 落在宿主 user-settings 文档里；缺省 'queue'）。手机端**不提供切换**——
+   * 「插话还是排队」是宿主的设置，不是手机端的选项（用户明确要求：跟随 DSH 的设置）。
+   *
+   * **每次都现读**（不缓存）：用户刚在 DSH 设置里改过，下一条手机消息就该跟随新行为。
+   * 读设置的时机只有「发提示词」与「回 capabilities」——都是低频，缓存反而会引入滞后。
+   *
+   * 读不到（服务缺失/命名空间不在/字段非法）→ 退回 'queue'（最保守：消息不会丢）。
+   */
+  #busyEnterMode() {
+    try {
+      const settings = this.#service("settings");
+      if (settings && typeof settings.describe === "function") {
+        const rows = settings.describe({ redactSecrets: true });
+        const row = (Array.isArray(rows) ? rows : []).find((r) => r?.ns === BUSY_ENTER_NAMESPACE);
+        const raw = row?.user?.busyEnter ?? row?.value?.busyEnter;
+        if (raw === "steer" || raw === "queue") {
+          return raw;
+        }
+      }
+    } catch (e) {
+      // 宿主没有设置服务 / 读失败 → 保守用 queue
+      this.#log("warn", "busyEnter read failed", { error: errText(e) });
+    }
+    return "queue";
+  }
+
+  /**
+   * 这次提示词用哪种投递行为（'queue' | 'steer'）。
+   * 跟宿主设置走：agent 忙时用设置值；空闲时总是 queue（= 立即执行，没有「繁忙」可言）。
+   */
+  #resolvePromptMode(sessionId) {
+    if (!this.#isSessionRunning(sessionId)) {
+      return "queue";
+    }
+    return this.#busyEnterMode();
+  }
+
+  /** 该会话当前是否在跑（api-session/status 维护的内存态）。 */
+  #isSessionRunning(sessionId) {
+    return this.#runningSessions.has(String(sessionId));
   }
 
   /** 归档能力（§5.9）：宿主有 Workspace 注册表**且**有归档方法才为 true。 */
@@ -2337,29 +2430,43 @@ export class HostBridge {
       this.#reply(m, errorOf(m, "bad-params", "sessionId and non-empty text required"));
       return;
     }
-    // v1.1.1（契约 §5.1）：mode 只认两个字面量，缺省 'queue'。
-    // 其它值（含 null / 空串 / 大写）一律回 bad-params —— 默默当 queue 会让用户
-    // 以为消息插进了正在跑的 turn，实际却排在后面（行为与预期不符，且难排查）。
-    const mode = p.mode === undefined ? "queue" : p.mode;
-    if (mode !== "queue" && mode !== "steer") {
-      this.#reply(m, errorOf(m, "bad-params", "mode 只支持 queue / steer（缺省 queue）。"));
-      return;
-    }
-    try {
-      const value = await this.#sc().prompt(
+    // v1.1.2（契约 §5.1）：**投递行为由宿主设置决定**，客户端不参与选择。
+    // DSH 桌面端 composer 读的是同一处设置（ui-conversation.busyEnter：
+    // 「排队发送」/「插话发送」），手机端只跟随——用户明确要求「不应该手机上设置」。
+    // 客户端若仍带 mode（旧客户端），**忽略**它，不报错也不改变行为。
+    const mode = this.#resolvePromptMode(sessionId);
+    const requestId = randomUUID();
+    const send = async (delivery) =>
+      this.#sc().prompt(
         {
-          requestId: randomUUID(),
+          requestId,
           sessionId,
-          mode,
+          mode: delivery,
           content: [{ type: "text", text }],
         },
         this.#signal(30_000),
       );
-      this.#reply(m, resultOf(m, { accepted: value?.accepted === true }));
+    try {
+      const value = await send(mode);
+      this.#reply(m, resultOf(m, { accepted: value?.accepted === true, mode }));
     } catch (e) {
-      // 宿主拒绝（如 steer 不可用：session/steer-unavailable）时**原样**回宿主的
-      // 错误码与文案——吞掉的话客户端没法退回 queue 重发。
+      // 宿主拒绝插话（session/steer-unavailable：当前 turn 不再接受插入）时
+      // **自动退回排队**——桌面端此时是把 steer 动作置灰，手机不能把用户的消息弄丢。
       const err = hostErrorOf(e, "prompt-failed");
+      if (mode === "steer" && err.code === "session/steer-unavailable") {
+        this.#log("warn", "steer unavailable, falling back to queue", { sessionId });
+        try {
+          const value = await send("queue");
+          this.#reply(m, resultOf(m, { accepted: value?.accepted === true, mode: "queue" }));
+          return;
+        } catch (e2) {
+          const err2 = hostErrorOf(e2, "prompt-failed");
+          this.#log("warn", "prompt failed", { sessionId, mode: "queue", code: err2.code });
+          this.#reply(m, errorOf(m, err2.code, err2.message));
+          return;
+        }
+      }
+      // 其余宿主错误**原样**回客户端（不得吞掉）
       this.#log("warn", "prompt failed", { sessionId, mode, code: err.code });
       this.#reply(m, errorOf(m, err.code, err.message));
     }

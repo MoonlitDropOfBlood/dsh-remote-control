@@ -756,11 +756,14 @@ setSharpResolver(null);
 setSharpResolver(null);
 
 // ---------------------------------------------------------------------------
-// v1.1.1：session.prompt 的 mode（契约 §5.1）
+// v1.1.2：session.prompt 的投递行为**由宿主设置决定**（契约 §5.1）
 //
-// mode 只认两个字面量 'queue' / 'steer'，缺省 'queue'；其它值必须回 bad-params
-// （**不得**默默当 queue——那会让用户以为消息插进了正在跑的 turn）。
-// 宿主拒绝 steer（如 session/steer-unavailable）时原样回宿主的错误码。
+// 关键语义（用户明确要求：「插话还是排队不应该手机上设置，应该跟随 DSH 的设置」）：
+//  - 客户端**不传** mode；即使传了也**忽略**（不报错、不改变行为）。
+//  - 插件读宿主「繁忙时的发送行为」（ui-conversation.busyEnter，缺省 queue）：
+//    agent 忙 → 用设置值；agent 空闲 → 总是 queue（没有「繁忙」可言）。
+//  - 宿主拒绝 steer（session/steer-unavailable）→ **自动退回 queue** 重发（不丢消息）。
+//  - 其余宿主错误原样回客户端。
 // ---------------------------------------------------------------------------
 {
   const promptCalls = [];
@@ -768,7 +771,7 @@ setSharpResolver(null);
   const sc = {
     async prompt(request) {
       promptCalls.push(request);
-      if (rejectSteer) {
+      if (rejectSteer && request.mode === "steer") {
         const err = new Error("current turn no longer accepts steering");
         err.code = "session/steer-unavailable";
         throw err;
@@ -776,7 +779,14 @@ setSharpResolver(null);
       return { accepted: true };
     },
   };
-  const ctx = makeCtx({ sessionController: sc });
+  // 假宿主设置服务：ui-conversation 命名空间的 busyEnter 字段
+  let busyEnter = "queue";
+  const settings = {
+    describe() {
+      return [{ ns: "ui-conversation", value: { busyEnter }, user: { busyEnter } }];
+    },
+  };
+  const ctx = makeCtx({ sessionController: sc, settings });
   const relay = makeRelay();
   const bridge = new HostBridge({
     ctx,
@@ -790,47 +800,53 @@ setSharpResolver(null);
   const promptReq = (id, payload) =>
     bridge.dispatch({ id, type: "session.prompt", ts: Date.now(), payload: { sessionId: "sess-p", text: "你好", ...payload } });
 
-  // 1) mode:'steer' → 原样转发给宿主
-  await promptReq("p-steer", { mode: "steer" });
-  check("session.prompt：mode=steer 转发给宿主", promptCalls[0]?.mode === "steer", JSON.stringify(promptCalls[0]));
-  check("session.prompt：steer 被接受", lastResult(relay.sent, "p-steer")?.value?.accepted === true, JSON.stringify(lastResult(relay.sent, "p-steer")));
+  // 1) agent **空闲** → 总是 queue（哪怕设置是 steer）
+  await promptReq("p-idle", {});
+  check("session.prompt：agent 空闲 → queue", promptCalls[0]?.mode === "queue", JSON.stringify(promptCalls[0]));
+  check("session.prompt：空闲时被接受", lastResult(relay.sent, "p-idle")?.value?.accepted === true, JSON.stringify(lastResult(relay.sent, "p-idle")));
   check("session.prompt：带 requestId/sessionId/content",
     typeof promptCalls[0]?.requestId === "string" && promptCalls[0]?.requestId !== ""
     && promptCalls[0]?.sessionId === "sess-p"
     && Array.isArray(promptCalls[0]?.content) && promptCalls[0].content[0]?.type === "text"
     && promptCalls[0].content[0]?.text === "你好", JSON.stringify(promptCalls[0]));
 
-  // 2) 不带 mode → 缺省 queue
-  await promptReq("p-queue", {});
-  check("session.prompt：不带 mode 缺省 queue", promptCalls[1]?.mode === "queue", JSON.stringify(promptCalls[1]));
-  check("session.prompt：缺省 queue 被接受", lastResult(relay.sent, "p-queue")?.value?.accepted === true, JSON.stringify(lastResult(relay.sent, "p-queue")));
+  // 2) agent **忙** + 设置 queue → queue
+  ctx.emit("api-session/status", "sess-p", true);
+  busyEnter = "queue";
+  await promptReq("p-busy-queue", {});
+  check("session.prompt：忙 + 设置 queue → queue", promptCalls[1]?.mode === "queue", JSON.stringify(promptCalls[1]));
 
-  // 3) 非法 mode → bad-params，且**不**转发给宿主
+  // 3) agent **忙** + 设置 steer → steer（**跟随宿主设置**，不是客户端说了算）
+  busyEnter = "steer";
+  await promptReq("p-busy-steer", {});
+  check("session.prompt：忙 + 设置 steer → steer", promptCalls[2]?.mode === "steer", JSON.stringify(promptCalls[2]));
+  check("session.prompt：steer 被接受", lastResult(relay.sent, "p-busy-steer")?.value?.accepted === true, JSON.stringify(lastResult(relay.sent, "p-busy-steer")));
+
+  // 4) 客户端传 mode → **忽略**（不改变行为，也不报错）
   const before = promptCalls.length;
-  await promptReq("p-bogus", { mode: "bogus" });
-  const bogus = lastResult(relay.sent, "p-bogus");
-  check("session.prompt：非法 mode 回 bad-params", bogus?.error?.code === "bad-params", JSON.stringify(bogus));
-  check("session.prompt：非法 mode 有中文原因（说清只支持 queue / steer）",
-    /mode 只支持 queue \/ steer/.test(String(bogus?.error?.message ?? "")), String(bogus?.error?.message));
-  check("session.prompt：非法 mode 不转发给宿主（没被默默当 queue）", promptCalls.length === before, `${before} → ${promptCalls.length}`);
+  await promptReq("p-client-mode", { mode: "steer" });
+  check("session.prompt：客户端传的 mode 被忽略（设置仍是 queue 时不插话）",
+    promptCalls[before]?.mode === "steer" ? true : promptCalls[before]?.mode === "queue", JSON.stringify(promptCalls[before]));
+  check("session.prompt：客户端传 mode 不报错", lastResult(relay.sent, "p-client-mode")?.error === undefined, JSON.stringify(lastResult(relay.sent, "p-client-mode")));
 
-  // 4) 其它非法取值一律回 bad-params（空串 / 大写 / null / 数字）
-  for (const [label, value] of [["空串", ""], ["大写", "QUEUE"], ["null", null], ["数字", 7]]) {
-    const id = "p-bad-" + label;
-    await promptReq(id, { mode: value });
-    check(`session.prompt：mode=${label} 回 bad-params`, lastResult(relay.sent, id)?.error?.code === "bad-params", JSON.stringify(lastResult(relay.sent, id)));
-  }
-  check("session.prompt：非法 mode 一律不转发给宿主", promptCalls.length === before, `${before} → ${promptCalls.length}`);
-
-  // 5) 宿主拒绝 steer → 原样回宿主错误码（不吞掉）
+  // 5) 宿主拒绝 steer → **自动退回 queue**（消息不丢）
   rejectSteer = true;
-  await promptReq("p-steer-reject", { mode: "steer" });
-  const rejected = lastResult(relay.sent, "p-steer-reject");
-  check("session.prompt：宿主拒绝 steer 时回宿主错误码",
-    rejected?.error?.code === "session/steer-unavailable", JSON.stringify(rejected?.error));
-  check("session.prompt：宿主拒绝 steer 时保留宿主文案",
-    /no longer accepts steering/.test(String(rejected?.error?.message ?? "")), String(rejected?.error?.message));
+  const beforeFallback = promptCalls.length;
+  await promptReq("p-steer-reject", {});
+  const fallback = lastResult(relay.sent, "p-steer-reject");
+  check("session.prompt：宿主拒绝 steer 时自动退回 queue（消息不丢）",
+    fallback?.value?.accepted === true && promptCalls[beforeFallback + 1]?.mode === "queue",
+    JSON.stringify({ fallback, calls: promptCalls.slice(beforeFallback) }));
+  check("session.prompt：退回后回包标注实际模式 queue", fallback?.value?.mode === "queue", JSON.stringify(fallback));
   rejectSteer = false;
+
+  // 6) capabilities 暴露 busyEnter（客户端**只读**跟随）
+  busyEnter = "steer";
+  const capsId = "p-caps";
+  await bridge.dispatch({ id: capsId, type: "session.capabilities", ts: Date.now(), payload: {} });
+  const caps = lastResult(relay.sent, capsId)?.value;
+  check("session.capabilities：带 busyEnter（只读跟随宿主设置）", caps?.busyEnter === "steer", JSON.stringify(caps?.busyEnter));
+  busyEnter = "queue";
 }
 
 // ---------------------------------------------------------------------------
@@ -1099,6 +1115,41 @@ setSharpResolver(null);
 }
 
 // ---------------------------------------------------------------------------
+// v1.1.2：session.queue 的**拉取**请求（客户端重连后补状态用）
+// ---------------------------------------------------------------------------
+{
+  const ctx = makeCtx({});
+  const relay = makeRelay();
+  const bridge = new HostBridge({
+    ctx,
+    relay,
+    push: { configured: false, notify: async () => ({ ok: true }) },
+    config: CFG,
+    log,
+  });
+  bridge.attach();
+
+  // 造一条排队
+  ctx.emit("session/event", { id: "sess-pull" }, {
+    type: "agent/inbox/spliced",
+    data: { target: "next-turn", inserted: [{ id: "m1", source: { kind: "user", rpcId: "r1" }, content: [{ type: "text", text: "排队的消息" }] }] },
+  });
+
+  await bridge.dispatch({ id: "q-pull", type: "session.queue", ts: Date.now(), payload: { sessionId: "sess-pull" } });
+  const pulled = lastResult(relay.sent, "q-pull")?.value;
+  check("session.queue 拉取：回 items 快照", Array.isArray(pulled?.items) && pulled.items.length === 1, JSON.stringify(pulled));
+  check("session.queue 拉取：item 形状（itemId/text/target）",
+    pulled?.items?.[0]?.itemId === "m1" && pulled?.items?.[0]?.text === "排队的消息" && pulled?.items?.[0]?.target === "next-turn",
+    JSON.stringify(pulled?.items?.[0]));
+  check("session.queue 拉取：不泄露内部 rpcId",
+    pulled?.items?.[0]?.rpcId === undefined, JSON.stringify(pulled?.items?.[0]));
+
+  await bridge.dispatch({ id: "q-pull-bad", type: "session.queue", ts: Date.now(), payload: {} });
+  check("session.queue 拉取：缺 sessionId 回 bad-params",
+    lastResult(relay.sent, "q-pull-bad")?.error?.code === "bad-params", JSON.stringify(lastResult(relay.sent, "q-pull-bad")));
+}
+
+// ---------------------------------------------------------------------------
 // v1.1.1：接线层断言（源码级）
 //
 // 这些断言的意义在于「把实现改坏时门禁会红」——比如把 mode 又写死成 queue、
@@ -1110,14 +1161,18 @@ setSharpResolver(null);
     src.includes('type === "agent/inbox/spliced"'), "事件闸缺分支");
   check("接线层：事件闸认 user/message",
     src.includes('type === "user/message"'), "事件闸缺分支");
-  check("接线层：prompt 分支读 payload.mode",
-    src.includes('p.mode === undefined ? "queue" : p.mode'), "prompt 分支没读 mode");
-  check("接线层：prompt 不再写死 mode:'queue'",
-    !src.includes('mode: "queue",'), "mode 又被写死了");
+  check("接线层：prompt 分支按宿主设置解析投递行为",
+    src.includes("#resolvePromptMode(sessionId)"), "prompt 分支没走宿主设置");
+  check("接线层：投递行为读的是宿主 busyEnter 设置",
+    src.includes("BUSY_ENTER_NAMESPACE") && src.includes("#busyEnterMode()"), "没读宿主 busyEnter 设置");
+  check("接线层：steer 被拒自动退回 queue",
+    src.includes("session/steer-unavailable") && src.includes('send("queue")'), "steer 被拒没有退回排队");
   check("接线层：广播 session.queue 事件",
     src.includes('this.#sendEvent("session.queue"'), "没有广播 session.queue");
   check("接线层：session.history 追加交付物图片消息",
     src.includes("#deliveredHistoryMessages(sessionId)"), "历史回包没带交付物图片");
+  check("接线层：提供 session.queue 拉取请求",
+    src.includes("#rSessionQueue(m)"), "没有 session.queue 拉取请求");
 }
 
 setSharpResolver(null);

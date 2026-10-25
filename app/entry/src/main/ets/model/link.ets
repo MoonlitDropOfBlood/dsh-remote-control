@@ -30,6 +30,7 @@ import {
   DshrcCreateResult,
   DshrcModelSelection,
   DshrcPromptMode,
+  DshrcQueueItem,
   DshrcSubagentInfo,
   DshrcRelayFrame,
   DshrcRelayPeers,
@@ -56,6 +57,7 @@ import {
   MSG_SESSION_UNARCHIVE,
   MSG_SESSION_SELECT_MODEL,
   MSG_SESSION_MODEL,
+  MSG_SESSION_QUEUE,
   MSG_SESSION_PROMPT,
   MSG_SESSION_CANCEL,
   MSG_SESSION_RENAME,
@@ -765,6 +767,28 @@ export class DshrcLink {
     });
   }
 
+  /**
+   * session.queue（§5.2 v1.1.1）：拉取该会话**当前**的待执行消息快照。
+   * 事件只在变化时推 → 断线重连后光靠事件补不上，打开会话时拉一次。
+   */
+  sessionQueue(sessionId: string): Promise<DshrcQueueItem[]> {
+    const p: DshrcPayload = { sessionId: sessionId };
+    return this.request(MSG_SESSION_QUEUE, p, 15000).then((v: DshrcValue): DshrcQueueItem[] => {
+      const out: DshrcQueueItem[] = [];
+      if (v.items !== undefined) {
+        for (let i = 0; i < v.items.length; i++) {
+          const src: DshrcQueueItem = v.items[i];
+          out.push({
+            itemId: src.itemId !== undefined ? src.itemId : '',
+            text: src.text !== undefined ? src.text : '',
+            target: src.target !== undefined ? src.target : 'next-turn'
+          });
+        }
+      }
+      return out;
+    });
+  }
+
   /** session.capabilities（§5.1 v1.0.6 + v1.0.7）：新建会话可选的「模式 / 权限 / 模型」目录
    *  与真实归档能力标记。宿主不支持时返回空目录（客户端隐藏选择区，不报错）。 */
   sessionCapabilities(): Promise<DshrcCapabilities> {
@@ -777,7 +801,9 @@ export class DshrcLink {
         defaultPermission: v.defaultPermission !== undefined ? v.defaultPermission : '',
         models: v.models !== undefined ? v.models : [],
         defaultModelId: v.defaultModelId !== undefined ? v.defaultModelId : '',
-        archiveSupported: v.archiveSupported === true
+        archiveSupported: v.archiveSupported === true,
+        // v1.1.2：宿主「繁忙时的发送行为」（只读；旧插件无此字段 → queue）
+        busyEnter: v.busyEnter === 'steer' ? 'steer' : 'queue'
       };
       return caps;
     });
@@ -907,13 +933,12 @@ export class DshrcLink {
   }
 
   /**
-   * session.prompt（§5.1 v1.1.1）：发送提示词；value.accepted。
-   *  mode：'queue'（缺省语义——追加到当前 turn 之后执行）/ 'steer'（插入正在运行的 turn）。
-   *  协议要求请求体**显式**带 mode（缺省也带 'queue'），故此处无条件写入。
+   * session.prompt（§5.1 v1.1.2）：发送提示词；value.accepted。
+   *  **不带 mode**——投递行为（排队/插话）由宿主设置决定，手机端只跟随
+   *  （用户在 DSH 设置里改「繁忙时的发送行为」，手机端随之变化）。
    */
-  sessionPrompt(sessionId: string, text: string, mode?: DshrcPromptMode): Promise<boolean> {
+  sessionPrompt(sessionId: string, text: string): Promise<boolean> {
     const p: DshrcPayload = { sessionId: sessionId, text: text };
-    p.mode = mode !== undefined ? mode : 'queue';
     return this.request(MSG_SESSION_PROMPT, p).then((v: DshrcValue): boolean => {
       return v.accepted === true;
     });

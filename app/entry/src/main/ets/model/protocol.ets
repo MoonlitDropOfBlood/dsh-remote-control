@@ -79,6 +79,7 @@ export const MSG_SESSION_UNARCHIVE: string = 'session.unarchive'; // v1.0.7：�
 export const MSG_SESSION_SELECT_MODEL: string = 'session.selectModel'; // v1.0.8：会话中切换模型/思考强度
 export const MSG_SESSION_MODEL: string = 'session.model'; // v1.0.8：查询会话当前模型
 export const MSG_IMAGE_FETCH: string = 'image.fetch'; // v1.0.9：拉取图片大图（§5.10）
+export const MSG_SESSION_QUEUE: string = 'session.queue'; // v1.1.1：拉取待执行消息快照（§5.2）
 export const MSG_SESSION_PROMPT: string = 'session.prompt';
 export const MSG_SESSION_CANCEL: string = 'session.cancel';
 export const MSG_SESSION_RENAME: string = 'session.rename';
@@ -254,6 +255,8 @@ export interface DshrcValue {
   models?: DshrcModelOption[];
   defaultModelId?: string;
   archiveSupported?: boolean;
+  // session.capabilities（§5.1 v1.1.2）：宿主「繁忙时的发送行为」（只读）
+  busyEnter?: string;
   // session.create（§5.1 v1.0.7）：模型选择与设置结果
   model?: DshrcModelSelection;
   modelError?: string;
@@ -405,6 +408,11 @@ export interface DshrcCapabilities {
   defaultModelId: string;
   /** v1.0.7：宿主是否支持 Workspace 真实归档（false 时客户端禁用归档动作）。 */
   archiveSupported: boolean;
+  /**
+   * v1.1.2：宿主「繁忙时的发送行为」（'queue' | 'steer'）——**只读**。
+   * 手机端不提供切换；发消息走哪种行为由 DSH 设置决定（用户明确要求）。
+   */
+  busyEnter: string;
 }
 
 /**

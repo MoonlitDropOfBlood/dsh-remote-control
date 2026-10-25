@@ -168,10 +168,15 @@ grep -rnE "@State|@Prop|@Link|@ObjectLink|@Observed[^V]|@Provide|@Consume|@Watch
 - **排队**：`session.queue` 事件（插件从宿主 `agent/inbox/spliced` / `user/message` 追踪）
   → `store.queueItems(sid)`；`store.queueVersion`（`@Trace`）驱动页面刷新。
   列表**只展示宿主推来的内容，不做猜测**；空列表整块不渲染。
-- **发送模式**：agent 运行时输入条上方出现两段式胶囊「排队发送 / 插入当前任务」
-  （对应 `session.prompt` 的 `mode:'queue'|'steer'`）；文案沿用桌面端（`排队消息`/`排队发送`）。
-  steer 被宿主拒绝时**自动退回 queue** 并 toast（桌面端此时是置灰 steer 动作，手机不能把消息弄丢）。
-  空闲时 queue 语义 = 立即执行，toast 文案用「已发送」而不是「已排队」。
+  事件只在**变化时**推 → 打开会话时还要 `store.loadQueue(sid)` **拉一次快照**
+  （断线重连后光靠事件补不上：列表空着但桌面端明明排着一条）。
+- **发送模式**：投递行为（排队/插话）**由 DSH 的设置决定**，手机端**只读不选**
+  （用户明确要求：「插话还是排队不应该手机上设置，应该跟随 DSH 的设置」）。
+  - 手机端**不发** `mode`；插件读宿主「繁忙时的发送行为」（`ui-conversation.busyEnter`，
+    与桌面端 composer 同一处），agent 忙时按设置投递、空闲时总是 queue。
+  - `session.capabilities` 回 `busyEnter`（只读）→ `store.busyEnter` → 详情页显示
+    「繁忙时：排队发送（跟随 DSH 设置）」这类**只读**提示（原可切换的两段式胶囊已删除）。
+  - 宿主拒绝插话时**插件自动退回 queue**（桌面端此时置灰 steer，手机不能把消息弄丢）。
 - **思考块用独立的 markdown 控制器**（`mdCtrlReasoning`）：思考块刻意弱化
   （`FS_SMALL` + `label_secondary`），复用气泡的正文主题会让「思考」和「回答」分不开
   （用户反馈「思考中的文字颜色和之前版本不一致」）。`setupMarkdownTheme()` 拆成

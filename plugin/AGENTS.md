@@ -33,7 +33,7 @@ node --check index.js client.js typert.host.js lib/*.mjs scripts/*.mjs   # 语�
 node -e "import('./lib/protocol.mjs').then(m=>m.assertKat())"           # KAT
 node scripts/verify-qr.mjs && node scripts/verify-pairing.mjs           # QR/配对 API 回归（需 devDependencies）
 node scripts/verify-steps.mjs                                          # v1.0.9 步骤/模式/权限/归档/模型/思考/强度 + 图片回归（无依赖，154 项）
-node scripts/verify-images.mjs                                         # 图片专项 + 交付物桥接 + 排队(session.queue)/prompt mode：元数据映射/缩略图降级/image.fetch/帧预算守卫/交付物进历史/排队追踪（无依赖，151 项）
+node scripts/verify-images.mjs                                         # 图片专项 + 交付物桥接 + 排队(session.queue)/宿主投递设置(busyEnter)：元数据映射/缩略图降级/image.fetch/帧预算守卫/交付物进历史/排队追踪（无依赖，153 项）
 node scripts/verify-settings.mjs                                       # v1.1.x 设置页/manifest/combo/信封自检 + Host 真跑一遍（112 项）
 node scripts/verify-relay-supervisor.mjs                               # v1.1.1 中继进程托管：决策/端口占用不抢/启停/看门狗/跨平台/bundle（无依赖，162 项）
 node scripts/sync-client-icon.mjs                                      # 改了 icon.svg 后同步 client.js 的图标 data-uri
@@ -247,11 +247,19 @@ present 出来的图当图片记**：
 
 ### 排队与 steer（§5.1 / §5.2）
 
-- `session.prompt` 新增可选 `mode`：`'queue'`（缺省，追加到当前 turn 之后）/
-  `'steer'`（插入正在运行的 turn）。**只认这两个字面量**，其它值回 error `bad-params`
-  且**不转发宿主**（不默默当 queue）。宿主拒绝时**原样回宿主错误码**
-  （如 `session/steer-unavailable`）——注意这改变了老口径（一律 `prompt-failed`），
-  老客户端若精确匹配 `prompt-failed` 需留意。
+- **投递行为由宿主设置决定**（v1.1.2 修订，用户明确要求：「插话还是排队不应该手机上设置，
+  应该跟随 DSH 的设置」）：
+  - `session.prompt` **不再收客户端的 mode**（客户端传了也**忽略**，不报错、不改变行为）。
+  - 插件读宿主「繁忙时的发送行为」= `ctx.get("settings").describe()` 里
+    `ui-conversation` 命名空间的 `busyEnter` 字段（`user` 段优先，回落 `value` 段；
+    'queue' | 'steer'，缺省 'queue'）——**与 DSH 桌面端 composer 读的是同一处**。
+  - agent **忙** → 用设置值；agent **空闲** → 总是 queue（没有「繁忙」可言）。
+    忙闲由 `api-session/status` 维护的 `#runningSessions` 判断。
+  - 宿主拒绝插话（`session/steer-unavailable`）→ **自动退回 queue 重发**（消息不丢；
+    桌面端此时是把 steer 动作置灰，手机不能把消息弄丢）。
+  - 其余宿主错误**原样**回客户端（不吞）。
+  - **每次都现读**设置（不缓存）：用户刚在 DSH 设置里改过，下一条手机消息就该跟随。
+  - `session.capabilities` 回 `busyEnter`（**只读**，供客户端展示当前行为）。
 - 待执行消息追踪：会话事件总闸新增两个分支——
   `agent/inbox/spliced`（`data.target` ∈ {`next-step`,`next-turn`}，
   `data.inserted` 里每条取 id / `source.rpcId` / text 块文本；**无文本的跳过**）
@@ -260,9 +268,12 @@ present 出来的图当图片记**：
 - 每次增删后广播 `session.queue {sessionId, items:[{itemId,text,target}]}`
   （**全量快照**，空数组也发；`rpcId` 只在插件内部用于匹配，**不进 wire**）。
   每个 session 一份列表，互不串台；单会话条数上限 200。
-- 回归：`node scripts/verify-images.mjs` **151 项**（v1.1.0 的 12 项 + 本轮 39 项：
-  mode 转发/校验/宿主拒绝原样回、队列入队出队广播、交付物图进历史、接线层源码断言）。
-  另跑了 16 个变异点，**全部被杀死（存活率 0/16）**。
+- **新增请求 `session.queue`**（v1.1.2）：拉该会话当前待执行消息的全量快照。
+  事件只在**变化时**推 → 客户端断线重连后光靠事件补不上（用户会看到「列表空的，
+  桌面端明明排着一条」），故打开会话时拉一次（与事件同形状）。
+- 回归：`node scripts/verify-images.mjs` **153 项**（含：宿主设置 steer/queue 的解析、
+  空闲恒 queue、客户端 mode 被忽略、steer 被拒自动退回 queue、capabilities 带 busyEnter、
+  `session.queue` 拉取请求、队列入队出队广播、交付物图进历史、接线层源码断言）。
 
 ## v1.1.1：中继进程随插件托管（2026-10-25，跨平台）
 

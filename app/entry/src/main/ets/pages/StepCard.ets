@@ -6,7 +6,8 @@
  *    整行点击展开/收起
  *  - 展开态：折叠行下方追加「参数」「输出 / 错误」两块（bg_layer_2 底 + RADIUS_CTRL + SP_3 内边距，
  *    等宽字体、FS_SMALL/label_secondary，错误用 state_error），相对折叠行左缩进 SP_4、右留 SP_2
- *  - 超长参数 / 输出用内层 Scroll 限制高度并内部滚动（外层列表不抢滚动手势）
+ *  - 超长参数 / 输出用内层 Scroll 限制高度并内部滚动；到边后联动外层页面滚动
+ *    （nestedScroll SELF_FIRST；SELF_ONLY 会让展开区「滚不动页面」，用户反馈）
  *  - 展开状态存在本组件 @Local（V2）里，不写进 store
  */
 import { display } from '@kit.ArkUI';
@@ -205,8 +206,8 @@ export struct StepCard {
       .width('100%')
       .constraintSize({ maxHeight: stepOutputMaxVp() })
       .nestedScroll({
-        scrollForward: NestedScrollMode.SELF_ONLY,
-        scrollBackward: NestedScrollMode.SELF_ONLY
+        scrollForward: NestedScrollMode.SELF_FIRST,
+        scrollBackward: NestedScrollMode.SELF_FIRST
       })
       .scrollBar(BarState.Off)
       .align(Alignment.Top)
@@ -237,8 +238,8 @@ export struct StepCard {
       .width('100%')
       .constraintSize({ maxHeight: stepOutputMaxVp() })
       .nestedScroll({
-        scrollForward: NestedScrollMode.SELF_ONLY,
-        scrollBackward: NestedScrollMode.SELF_ONLY
+        scrollForward: NestedScrollMode.SELF_FIRST,
+        scrollBackward: NestedScrollMode.SELF_FIRST
       })
       .scrollBar(BarState.Off)
       .align(Alignment.Top)

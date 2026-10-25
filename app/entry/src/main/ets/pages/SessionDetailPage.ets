@@ -111,41 +111,62 @@ export struct SessionDetailPage {
   private autoScrollPending: boolean = false;
   /** markdown 渲染控制器（DSH 风格配色，深浅色随系统资源自动适配）。 */
   private mdCtrl: MarkdownController = new MarkdownController();
+  /**
+   * 思考过程的 markdown 控制器：**独立**于助手气泡。
+   * 思考块刻意弱化（FS_SMALL + label_secondary），不能跟正文同色同号——
+   * 否则「思考」和「回答」视觉上分不开（用户反馈：颜色和之前版本不一致）。
+   */
+  private mdCtrlReasoning: MarkdownController = new MarkdownController();
 
   /**
    * markdown 渲染样式：全部走 app.color 资源（深浅色自动适配），
    * 视觉口径对齐 DSH 自身主题（背景层/描边/标签层级）。
    */
   private setupMarkdownTheme(): void {
+    this.applyMarkdownTheme(this.mdCtrl, false);
+    this.applyMarkdownTheme(this.mdCtrlReasoning, true);
+  }
+
+  /**
+   * 把一套 markdown 主题刷到控制器上。
+   * @param ctrl 目标控制器
+   * @param dim true = 思考块专用（弱化：小号 + secondary 文字色）
+   */
+  private applyMarkdownTheme(ctrl: MarkdownController, dim: boolean): void {
     try {
-      this.mdCtrl
-        .setTextColor($r('app.color.label_primary'))
-        .setTitleColor($r('app.color.label_primary'))
-        .setTextSize(FS_BODY)
+      const textColor: Resource = dim ? $r('app.color.label_secondary') : $r('app.color.label_primary');
+      const titleColor: Resource = dim ? $r('app.color.label_secondary') : $r('app.color.label_primary');
+      const bodySize: number = dim ? FS_SMALL : FS_BODY;
+      ctrl
+        .setTextColor(textColor)
+        .setTitleColor(titleColor)
+        .setTextSize(bodySize)
         // setTitleSize 收 6 元组（h1..h6），单值不合法
-        .setTitleSize([FS_SUBTITLE, FS_SUBTITLE, FS_SUBTITLE, FS_SUBTITLE, FS_SUBTITLE, FS_SUBTITLE])
-        .setTextLineHeight(22)
-        .setInlineCodeColor($r('app.color.label_primary'))
+        .setTitleSize(dim
+          ? [FS_SMALL, FS_SMALL, FS_SMALL, FS_SMALL, FS_SMALL, FS_SMALL]
+          : [FS_SUBTITLE, FS_SUBTITLE, FS_SUBTITLE, FS_SUBTITLE, FS_SUBTITLE, FS_SUBTITLE])
+        .setTextLineHeight(dim ? 20 : 22)
+        .setInlineCodeColor(textColor)
         .setInlineCodeBackgroundColor($r('app.color.bg_layer_2'))
         .setInlineCodeBackgroundRadius(4)
         .setQuoteBackgroundColor($r('app.color.bg_layer_2'))
-        .setQuoteTextColor($r('app.color.label_secondary'))
+        .setQuoteTextColor(dim ? $r('app.color.label_tertiary') : $r('app.color.label_secondary'))
         .setQuoteBorderColor($r('app.color.border_l1'))
         .setQuoteBorderRadius(RADIUS_CTRL)
         .setHyperlinkTextColor($r('app.color.brand_label'))
         .setTableBackgroundColor($r('app.color.bg_layer_2'))
         .setTableTitleBackgroundColor($r('app.color.bg_layer_1'))
-        .setTableTitleTextColor($r('app.color.label_primary'))
+        .setTableTitleTextColor(titleColor)
         .setTableOuterBorderColor($r('app.color.border_l1'))
         .setTableInnerBorderColor($r('app.color.border_l1'))
         .setTableBorderRadius(RADIUS_CTRL)
         .setLineColor($r('app.color.border_l1'))
-        .setFootnoteTextColor($r('app.color.label_secondary'))
+        .setFootnoteTextColor(dim ? $r('app.color.label_tertiary') : $r('app.color.label_secondary'))
         .setCodeBlockBorderRadius(RADIUS_CTRL)
         .setTextSelectionEnable(true);
       // 以下两个返回 void（不能链式），单独调用
-      this.mdCtrl.setTableNormalTextColor($r('app.color.label_primary'));
-      this.mdCtrl.setTableInterleaveTextColor($r('app.color.label_secondary'));
+      ctrl.setTableNormalTextColor(textColor);
+      ctrl.setTableInterleaveTextColor(dim ? $r('app.color.label_tertiary') : $r('app.color.label_secondary'));
     } catch (err) {
       // 样式设置失败不影响渲染（库会走默认主题）
     }
@@ -856,7 +877,8 @@ export struct SessionDetailPage {
             } else {
               TimelineView({
                 items: this.store.timeline,
-                mdController: this.mdCtrl
+                mdController: this.mdCtrl,
+                mdReasoningController: this.mdCtrlReasoning
               })
             }
           }

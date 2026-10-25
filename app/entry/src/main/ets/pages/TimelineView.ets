@@ -406,8 +406,10 @@ struct StepGroup {
 
 /**
  * 「思考过程」折叠块（kind="reasoning"）：lightbulb 图标 + 标题 + 固定尺寸 chevron。
- * 默认收起，点标题行展开/收起；展开正文走共享 MarkdownController 渲染
+ * 默认收起，点标题行展开/收起；展开正文走 markdown 渲染
  * （思考内容常含代码块/列表，纯 Text 展示会甩出一堆裸标记——用户反馈）。
+ * mdController 传的是**思考专用**控制器（小号 + label_secondary 弱化配色），
+ * 与助手气泡的正文主题分开——同色会分不清「思考」和「回答」。
  * 流式刷新：item 为 @Param，item.text 是 model 侧 @Trace 字段，原地增量更新即可自然刷新。
  */
 @ComponentV2
@@ -463,6 +465,8 @@ struct ReasoningCard {
 export struct TimelineView {
   @Require @Param items: TimelineItem[];
   @Require @Param mdController: MarkdownController;
+  /** 思考块专用 markdown 控制器（弱化配色：小号 + secondary 文字色）。 */
+  @Require @Param mdReasoningController: MarkdownController;
 
   /** 分组视图（连续的工作步骤 → 一组）。 */
   private timelineEntries(): TimelineEntry[] {
@@ -478,8 +482,9 @@ export struct TimelineView {
           } else if (cell.item.head.kind === 'system') {
             SystemNote({ item: cell.item.head })
           } else if (cell.item.head.kind === 'reasoning') {
-            // 思考过程：独立折叠块（展开正文走 markdown），不进消息气泡、也不并入工作步骤分组
-            ReasoningCard({ item: cell.item.head, mdController: this.mdController })
+            // 思考过程：独立折叠块（展开正文走 markdown，**用弱化主题的独立控制器**：
+            // 与助手气泡同色会分不清「思考」和「回答」），不进消息气泡、也不并入工作步骤分组
+            ReasoningCard({ item: cell.item.head, mdController: this.mdReasoningController })
           } else {
             MessageBubble({ item: cell.item.head, mdController: this.mdController })
           }

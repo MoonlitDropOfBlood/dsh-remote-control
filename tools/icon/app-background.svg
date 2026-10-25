@@ -1,11 +1,10 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
-  <!-- DSH Pocket layered-icon background: family tile (blue->teal gradient) + signature bottom wave -->
+  <!-- DSH Pocket layered-icon background: family tile (blue->teal gradient) -->
   <defs>
-    <linearGradient id="g-dp" x1="0" y1="0" x2="1" y2="1">
+    <linearGradient id="g-dpb" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#4D6BFE"/>
       <stop offset="1" stop-color="#00B8A9"/>
     </linearGradient>
   </defs>
-  <rect x="2" y="2" width="44" height="44" rx="11" fill="url(#g-dp)"/>
-  <path d="M10 39.5 q3.5 -2.6 7 0 t7 0 t7 0 t7 0" fill="none" stroke="#fff" stroke-opacity=".5" stroke-width="1.6" stroke-linecap="round"/>
+  <rect x="2" y="2" width="44" height="44" rx="11" fill="url(#g-dpb)"/>
 </svg>

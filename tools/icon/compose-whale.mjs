@@ -1,11 +1,17 @@
-// Compose DSH Pocket icons: the official DSH whale in a pocket.
+// Compose DSH Pocket icons: the official DSH whale inside a pocket.
+//
 // Whale source: dsh-desktop/build/whale.svg (single-path silhouette, viewBox 0 0 23.16 17.04).
-// Family style: blue->teal gradient tile + white line art + signature bottom wave.
-// "Pocket" concept (2026-10-24 user feedback): the whale dives INTO a pouch —
-// pouch lip + U-shaped body (white stroke), whale bottom overlapping the lip so it
-// reads as tucked into the pocket.
-// Usage: node tools/icon/compose-whale.mjs   (then node tools/icon/render-icons.mjs
-//        and  node plugin/scripts/sync-client-icon.mjs)
+// Style: DSH plugin family tile (blue->teal gradient 44x44 rx11) + WHITE LINE ART
+// container (stroke 2.6~2.8, round caps/joins) + the official whale as a SOLID white
+// mark sitting inside the pocket.
+//
+// 2026-10-25 (user feedback, v3 -> v8):
+//   - v3（鲸鱼骑在 U 形口袋上）太挤、读不出「口袋」；改成鲸鱼**完整装进口袋**。
+//   - 去掉家族签名底部波浪（用户：底下多了个波浪线，去掉）。
+//   - 鲸鱼改回**官方 DeepSeek 鲸鱼剪影**（v4~v7 的家族线稿鲸/自绘尾鳍都不如它）。
+//
+// Usage: node tools/icon/compose-whale.mjs
+//   (then node tools/icon/render-icons.mjs, then node plugin/scripts/sync-client-icon.mjs)
 import { readFileSync, writeFileSync, copyFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -14,48 +20,70 @@ const here = dirname(fileURLToPath(import.meta.url));
 const whale = readFileSync('D:/ai-projects/dsh/dsh-desktop/build/whale.svg', 'utf8');
 const d = /<path d="([^"]+)"/.exec(whale)[1];
 
-// whale: width 21 (scale ~0.9067, height ~15.4), centered; bottom edge (TY+15.4=19.6)
-// overlaps the lip line (y 19.2..21.8 with stroke) so the whale reads as "in the pocket"
-const W = 21;
+// --- 口袋（描线）：上缘是袋口（微垂的曲线），袋底是圆角 ---
+const pocket =
+  'M10.5 12.5 Q24 15 37.5 12.5 L37.5 27 A10.5 10.5 0 0 1 27 37.5 H21 A10.5 10.5 0 0 1 10.5 27 Z';
+// 袋口开缝（弱化双线 = 开口）
+const lip = 'M14 16.6 Q24 18.4 34 16.6';
+
+// --- 官方鲸鱼：宽 20（scale 0.8636，高 14.72），居中于 x=24，落在袋口线之下 ---
+const W = 20;
 const SCALE = (W / 23.16).toFixed(4);
-const TX = ((48 - W) / 2).toFixed(2);
-const TY = '4.2';
-
-// pocket: lip line + U body (stroke 2.6, round caps), body bottom ~28+5+7.4 = 35.4 (+1.3 stroke)
-const pocket = `  <g fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M10.5 20.5 H37.5"/>
-    <path d="M13.5 23 v5 a7.4 7.4 0 0 0 7.4 7.4 h6.2 a7.4 7.4 0 0 0 7.4 -7.4 V23"/>
-  </g>`;
+const TX = (24 - W / 2).toFixed(2);
+const TY = '19.1';
 const whaleGroup = `  <g transform="translate(${TX},${TY}) scale(${SCALE})">\n    <path d="${d}" fill="#fff"/>\n  </g>`;
-const gradient = (gid) => `  <defs>\n    <linearGradient id="${gid}" x1="0" y1="0" x2="1" y2="1">\n      <stop offset="0" stop-color="#4D6BFE"/>\n      <stop offset="1" stop-color="#00B8A9"/>\n    </linearGradient>\n  </defs>`;
-const wave = `  <path d="M10 39.5 q3.5 -2.6 7 0 t7 0 t7 0 t7 0" fill="none" stroke="#fff" stroke-opacity=".5" stroke-width="1.6" stroke-linecap="round"/>`;
 
-// 1) layered foreground: white pocket + whale (no tile — the background layer carries it)
+const gradient = (gid) =>
+  `  <defs>\n    <linearGradient id="${gid}" x1="0" y1="0" x2="1" y2="1">\n      <stop offset="0" stop-color="#4D6BFE"/>\n      <stop offset="1" stop-color="#00B8A9"/>\n    </linearGradient>\n  </defs>`;
+const tile = (gid) => `  <rect x="2" y="2" width="44" height="44" rx="11" fill="url(#${gid})"/>`;
+
+// 1) layered background：只有家族渐变方块（**无波浪**）
+writeFileSync(
+  join(here, 'app-background.svg'),
+  `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">\n` +
+  `  <!-- DSH Pocket layered-icon background: family tile (blue->teal gradient) -->\n` +
+  `${gradient('g-dpb')}\n${tile('g-dpb')}\n</svg>\n`,
+);
+
+// 2) layered foreground：描线口袋 + 实心官方鲸鱼（白）
 writeFileSync(
   join(here, 'app-foreground.svg'),
   `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">\n` +
-  `  <!-- DSH Pocket layered-icon foreground: whale diving into a pocket, white -->\n` +
-  `${pocket}\n${whaleGroup}\n</svg>\n`,
+  `  <!-- DSH Pocket layered-icon foreground: official DSH whale inside a line-art pocket, white -->\n` +
+  `  <g fill="none" stroke="#fff" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round">\n` +
+  `    <path d="${pocket}"/>\n` +
+  `    <path d="${lip}" stroke-opacity=".4" stroke-width="1.3"/>\n` +
+  `  </g>\n${whaleGroup}\n</svg>\n`,
 );
 
-// 2) composite (startIcon): family tile + wave + pocket + whale
+// 3) composite（startIcon / 预览）
 writeFileSync(
   join(here, 'app-full.svg'),
   `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">\n` +
-  `  <!-- DSH Pocket composite icon (startIcon / preview): tile + wave + pocket + whale -->\n` +
-  `${gradient('g-dpw')}\n  <rect x="2" y="2" width="44" height="44" rx="11" fill="url(#g-dpw)"/>\n` +
-  `${wave}\n${pocket}\n${whaleGroup}\n</svg>\n`,
+  `  <!-- DSH Pocket composite icon (startIcon / preview): tile + pocket + official whale -->\n` +
+  `${gradient('g-dpf')}\n${tile('g-dpf')}\n` +
+  `  <g fill="none" stroke="#fff" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round">\n` +
+  `    <path d="${pocket}"/>\n` +
+  `    <path d="${lip}" stroke-opacity=".4" stroke-width="1.3"/>\n` +
+  `  </g>\n${whaleGroup}\n</svg>\n`,
 );
 
-// 3) plugin icon: same composite in family format, with provenance comment
+// 4) plugin icon：同一标记，家族格式
 writeFileSync(
   join(here, '../../plugin/icon.svg'),
   `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">\n` +
-  `  <!--\n    dsh-remote-control plugin icon, dsh plugin family style\n    (blue->teal gradient tile, white glyph, signature bottom wave).\n    Glyph: the official DSH whale (dsh-desktop/build/whale.svg) diving into a\n    pocket — "DSH in your pocket".\n  -->\n` +
-  `${gradient('g-rcw')}\n  <rect x="2" y="2" width="44" height="44" rx="11" fill="url(#g-rcw)"/>\n` +
-  `${wave}\n${pocket}\n${whaleGroup}\n</svg>\n`,
+  `  <!--\n` +
+  `    dsh-remote-control plugin icon, dsh plugin family style\n` +
+  `    (blue->teal gradient tile, white line-art pocket, official DSH whale inside).\n` +
+  `  -->\n` +
+  `${gradient('g-rcw')}\n${tile('g-rcw')}\n` +
+  `  <g fill="none" stroke="#fff" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round">\n` +
+  `    <path d="${pocket}"/>\n` +
+  `    <path d="${lip}" stroke-opacity=".4" stroke-width="1.3"/>\n` +
+  `  </g>\n${whaleGroup}\n</svg>\n`,
 );
 
-// 4) keep the original whale next to this script for provenance
+// 5) 留档官方鲸鱼源
 copyFileSync('D:/ai-projects/dsh/dsh-desktop/build/whale.svg', join(here, 'whale-orig.svg'));
-console.log('composed pocket+whale foreground/full/plugin icons');
+
+console.log('composed: app-background / app-foreground / app-full / plugin/icon.svg');

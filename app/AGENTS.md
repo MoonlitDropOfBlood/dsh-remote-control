@@ -156,3 +156,23 @@ grep -rnE "@State|@Prop|@Link|@ObjectLink|@Observed[^V]|@Provide|@Consume|@Watch
   图片消息（`text` 为空串）。同一 imageId 重复到达幂等。
 - `store.fetchImage(imageId, maxEdge?)` 带内存缓存（key = imageId@maxEdge）；
   失败**只提示**（契约：图片可选，不阻塞会话其余功能）。
+
+### 交付物图片独立成条 + 排队显示（契约 §5.10.2 / §5.2 v1.1.1）
+- **交付物（present 投递的文件）必须独立成条**：`ImageRef.source === 'deliverable'`
+  → **不挂**到正在流式的 assistant 消息，直接新建独立图片消息。
+  根因：流式消息在 turn 结束刷新历史时会被**宿主持久副本替换**（副本里没有交付物图）
+  → 图「一闪而过然后消失」（用户实测）。插件侧同时把交付物图塞进 `session.history`
+  的独立历史消息，于是刷新/重开/重连都还在。
+- 历史去重：`mergeHistory` 里 `imagesCoveredByPage()`——直播的独立图片消息若在 durable
+  历史里已有同 imageId，摘掉直播副本（只对**正文为空**的图片消息生效，不误删带正文的流式消息）。
+- **排队**：`session.queue` 事件（插件从宿主 `agent/inbox/spliced` / `user/message` 追踪）
+  → `store.queueItems(sid)`；`store.queueVersion`（`@Trace`）驱动页面刷新。
+  列表**只展示宿主推来的内容，不做猜测**；空列表整块不渲染。
+- **发送模式**：agent 运行时输入条上方出现两段式胶囊「排队发送 / 插入当前任务」
+  （对应 `session.prompt` 的 `mode:'queue'|'steer'`）；文案沿用桌面端（`排队消息`/`排队发送`）。
+  steer 被宿主拒绝时**自动退回 queue** 并 toast（桌面端此时是置灰 steer 动作，手机不能把消息弄丢）。
+  空闲时 queue 语义 = 立即执行，toast 文案用「已发送」而不是「已排队」。
+- **思考块用独立的 markdown 控制器**（`mdCtrlReasoning`）：思考块刻意弱化
+  （`FS_SMALL` + `label_secondary`），复用气泡的正文主题会让「思考」和「回答」分不开
+  （用户反馈「思考中的文字颜色和之前版本不一致」）。`setupMarkdownTheme()` 拆成
+  `applyMarkdownTheme(ctrl, dim)`，两套主题同源。

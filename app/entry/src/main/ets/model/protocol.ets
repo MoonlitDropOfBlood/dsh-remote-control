@@ -1,19 +1,26 @@
 /*
  * Copyright (c) 2026 dukedsh.
- * dsh-remote-control-app 协议层：常量 / 消息类型 / KAT 向量（契约 v1.0.2）。
- * 契约来源（只读）：仓库根 docs/PROTOCOL.md（dsh-remote-control，v1.0.2）
+ * dsh-remote-control-app 协议层：常量 / 消息类型 / KAT 向量（契约 v1.1.1）。
+ * 契约来源（只读）：仓库根 docs/PROTOCOL.md（dsh-remote-control，v1.1.1）
  * 本文件只描述“协议长什么样”，不做任何 IO 与加密运算。
  */
 
 /** 协议版本（契约 §5.1 hello.proto）。 */
 export const PROTO_VERSION: number = 1;
 
-/** 协议契约文档版本（v1.0.9：§5.10 会话消息里的图片——缩略图内联 + 大图按需拉取；关于页展示用）。 */
-export const CONTRACT_VERSION: string = 'v1.0.9';
+/** 协议契约文档版本（v1.1.1：§5.10.1/§5.10.2 交付物图片 + §5.2 session.queue 队列 + session.prompt 的 mode；关于页展示用）。 */
+export const CONTRACT_VERSION: string = 'v1.1.1';
 
 /** 角色：host = PC 端 DSH 插件；client = 本 App。 */
 export const ROLE_HOST: string = 'host';
 export const ROLE_CLIENT: string = 'client';
+
+/**
+ * session.prompt 的发送模式（契约 §5.1 v1.1.1）：
+ *  - 'queue'：缺省语义——追加到当前 turn 之后执行（agent 空闲时即刻执行）；
+ *  - 'steer'：插入正在运行的 turn（宿主拒绝 steer 时回 error，客户端可退回 queue）。
+ */
+export type DshrcPromptMode = 'queue' | 'steer';
 
 /** HKDF 参数（契约 §3.3）。 */
 export const HKDF_SALT: string = 'dsh-remote-control/v1';
@@ -90,6 +97,7 @@ export const TOPIC_SESSION_REMOVED: string = 'session.removed';
 export const TOPIC_SESSION_STATUS: string = 'session.status';
 export const TOPIC_SESSION_ACTIVITY: string = 'session.activity';
 export const TOPIC_SESSION_ARCHIVES: string = 'session.archives'; // v1.0.7：Workspace 归档全集快照
+export const TOPIC_SESSION_QUEUE: string = 'session.queue'; // v1.1.1：待执行消息（排队中 / 已插入当前 turn）
 export const TOPIC_SESSION_MODEL_CHANGED: string = 'session.modelChanged'; // v1.0.8：会话模型/强度变化
 export const TOPIC_ASSISTANT_DELTA: string = 'assistant.delta';
 export const TOPIC_ASSISTANT_REASONING_DELTA: string = 'assistant.reasoningDelta'; // v1.0.7：思考增量
@@ -166,6 +174,8 @@ export interface DshrcPayload {
   subagents?: DshrcSubagentInfo[];
   parentSessionId?: string;
   childSessionId?: string;
+  // session.prompt（§5.1 v1.1.1）：发送模式（'queue' | 'steer'）——请求体必须**显式**带上
+  mode?: DshrcPromptMode;
   // image.fetch（§5.1 v1.0.9：拉图片大图）
   imageId?: string;
   maxEdge?: number;
@@ -261,6 +271,20 @@ export interface DshrcValue {
   imageId?: string;
   // assistant.image 事件（§5.10 v1.0.9）：单张图片引用
   image?: DshrcImageRef;
+  // session.queue 事件（§5.2 v1.1.1）：该会话待执行的用户消息列表（空数组 = 没有待执行消息）
+  items?: DshrcQueueItem[];
+}
+
+/**
+ * 待执行消息条目（契约 §5.2 v1.1.1 session.queue）。
+ *  源为 Host 会话事件 agent/inbox/spliced（入队）与 user/message（被消费时出队）。
+ *  target：'next-turn' = 当前 turn 结束后执行（排队中）；'next-step' = 已插入当前 turn（尚未消费）。
+ *  客户端**只做展示，不做猜测**（不推断文本、不推断状态）。
+ */
+export interface DshrcQueueItem {
+  itemId: string;
+  text: string;
+  target: string; // 'next-turn' | 'next-step'
 }
 
 /** session.history 的单条历史消息（契约 §5.1 v1.0.4 ChatMessage）。 */
@@ -281,11 +305,19 @@ export interface DshrcChatMessage {
  *  插件降质后仍超限时只发元数据、thumb 留空（客户端显示占位框）。
  */
 export interface DshrcImageRef {
-  imageId: string; // 宿主 attachmentId（同会话内稳定）
+  imageId: string; // 宿主 attachmentId（同会话内稳定）；交付物图片为 "d"+hash
   mediaType: string; // image/png | image/jpeg | image/webp | image/gif
   width: number; // 原图宽（px）
   height: number; // 原图高（px）
   bytes: number; // 原始字节数（宿主侧）
+  /**
+   * 图片来源（契约 §5.10.1 / §5.10.2 v1.1.1，**可选**）：
+   *  - 缺省 = 'attachment'：宿主会话消息的附件引用；
+   *  - 'deliverable' = present 投递的交付物文件。
+   *  交付物图片**必须**渲染成独立的一条图片消息（不挂到 assistant 气泡上）——
+   *  挂上去会在 turn 结束的历史刷新里被宿主持久副本替换（副本里没有该图）→ 图片消失。
+   */
+  source?: string;
   thumb: string; // 缩略图 data URI（可能为空串）
 }
 

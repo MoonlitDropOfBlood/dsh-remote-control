@@ -36,8 +36,10 @@ cd relay && npm install && node server.js            # 中继（默认 8787；�
 
 ## 全局约定
 
-1. **协议以 docs/PROTOCOL.md 为准**（v1.0.9：在 v1.0.8 模型思考强度目录与会话中切换模型之上，
-   增补会话消息里的图片——§5.10「缩略图内联 + 大图按需拉取」）。改任何一端的 wire 行为必须先改契约，三方同步。
+1. **协议以 docs/PROTOCOL.md 为准**（**v1.1.1**：v1.0.9 会话消息里的图片（§5.10「缩略图内联 +
+   大图按需拉取」）→ v1.1.0 present 投递的文件也上手机（§5.10.1）→ v1.1.2 交付物图片进历史
+   （§5.10.2）+ 排队  与  的 （§5.1/§5.2））。
+   改任何一端的 wire 行为必须先改契约，三方同步。
 2. **KAT 是硬验收**：契约 §7 测试向量（key/iv/ct/tag/hmac）在 plugin 与 app 各有一份自测，
    连接建立前执行，失败禁连。加密链路每一环（HKDF/AES/HMAC）都必须进 KAT。
 3. **git 提交**：`git -c user.name="dsh-remote-control" -c user.email="dev@localhost" commit`，

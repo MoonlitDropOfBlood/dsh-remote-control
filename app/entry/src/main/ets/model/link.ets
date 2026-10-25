@@ -29,6 +29,7 @@ import {
   DshrcCapabilities,
   DshrcCreateResult,
   DshrcModelSelection,
+  DshrcPromptMode,
   DshrcSubagentInfo,
   DshrcRelayFrame,
   DshrcRelayPeers,
@@ -905,9 +906,14 @@ export class DshrcLink {
     });
   }
 
-  /** session.prompt（§5.1）：发送提示词；value.accepted。 */
-  sessionPrompt(sessionId: string, text: string): Promise<boolean> {
+  /**
+   * session.prompt（§5.1 v1.1.1）：发送提示词；value.accepted。
+   *  mode：'queue'（缺省语义——追加到当前 turn 之后执行）/ 'steer'（插入正在运行的 turn）。
+   *  协议要求请求体**显式**带 mode（缺省也带 'queue'），故此处无条件写入。
+   */
+  sessionPrompt(sessionId: string, text: string, mode?: DshrcPromptMode): Promise<boolean> {
     const p: DshrcPayload = { sessionId: sessionId, text: text };
+    p.mode = mode !== undefined ? mode : 'queue';
     return this.request(MSG_SESSION_PROMPT, p).then((v: DshrcValue): boolean => {
       return v.accepted === true;
     });

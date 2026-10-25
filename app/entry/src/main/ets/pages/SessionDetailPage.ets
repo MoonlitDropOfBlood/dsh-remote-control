@@ -6,12 +6,14 @@
  *  - 底部输入条 + 发送；running 时显示「取消」；顶部标题栏 + 运行状态徽标
  *  - 本会话的审批 / 提问卡片内嵌在输入条上方（AskCards），resolved 后自动消失
  *  - v1.0.8：输入条上方「模型 / 思考强度」胶囊 → bindSheet 选模型与强度（session.selectModel）
+ *  - v1.1.1：agent 运行时输入条上方出现「排队 / 插入当前任务」模式胶囊（session.prompt 的 mode）；
+ *    待执行消息列表（宿主 session.queue 事件）在输入区上方展示，只展示不猜测
  */
 import { MarkdownController } from '@luvi/lv-markdown-in';
 import { promptAction } from '@kit.ArkUI';
 import { HRouter } from 'hrouter';
 import { dshrcLink } from '../model/link';
-import { DshrcEffortOption, DshrcModelOption, DshrcModelSelection } from '../model/protocol';
+import { DshrcEffortOption, DshrcModelOption, DshrcModelSelection, DshrcQueueItem } from '../model/protocol';
 import { SessionDetailParam, goBack, openSessionDetail } from '../model/routes';
 import {
   ApprovalCard,
@@ -102,6 +104,13 @@ export struct SessionDetailPage {
   @Local sheetModelId: string = '';
   /** 面板内选中的思考强度 id（'' = 默认）。 */
   @Local sheetEffortId: string = '';
+  /**
+   * 发送模式（契约 §5.1 v1.1.1 session.prompt 的 mode）：
+   *  - 'queue'（默认）：当前任务结束后执行（agent 空闲时即刻执行）；
+   *  - 'steer'：插入正在运行的任务。
+   *  仅在 agent 运行时可切换（见 modeChip）。
+   */
+  @Local sendMode: string = 'queue';
   private scroller: Scroller = new Scroller();
   /** 首次进入是否已完成贴底（timeline 有缓存 / 历史异步到达两种都要滚到底）。 */
   private pendingInitialScroll: boolean = true;
@@ -673,6 +682,107 @@ export struct SessionDetailPage {
     .padding({ left: SP_4, right: SP_4, top: SP_4, bottom: SP_6 })
   }
 
+  // ---- v1.1.1：发送模式（session.prompt 的 mode）+ 待执行消息列表（session.queue）----
+
+  /** agent 是否正在运行（决定是否显示发送模式胶囊）。 */
+  private agentRunning(): boolean {
+    return this.store.runningOf(this.sessionId);
+  }
+
+  /**
+   * 待执行消息（宿主 session.queue 事件，契约 §5.2 v1.1.1）。
+   * 读 store.queueVersion（@Trace）建立响应式依赖——队列内容存在 store 内部 Map 里，
+   * 版本号一变即触发本页重渲染；宿主说「没有待执行消息」→ 空数组（不显示该区）。
+   */
+  private pendingQueue(): DshrcQueueItem[] {
+    const version: number = this.store.queueVersion;
+    if (version < 0) {
+      return [];
+    }
+    return this.store.queueItems(this.sessionId);
+  }
+
+  /** 模式胶囊旁的一句说明（跟着当前模式走）。 */
+  private modeHint(mode: string): string {
+    return mode === 'steer' ? '插入正在运行的任务' : '当前任务结束后执行';
+  }
+
+  /**
+   * 发送模式胶囊（仅 agent 运行时显示）：两段式，点一下即切换。
+   * 当前模式 = 品牌填充 + 反白字；未选中 = 中性底 + 次级字（全部走 app.color 资源）。
+   */
+  @Builder
+  modeChip() {
+    Row({ space: SP_1 }) {
+      Text('排队发送')
+        .fontSize(FS_CAPTION)
+        .fontColor(this.sendMode === 'queue' ? $r('app.color.label_on_brand') : $r('app.color.label_secondary'))
+        .padding({ left: SP_2, right: SP_2, top: SP_1, bottom: SP_1 })
+        .borderRadius(RADIUS_PILL)
+        .backgroundColor(this.sendMode === 'queue' ? $r('app.color.brand_fill') : $r('app.color.bg_layer_1'))
+        .onClick((): void => {
+          this.sendMode = 'queue';
+        })
+      Text('插入当前任务')
+        .fontSize(FS_CAPTION)
+        .fontColor(this.sendMode === 'steer' ? $r('app.color.label_on_brand') : $r('app.color.label_secondary'))
+        .padding({ left: SP_2, right: SP_2, top: SP_1, bottom: SP_1 })
+        .borderRadius(RADIUS_PILL)
+        .backgroundColor(this.sendMode === 'steer' ? $r('app.color.brand_fill') : $r('app.color.bg_layer_1'))
+        .onClick((): void => {
+          this.sendMode = 'steer';
+        })
+    }
+    .padding({ left: SP_1, right: SP_1, top: SP_1, bottom: SP_1 })
+    .borderRadius(RADIUS_PILL)
+    .backgroundColor($r('app.color.bg_layer_2'))
+    .border({ width: HAIRLINE, color: $r('app.color.border_l1') })
+  }
+
+  /**
+   * 待执行消息列表（宿主 session.queue 事件，契约 §5.2 v1.1.1）：
+   * 文本与状态**直接来自宿主**（只做展示，不做猜测）；target='next-step' → 「已插入」，
+   * 其余（'next-turn'）→ 「排队中」。空列表时整块不渲染（不留空白占位）。
+   */
+  @Builder
+  pendingQueueBar() {
+    Column({ space: SP_1 }) {
+      // 标题沿用桌面端文案（dsh-client-ui-conversation：「排队消息」）
+      Text('排队消息')
+        .fontSize(FS_CAPTION)
+        .fontColor($r('app.color.label_tertiary'))
+        .width('100%')
+      Repeat(this.pendingQueue())
+        .each((cell: RepeatItem<DshrcQueueItem>): void => {
+          Row() {
+            Text(cell.item.text.length > 0 ? cell.item.text : '（空消息）')
+              .fontSize(FS_SMALL)
+              .fontColor($r('app.color.label_secondary'))
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .layoutWeight(1)
+            Text(cell.item.target === 'next-step' ? '已插入' : '排队中')
+              .fontSize(FS_CAPTION)
+              .fontColor(cell.item.target === 'next-step' ? $r('app.color.brand_label') : $r('app.color.state_warn'))
+              .padding({ left: SP_2, right: SP_2, top: 1, bottom: 1 })
+              .borderRadius(RADIUS_PILL)
+              .backgroundColor(cell.item.target === 'next-step' ? $r('app.color.brand_tint') : $r('app.color.state_warn_tint'))
+              .margin({ left: SP_2 })
+          }
+          .width('100%')
+          .alignItems(VerticalAlign.Center)
+          .padding({ left: SP_3, right: SP_3, top: SP_1 + 2, bottom: SP_1 + 2 })
+          .borderRadius(RADIUS_CTRL)
+          .backgroundColor($r('app.color.bg_layer_2'))
+        })
+        .key((it: DshrcQueueItem, index: number): string => {
+          return it.itemId.length > 0 ? it.itemId : ('q' + index.toString());
+        })
+    }
+    .width('100%')
+    .padding({ left: SP_3, right: SP_3, top: SP_2 })
+  }
+
   /** 发送提示词（乐观上屏；根会话走 session.prompt，subagent 走 session.subagentPrompt §5.1 v1.0.5）。 */
   private send(): void {
     const text: string = this.draft.trim();
@@ -685,16 +795,45 @@ export struct SessionDetailPage {
     }
     const row: SessionRow | undefined = this.store.rowOf(this.sessionId);
     const parent: string = row !== undefined ? row.parentSessionId : '';
+    // v1.1.1：steer 只在 agent 运行时才有意义（空闲时按 queue 发）。
+    const running: boolean = this.agentRunning();
+    const steer: boolean = this.sendMode === 'steer' && running;
     this.store.pushLocalUser(this.sessionId, text);
     this.draft = '';
     const sent: Promise<boolean> = parent.length > 0 ?
       dshrcLink.subagentPrompt(parent, this.sessionId, text) :
-      dshrcLink.sessionPrompt(this.sessionId, text);
+      dshrcLink.sessionPrompt(this.sessionId, text, steer ? 'steer' : 'queue');
     sent.then((accepted: boolean): void => {
       if (!accepted) {
         promptAction.showToast({ message: '主机未接受该提示词', duration: 2500 });
+        return;
+      }
+      if (parent.length > 0) {
+        return; // subagent 没有 queue/steer 之分（契约 §5.1 v1.0.5）
+      }
+      if (steer) {
+        promptAction.showToast({ message: '已插入当前任务', duration: 2000 });
+      } else if (running) {
+        // 排队模式：明确告诉用户「发出去了，但排在当前任务之后」，别让人以为没发出去
+        promptAction.showToast({ message: '已排队，当前任务结束后执行', duration: 2500 });
+      } else {
+        // 空闲时的 queue 语义 = 立即执行（没有当前任务可排）
+        promptAction.showToast({ message: '已发送', duration: 1500 });
       }
     }).catch((e: Error): void => {
+      // v1.1.1：宿主拒绝 steer（当前 turn 不再接受插入）时**自动退回 queue**——
+      // 桌面端此时是把 steer 动作置灰，手机端不能把用户的消息直接弄丢。
+      if (steer && parent.length === 0) {
+        promptAction.showToast({ message: '当前任务无法插入，已改为排队发送', duration: 2500 });
+        dshrcLink.sessionPrompt(this.sessionId, text, 'queue').then((ok2: boolean): void => {
+          if (!ok2) {
+            promptAction.showToast({ message: '主机未接受该提示词', duration: 2500 });
+          }
+        }).catch((e2: Error): void => {
+          promptAction.showToast({ message: '发送失败：' + e2.message, duration: 3000 });
+        });
+        return;
+      }
       promptAction.showToast({ message: '发送失败：' + e.message, duration: 3000 });
     });
     // 自己发的消息一定看得到：贴底并恢复跟随（不再受「用户已上翻历史」影响）
@@ -953,6 +1092,10 @@ export struct SessionDetailPage {
         .border({ width: HAIRLINE, color: $r('app.color.border_l1') })
       } else {
         Column() {
+          // 待执行消息列表（宿主 session.queue；空 → 整块不渲染，不留空白占位）
+          if (this.pendingQueue().length > 0) {
+            this.pendingQueueBar()
+          }
           // 模型 / 思考强度胶囊（v1.0.8）：在输入框上方一行，点击弹选择面板
           Row() {
             this.modelCapsule()
@@ -961,6 +1104,23 @@ export struct SessionDetailPage {
           .width('100%')
           .alignItems(VerticalAlign.Center)
           .padding({ left: SP_3, right: SP_3, top: SP_2, bottom: SP_1 })
+
+          // 发送模式胶囊（v1.1.1）：仅 agent 正在运行时显示（点一下切 queue / steer）
+          if (this.agentRunning()) {
+            Row() {
+              this.modeChip()
+              Text(this.modeHint(this.sendMode))
+                .fontSize(FS_CAPTION)
+                .fontColor($r('app.color.label_tertiary'))
+                .margin({ left: SP_2 })
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+              Blank()
+            }
+            .width('100%')
+            .alignItems(VerticalAlign.Center)
+            .padding({ left: SP_3, right: SP_3, bottom: SP_1 })
+          }
 
           Row() {
             TextArea({ text: this.draft, placeholder: '输入提示词，Enter 发送…' })

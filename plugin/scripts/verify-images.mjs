@@ -755,6 +755,373 @@ setSharpResolver(null);
 
 setSharpResolver(null);
 
+// ---------------------------------------------------------------------------
+// v1.1.1：session.prompt 的 mode（契约 §5.1）
+//
+// mode 只认两个字面量 'queue' / 'steer'，缺省 'queue'；其它值必须回 bad-params
+// （**不得**默默当 queue——那会让用户以为消息插进了正在跑的 turn）。
+// 宿主拒绝 steer（如 session/steer-unavailable）时原样回宿主的错误码。
+// ---------------------------------------------------------------------------
+{
+  const promptCalls = [];
+  let rejectSteer = false;
+  const sc = {
+    async prompt(request) {
+      promptCalls.push(request);
+      if (rejectSteer) {
+        const err = new Error("current turn no longer accepts steering");
+        err.code = "session/steer-unavailable";
+        throw err;
+      }
+      return { accepted: true };
+    },
+  };
+  const ctx = makeCtx({ sessionController: sc });
+  const relay = makeRelay();
+  const bridge = new HostBridge({
+    ctx,
+    relay,
+    push: { configured: false, notify: async () => ({ ok: true }) },
+    config: CFG,
+    log,
+  });
+  bridge.attach();
+
+  const promptReq = (id, payload) =>
+    bridge.dispatch({ id, type: "session.prompt", ts: Date.now(), payload: { sessionId: "sess-p", text: "你好", ...payload } });
+
+  // 1) mode:'steer' → 原样转发给宿主
+  await promptReq("p-steer", { mode: "steer" });
+  check("session.prompt：mode=steer 转发给宿主", promptCalls[0]?.mode === "steer", JSON.stringify(promptCalls[0]));
+  check("session.prompt：steer 被接受", lastResult(relay.sent, "p-steer")?.value?.accepted === true, JSON.stringify(lastResult(relay.sent, "p-steer")));
+  check("session.prompt：带 requestId/sessionId/content",
+    typeof promptCalls[0]?.requestId === "string" && promptCalls[0]?.requestId !== ""
+    && promptCalls[0]?.sessionId === "sess-p"
+    && Array.isArray(promptCalls[0]?.content) && promptCalls[0].content[0]?.type === "text"
+    && promptCalls[0].content[0]?.text === "你好", JSON.stringify(promptCalls[0]));
+
+  // 2) 不带 mode → 缺省 queue
+  await promptReq("p-queue", {});
+  check("session.prompt：不带 mode 缺省 queue", promptCalls[1]?.mode === "queue", JSON.stringify(promptCalls[1]));
+  check("session.prompt：缺省 queue 被接受", lastResult(relay.sent, "p-queue")?.value?.accepted === true, JSON.stringify(lastResult(relay.sent, "p-queue")));
+
+  // 3) 非法 mode → bad-params，且**不**转发给宿主
+  const before = promptCalls.length;
+  await promptReq("p-bogus", { mode: "bogus" });
+  const bogus = lastResult(relay.sent, "p-bogus");
+  check("session.prompt：非法 mode 回 bad-params", bogus?.error?.code === "bad-params", JSON.stringify(bogus));
+  check("session.prompt：非法 mode 有中文原因（说清只支持 queue / steer）",
+    /mode 只支持 queue \/ steer/.test(String(bogus?.error?.message ?? "")), String(bogus?.error?.message));
+  check("session.prompt：非法 mode 不转发给宿主（没被默默当 queue）", promptCalls.length === before, `${before} → ${promptCalls.length}`);
+
+  // 4) 其它非法取值一律回 bad-params（空串 / 大写 / null / 数字）
+  for (const [label, value] of [["空串", ""], ["大写", "QUEUE"], ["null", null], ["数字", 7]]) {
+    const id = "p-bad-" + label;
+    await promptReq(id, { mode: value });
+    check(`session.prompt：mode=${label} 回 bad-params`, lastResult(relay.sent, id)?.error?.code === "bad-params", JSON.stringify(lastResult(relay.sent, id)));
+  }
+  check("session.prompt：非法 mode 一律不转发给宿主", promptCalls.length === before, `${before} → ${promptCalls.length}`);
+
+  // 5) 宿主拒绝 steer → 原样回宿主错误码（不吞掉）
+  rejectSteer = true;
+  await promptReq("p-steer-reject", { mode: "steer" });
+  const rejected = lastResult(relay.sent, "p-steer-reject");
+  check("session.prompt：宿主拒绝 steer 时回宿主错误码",
+    rejected?.error?.code === "session/steer-unavailable", JSON.stringify(rejected?.error));
+  check("session.prompt：宿主拒绝 steer 时保留宿主文案",
+    /no longer accepts steering/.test(String(rejected?.error?.message ?? "")), String(rejected?.error?.message));
+  rejectSteer = false;
+}
+
+// ---------------------------------------------------------------------------
+// v1.1.1：待执行消息（排队中）追踪 → session.queue 事件（契约 §5.2）
+//
+// 源为宿主会话事件 agent/inbox/spliced（入队）与 user/message（被消费时出队）。
+// 一个 session 一个列表——不同会话互不干扰。
+// ---------------------------------------------------------------------------
+{
+  const ctx = makeCtx({});
+  const relay = makeRelay();
+  const bridge = new HostBridge({
+    ctx,
+    relay,
+    push: { configured: false, notify: async () => ({ ok: true }) },
+    config: CFG,
+    log,
+  });
+  bridge.attach();
+
+  const splice = (sessionId, target, inserted, extra = {}) =>
+    ctx.emit("session/event", { id: sessionId }, {
+      type: "agent/inbox/spliced",
+      seq: 10,
+      time: 100,
+      data: { target, start: 0, inserted, ...extra },
+    });
+
+  // 1) 入队 → 广播 session.queue
+  splice("sess-q", "next-turn", [
+    { id: "m-1", source: { kind: "user", rpcId: "rpc-1" }, content: [{ type: "text", text: "排队的消息" }] },
+  ]);
+  const q1 = eventsOf(relay.sent, "session.queue");
+  check("session.queue：入队后广播 session.queue", q1.length === 1, `events=${q1.length}`);
+  check("session.queue：带 sessionId", q1[0]?.sessionId === "sess-q", JSON.stringify(q1[0]));
+  check("session.queue：items 形状正确（itemId/text/target）",
+    Array.isArray(q1[0]?.items) && q1[0].items.length === 1
+    && q1[0].items[0]?.itemId === "m-1"
+    && q1[0].items[0]?.text === "排队的消息"
+    && q1[0].items[0]?.target === "next-turn", JSON.stringify(q1[0]?.items));
+  check("session.queue：item 只带三个字段（不泄露 rpcId）",
+    Object.keys(q1[0]?.items?.[0] ?? {}).length === 3, JSON.stringify(q1[0]?.items?.[0]));
+  check("session.queue：wire 里没有 rpcId", !JSON.stringify(q1[0] ?? {}).includes("rpc-1"), JSON.stringify(q1[0]));
+
+  // 2) 未知 target → 忽略
+  splice("sess-q", "next-week", [{ id: "m-x", content: [{ type: "text", text: "x" }] }]);
+  check("session.queue：未知 target 忽略", eventsOf(relay.sent, "session.queue").length === 1, "不该广播");
+
+  // 3) 没有文本 → 跳过该条
+  splice("sess-q", "next-turn", [{ id: "m-y", content: [{ type: "image" }] }]);
+  check("session.queue：没有文本的条目跳过", eventsOf(relay.sent, "session.queue").length === 1, "不该广播");
+
+  // 4) 另一个会话入队 → 各自独立
+  splice("sess-q2", "next-step", [
+    { id: "m-2", source: { kind: "user", rpcId: "rpc-2" }, content: [{ type: "text", text: "别的会话" }] },
+  ]);
+  const q2 = eventsOf(relay.sent, "session.queue");
+  check("session.queue：不同 session 各自一条队列",
+    q2[1]?.sessionId === "sess-q2" && q2[1]?.items?.length === 1 && q2[1].items[0]?.itemId === "m-2",
+    JSON.stringify(q2[1]));
+
+  // 5) 别的会话消费了同 rpcId → 不影响本会话的队列
+  ctx.emit("session/event", { id: "sess-q2" }, {
+    type: "user/message",
+    seq: 11,
+    time: 110,
+    surfaceOp: "append",
+    data: { id: "m-1", source: { kind: "user", rpcId: "rpc-1" }, content: [{ type: "text", text: "排队的消息" }] },
+  });
+  check("session.queue：别的会话消费不影响本会话", eventsOf(relay.sent, "session.queue").length === 2, "不该广播");
+
+  // 6) 本会话的消息被消费（rpcId 命中）→ 再次广播，items 变空
+  ctx.emit("session/event", { id: "sess-q" }, {
+    type: "user/message",
+    seq: 12,
+    time: 120,
+    surfaceOp: "append",
+    data: { id: "m-1", source: { kind: "user", rpcId: "rpc-1" }, content: [{ type: "text", text: "排队的消息" }] },
+  });
+  const q3 = eventsOf(relay.sent, "session.queue");
+  check("session.queue：消费后再次广播", q3.length === 3, `events=${q3.length}`);
+  check("session.queue：消费后 items 变空（空数组也要发）",
+    Array.isArray(q3[2]?.items) && q3[2].items.length === 0, JSON.stringify(q3[2]));
+  check("session.queue：消费广播的 sessionId 正确", q3[2]?.sessionId === "sess-q", JSON.stringify(q3[2]));
+
+  // 7) 另一会话的队列仍在自己那儿（再插一条看它还在）
+  splice("sess-q2", "next-step", [
+    { id: "m-3", source: { kind: "user", rpcId: "rpc-3" }, content: [{ type: "text", text: "第三条" }] },
+  ]);
+  const q4 = eventsOf(relay.sent, "session.queue");
+  check("session.queue：另一会话的旧条目仍在（不串台）",
+    q4[3]?.sessionId === "sess-q2" && q4[3]?.items?.length === 2
+    && q4[3].items.map((i) => i.itemId).join(",") === "m-2,m-3", JSON.stringify(q4[3]));
+
+  // 8) 非真人来源的 user/message（agent 注入）→ 不出队
+  splice("sess-q", "next-turn", [
+    { id: "m-4", source: { kind: "user", rpcId: "rpc-4" }, content: [{ type: "text", text: "第四条" }] },
+  ]);
+  ctx.emit("session/event", { id: "sess-q" }, {
+    type: "user/message",
+    seq: 13,
+    time: 130,
+    surfaceOp: "append",
+    data: { id: "m-4", source: { kind: "agent" }, content: [{ type: "text", text: "注入" }] },
+  });
+  const q5 = eventsOf(relay.sent, "session.queue");
+  check("session.queue：非真人来源的 user/message 不出队", q5.length === 5, `events=${q5.length}`);
+}
+
+// ---------------------------------------------------------------------------
+// v1.1.1：交付物图片在历史里也留着（契约 §5.10.2）
+//
+// 直播时交付物图片挂在「正在流式的 assistant 消息」上 → turn 结束刷新历史时，
+// 那条消息被宿主的持久副本替换 → 图片一闪而过然后消失。
+// 故 session.history 的回包里要补一条**独立**的图片消息（正文空串）。
+// ---------------------------------------------------------------------------
+{
+  const dir = mkdtempSync(join(tmpdir(), "dshrc-hist-"));
+  const pngPath = join(dir, "shot.png");
+  writeFileSync(pngPath, Buffer.from("fake-png-bytes"));
+  // 交付物图片的尺寸走 imageMetaOf（sharp.metadata()），故桩要能报 metadata
+  const sharpWithMeta = () => {
+    const chain = {
+      _edge: 0,
+      _q: 0,
+      rotate() { return chain; },
+      resize(opts) {
+        chain._edge = Math.min(opts?.width ?? 0, opts?.height ?? 0) || 0;
+        return chain;
+      },
+      jpeg(opts) {
+        chain._q = opts?.quality ?? 0;
+        return chain;
+      },
+      async metadata() {
+        return { width: 640, height: 480 };
+      },
+      async toBuffer() {
+        const edge = chain._edge || 0;
+        const size = Math.max(1, Math.round((edge * (chain._q || 70)) / 100) * 64);
+        return { data: Buffer.alloc(size, 9), info: { width: edge, height: Math.max(1, Math.round(edge * 0.75)) } };
+      },
+    };
+    return chain;
+  };
+  // 桩要**可调用**（loadSharp() 的返回值会被当 sharp(input, opts) 调）
+  setSharpResolver(() => () => sharpWithMeta());
+
+  // 会话日志里有一条普通助手消息（**非空**历史 → 走 page 那条回包路径）
+  const histEvents = [
+    {
+      type: "assistant/message",
+      seq: 1,
+      time: 100,
+      surfaceOp: "append",
+      data: { message: { role: "assistant", content: [{ type: "text", text: "在的" }] } },
+    },
+  ];
+  const sc = {
+    async inspect() {
+      return { events: histEvents };
+    },
+    async page() {
+      return { records: histEvents.map((e) => ({ event: e })), hasMore: false };
+    },
+  };
+  const ctx = makeCtx({ sessionController: sc });
+  const relay = makeRelay();
+  const bridge = new HostBridge({
+    ctx,
+    relay,
+    push: { configured: false, notify: async () => ({ ok: true }) },
+    config: CFG,
+    log,
+  });
+  bridge.attach();
+
+  ctx.emit("session/event", { id: "sess-hist" }, {
+    type: "deliverables/presented",
+    seq: 42,
+    time: 4242,
+    data: { turn: 3, callId: "call-1", files: [{ path: pngPath, name: "shot.png" }] },
+  });
+  await new Promise((r) => setTimeout(r, 150));
+
+  const imgs = eventsOf(relay.sent, "assistant.image");
+  check("交付物图片：assistant.image 带 source:'deliverable'",
+    imgs[0]?.image?.source === "deliverable", JSON.stringify(imgs[0]?.image));
+
+  const histId = "req-hist-deliv";
+  await bridge.dispatch({ id: histId, type: "session.history", ts: Date.now(), payload: { sessionId: "sess-hist" } });
+  const hist = lastResult(relay.sent, histId);
+  const msgs = hist?.value?.messages ?? [];
+  check("交付物图片：历史回包里既有原消息也有独立图片消息", msgs.length === 2, JSON.stringify(msgs.map((m) => m?.id)));
+  check("交付物图片：原消息顺序/字段口径保持原样",
+    msgs[0]?.text === "在的" && msgs[0]?.role === "assistant" && msgs[0]?.seq === 1, JSON.stringify(msgs[0]));
+  const dm = msgs[1] ?? {};
+  check("交付物图片：历史回包里有独立图片消息", dm !== undefined && Array.isArray(dm.images), JSON.stringify(dm));
+  check("交付物图片：独立消息正文为空串", dm.text === "", JSON.stringify(dm.text));
+  check("交付物图片：独立消息 role=assistant", dm.role === "assistant", String(dm.role));
+  check("交付物图片：seq 用宿主事件 seq", dm.seq === 42, String(dm.seq));
+  check("交付物图片：ts 用宿主事件时间", dm.ts === 4242, String(dm.ts));
+  check("交付物图片：消息带 images[]", Array.isArray(dm.images) && dm.images.length === 1, JSON.stringify(dm.images));
+  const dim = dm.images?.[0] ?? {};
+  check("交付物图片：历史 ImageRef 带 source:'deliverable'", dim.source === "deliverable", JSON.stringify(dim));
+  check("交付物图片：历史 ImageRef 缩略图内联",
+    typeof dim.thumb === "string" && dim.thumb.startsWith("data:image/jpeg;base64,"), String(dim.thumb).slice(0, 40));
+  check("交付物图片：历史 ImageRef 的 imageId 与事件一致",
+    dim.imageId === imgs[0]?.image?.imageId, `${dim.imageId} vs ${imgs[0]?.image?.imageId}`);
+  check("交付物图片：历史 ImageRef 带元数据（mediaType/尺寸/字节）",
+    dim.mediaType === "image/png" && dim.width === 640 && dim.height === 480 && dim.bytes > 0,
+    JSON.stringify({ mt: dim.mediaType, w: dim.width, h: dim.height, b: dim.bytes }));
+  check("交付物图片：日志不含文件路径", !logs.some((l) => l.includes(pngPath)), "日志里出现了文件路径");
+
+  // 空会话（宿主日志为空）→ 另一条回包路径，也要带上交付物图片
+  const emptySc = {
+    async inspect() {
+      return { events: [] };
+    },
+    async page() {
+      return { records: [], hasMore: false };
+    },
+  };
+  const emptyCtx = makeCtx({ sessionController: emptySc });
+  const emptyRelay = makeRelay();
+  const emptyBridge = new HostBridge({
+    ctx: emptyCtx,
+    relay: emptyRelay,
+    push: { configured: false, notify: async () => ({ ok: true }) },
+    config: CFG,
+    log,
+  });
+  emptyBridge.attach();
+  emptyCtx.emit("session/event", { id: "sess-empty" }, {
+    type: "deliverables/presented",
+    seq: 7,
+    time: 700,
+    data: { turn: 4, callId: "call-2", files: [{ path: pngPath, name: "shot.png" }] },
+  });
+  await new Promise((r) => setTimeout(r, 150));
+  await emptyBridge.dispatch({ id: "req-hist-empty", type: "session.history", ts: Date.now(), payload: { sessionId: "sess-empty" } });
+  const emptyHist = lastResult(emptyRelay.sent, "req-hist-empty");
+  const emptyMsgs = emptyHist?.value?.messages ?? [];
+  check("交付物图片：空会话历史里也带独立图片消息",
+    emptyMsgs.length === 1 && emptyMsgs[0]?.text === "" && (emptyMsgs[0]?.images ?? []).length === 1,
+    JSON.stringify(emptyMsgs.map((m) => m?.id)));
+  rmSync(dir, { recursive: true, force: true });
+
+  // 附件来源的图片**不带** source 字段（只有交付物图片带）
+  setSharpResolver(() => makeFakeSharp());
+  const attCtx = makeCtx({ attachments: makeAttachments() });
+  const attRelay = makeRelay();
+  const attBridge = new HostBridge({
+    ctx: attCtx,
+    relay: attRelay,
+    push: { configured: false, notify: async () => ({ ok: true }) },
+    config: CFG,
+    log,
+  });
+  attBridge.attach();
+  attCtx.emit("session/event", { id: "sess-att" }, assistantImageEvent(3, "att-src"));
+  await new Promise((r) => setTimeout(r, 30));
+  const attImgs = eventsOf(attRelay.sent, "assistant.image");
+  check("附件图片：ImageRef 不带 source 字段",
+    attImgs[0]?.image !== undefined && !Object.hasOwn(attImgs[0].image, "source"), JSON.stringify(attImgs[0]?.image));
+}
+
+// ---------------------------------------------------------------------------
+// v1.1.1：接线层断言（源码级）
+//
+// 这些断言的意义在于「把实现改坏时门禁会红」——比如把 mode 又写死成 queue、
+// 或把事件闸的分支删掉。
+// ---------------------------------------------------------------------------
+{
+  const src = readFileSync(new URL("../lib/host-bridge.mjs", import.meta.url), "utf8");
+  check("接线层：事件闸认 agent/inbox/spliced",
+    src.includes('type === "agent/inbox/spliced"'), "事件闸缺分支");
+  check("接线层：事件闸认 user/message",
+    src.includes('type === "user/message"'), "事件闸缺分支");
+  check("接线层：prompt 分支读 payload.mode",
+    src.includes('p.mode === undefined ? "queue" : p.mode'), "prompt 分支没读 mode");
+  check("接线层：prompt 不再写死 mode:'queue'",
+    !src.includes('mode: "queue",'), "mode 又被写死了");
+  check("接线层：广播 session.queue 事件",
+    src.includes('this.#sendEvent("session.queue"'), "没有广播 session.queue");
+  check("接线层：session.history 追加交付物图片消息",
+    src.includes("#deliveredHistoryMessages(sessionId)"), "历史回包没带交付物图片");
+}
+
+setSharpResolver(null);
+
 console.log("");
 console.log("verify-images: " + pass + " passed, " + fail + " failed");
 if (fail > 0) process.exit(1);

@@ -127,7 +127,7 @@ dshrc://pair?r=<encodeURIComponent(relayUrl)>&c=<channel>&s=<secret>[&t=<encodeU
 | `session.unarchive` | `{sessionId}` | `{sessionId, archived:false}` | **v1.0.7** 从 Workspace 归档集合恢复；幂等 |
 | `session.selectModel` | `{sessionId, model:ModelSelection}` | `{model:ModelSelection}` | **v1.0.8** 对**已存在会话**切换模型/思考强度；插件调 `sessionController.selectModel({sessionId,…})`。Host 拒绝时回 `error`（原文带出），成功回归一化后的 selection，并视为一次 `model/selection`（同样触发 `session.modelChanged`） |
 | `session.model` | `{sessionId}` | `{model:ModelSelection\|null}` | **v1.0.8** 查询会话当前模型/思考强度。插件从 `model/selection` 会话事件维护内存态；插件重启后无记录时回 `null`（客户端回退展示目录默认），**不得臆造** |
-| `session.prompt` | `{sessionId, text}` | `{accepted:bool}` | 立即返回；实际回复走事件流 |
+| `session.prompt` | `{sessionId, text, mode?:'queue'\|'steer'}` | `{accepted:bool}` | 立即返回；实际回复走事件流。**v1.1.1** 增补 `mode`：`queue`（缺省：追加到当前 turn 之后执行）/`steer`（插入正在运行的 turn）。宿主拒绝 steer 时回 error，客户端可退回 queue |
 | `session.cancel` | `{sessionId}` | `{cancelled:bool}` | 取消当前运行的 turn |
 | `session.rename` | `{sessionId, title}` | `{title}` | |
 | `image.fetch` | `{imageId, maxEdge?:number}` | `{imageId, mediaType, width, height, data:"data:<mediaType>;base64,…"}` | **v1.0.9** 拉取图片大图（§5.10）：`maxEdge` 缺省 1600、上限 4096；插件等比缩放后回 data URI，单张 ≤ 1MiB（中继硬上限），失败回 `error`（不影响消息流） |
@@ -146,9 +146,10 @@ dshrc://pair?r=<encodeURIComponent(relayUrl)>&c=<channel>&s=<secret>[&t=<encodeU
 | `session.archives` | `{archivedSessionIds:string[]}` | **v1.0.7** Workspace `domain/changed` 后的归档全集快照；客户端据此覆盖各行 `archived`，不做增量猜测 |
 | `session.modelChanged` | `{sessionId, model:ModelSelection}` | **v1.0.8** 会话模型/思考强度变化：源为 Host 会话事件 `model/selection`（桌面端切换、手机端 `session.selectModel` 都会触发）；客户端更新会话当前模型显示 |
 | `session.activity` | `{sessionId, updatedAt}` | 事件 `api-session/activity` |
+| `session.queue` | `{sessionId, items:[{itemId, text, target:'next-turn'\|'next-step'}]}` | **v1.1.1** 该会话**待执行**的用户消息（排队中 / 已插入当前 turn 但尚未消费）。源为 Host 会话事件 `agent/inbox/spliced`（入队）与 `user/message`（被消费时出队）。客户端据此显示「排队中」列表——**只做展示，不做猜测**；items 为空数组 = 没有待执行消息 |
 | `assistant.delta` | `{sessionId, text}` | 事件 `agent/assistant-stream`（文本增量；**按 sessionId 合并节流 ≤8 条/秒**） |
 | `assistant.reasoningDelta` | `{sessionId, text}` | **v1.0.7** `agent/assistant-stream` 的 `reasoning-delta` 思考增量；与文本分流，客户端合并进「思考过程」块 |
-| `assistant.image` | `{sessionId, image:ImageRef}` | **v1.0.9** 会话消息里的图片（§5.10）：源为 Host 会话事件的 `content` 块 `type:"image"`（附件引用）；**v1.1.0** 增补第二来源：present 投递的图片文件（§5.10.1，imageId 以 `d` 开头） |
+| `assistant.image` | `{sessionId, image:ImageRef}` | **v1.0.9** 会话消息里的图片（§5.10）：源为 Host 会话事件的 `content` 块 `type:"image"`（附件引用）；**v1.1.0** 增补第二来源：present 投递的图片文件（§5.10.1，imageId 以 `d` 开头，`source:"deliverable"`） |
 | `tool.call` | `{sessionId, callId, name, arguments, ts}` | **v1.0.6** Host 会话事件 `tool/call`（模型发起一次工具调用） |
 | `tool.result` | `{sessionId, callId, status:"ok"\|"error", resultText, errorText?, ts}` | **v1.0.6** Host 会话事件 `tool/result`（工具调用结束；`resultText` 为结果文本，失败时 `errorText` 为原因） |
 | `system.message` | `{sessionId, kind:"system"\|"developer", text, ts}` | **v1.0.6** Host 会话事件 `system/message` / `developer/message`（系统提示注入等非对话内容） |
@@ -329,10 +330,11 @@ Host `sessionController.list` 本身仍不回归档标记，插件必须用
 **ImageRef**（出现在 `ChatMessage.images[]` 与 `assistant.image` 事件 data 里）：
 
 ```json
-{ "imageId": "…",            // 宿主 attachmentId（同会话内稳定）
+{ "imageId": "…",            // 宿主 attachmentId（同会话内稳定）；交付物图片为 "d"+hash
   "mediaType": "image/png",  // image/png | image/jpeg | image/webp | image/gif
   "width": 800, "height": 600,
   "bytes": 123456,           // 原始字节数（宿主侧）
+  "source": "deliverable",   // **v1.1.1 可选**：缺省 "attachment"；"deliverable" = present 投递的文件
   "thumb": "data:image/jpeg;base64,…" }  // 缩略图 data URI（长边 ≤ 480、JPEG q75）
 ```
 
@@ -370,6 +372,22 @@ Host `sessionController.list` 本身仍不回归档标记，插件必须用
   同一 imageId → 客户端幂等，不重复挂。
 - 非图片交付物（.md/.zip/…）**不**走这条通道（文件卡片是另一条通道，未定义）。
 - 本条是**直播**桥接（事件流），历史消息里的交付物不补图。
+- 交付物图片的 ImageRef 带 `source:"deliverable"`（v1.1.1）。
+
+#### 5.10.2 交付物图片在历史里的位置（v1.1.1 增补）
+
+直播时交付物图片若挂到「正在流式的 assistant 消息」上，**该消息在 turn 结束后的
+历史刷新里会被宿主的持久副本替换**——而持久副本里没有交付物图片 →
+图片「一闪而过然后消失」（用户实测反馈）。
+
+v1.1.1 的口径：
+
+- 交付物图片**必须**渲染成**独立的一条图片消息**（text 为空串），**不挂**到 assistant 气泡上。
+- 插件在 `session.history` 的回包里，把本会话的交付物图片作为**独立的历史消息**
+  一并返回（`text` 为空串、`images[]` 带内联缩略图）——于是任何一次历史刷新、
+  重新打开会话、断线重连，交付物都还在（不再闪一下就没）。
+- 交付物图片的 `imageId` 仍以 `d` 开头（与宿主附件 id 命名空间隔离），
+  `image.fetch` 照样能取到原图。
 
 ## 6. Push Kit（华为推送）旁路
 

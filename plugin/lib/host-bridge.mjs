@@ -52,6 +52,13 @@ import {
 const DELIVERED_MAX_BYTES = 20 * 1024 * 1024;
 
 /**
+ * 单会话待执行消息的条数上限（契约 §5.2 session.queue）。
+ *
+ * 内存态追踪，异常事件流（重连回放等）不该把内存吃满；超了就不再记新的。
+ */
+const QUEUE_MAX_ITEMS = 200;
+
+/**
  * present 投递文件的 imageId：`d` + sha1(path+turn) 前 16 位。
  *
  * 命名空间与宿主附件 id（随机 uuid）不冲突；同一文件在同一 turn 里稳定，
@@ -166,6 +173,24 @@ export function messageText(blocks) {
       text += "[文件]";
     }
     // image：单独渲染（§5.10），不占位；reasoning / tool-call 等：跳过
+  }
+  return text;
+}
+
+/**
+ * 契约 §5.2 `session.queue`：待执行消息的文本口径。
+ *
+ * 只取 content 里 `type==='text'` 的块拼接——与正文口径（messageText）刻意不同：
+ * 正文会把 file 块渲染成 "[文件]" 占位符，而排队列表要的是**用户实际打的字**。
+ * @param {unknown} content ContentBlock[]
+ * @returns {string}
+ */
+export function queueItemText(content) {
+  if (!Array.isArray(content)) return "";
+  let text = "";
+  for (const block of content) {
+    if (!block || typeof block !== "object") continue;
+    if (block.type === "text" && typeof block.text === "string") text += block.text;
   }
   return text;
 }
@@ -808,6 +833,14 @@ export class HostBridge {
   #deliveredImages = new Map();
   // v1.0.9（§5.10）：`${imageId}:${maxEdge}` -> 已缩放的大图（避免重复压缩）
   #imageCache = new Map();
+  // v1.1.1（§5.2）：会话的待执行消息（排队中 / 已插入当前 turn 但尚未消费）
+  // sessionId -> [{itemId, text, target, rpcId}]
+  // rpcId 只在插件内部用于「被消费时出队」的匹配，**不进 wire**。
+  #queues = new Map();
+  // v1.1.1（§5.10.2）：交付物图片的历史条目 sessionId -> [{seq, ts, imageId, …, path}]
+  #deliveredEntries = new Map();
+  // v1.1.1（§5.10.2）：交付物图片的缩略图缓存 imageId -> data URI（避免每次历史刷新都重压）
+  #deliveredThumbs = new Map();
   #disposers = [];
   #hostName = "";
   #dshVersion = "";
@@ -849,8 +882,12 @@ export class HostBridge {
       this.#sendEvent("session.added", { session: s });
     });
     this.#on("api-session/removed", (sessionId) => {
-      this.#titles.delete(String(sessionId));
-      this.#sendEvent("session.removed", { sessionId: String(sessionId) });
+      const key = String(sessionId);
+      this.#titles.delete(key);
+      // 会话没了，它的待执行列表与交付物历史条目也没有意义了（避免内存泄漏）
+      this.#queues.delete(key);
+      this.#deliveredEntries.delete(key);
+      this.#sendEvent("session.removed", { sessionId: key });
     });
     this.#on("api-session/status", (sessionId, running) => {
       this.#sendEvent("session.status", { sessionId: String(sessionId), running: running === true });
@@ -954,7 +991,18 @@ export class HostBridge {
         void this.#emitDeliveredImages(sessionId, event);
         return;
       }
-      // 其余事件（user/message、turn/*、step/* …）忽略
+      if (type === "agent/inbox/spliced") {
+        // v1.1.1（§5.2）：宿主把「排队中 / 已插入当前 turn 但还没消费」的用户消息
+        // 放进 Agent 的 inbox，并用这个事件通知客户端 → 维护待执行列表。
+        this.#handleInboxSpliced(sessionId, event);
+        return;
+      }
+      if (type === "user/message") {
+        // v1.1.1（§5.2）：真人输入被消费（进入某个 turn）→ 从待执行列表里摘掉。
+        this.#handleUserMessage(sessionId, event);
+        return;
+      }
+      // 其余事件（turn/*、step/* …）忽略
     });
 
     // --- v1.0.7（§5.9）：Workspace 归档变化 → 广播归档全集 ---
@@ -976,6 +1024,108 @@ export class HostBridge {
     const ids = this.#archivedSessionIds();
     if (ids === null) return;
     this.#sendEvent("session.archives", { archivedSessionIds: ids });
+  }
+
+  // ---- v1.1.1（§5.2）：待执行消息（排队中）追踪 ------------------------------
+
+  /**
+   * `agent/inbox/spliced` → 把插入的消息记进该会话的待执行列表。
+   *
+   * 宿主把「排队中 / 已插入当前 turn 但还没消费」的用户消息放在 Agent 的 inbox 里，
+   * 并用这个事件通知客户端。`data.target` 取 'next-step'（插进正在跑的 turn）
+   * 或 'next-turn'（排到下一个 turn）；**其它取值一律忽略**（不认识就不猜）。
+   * `data.inserted` 是消息数组（`{id, source:{kind:'user', rpcId?}, content}`）。
+   */
+  #handleInboxSpliced(sessionId, event) {
+    const data = event?.data;
+    const target = data?.target;
+    if (target !== "next-step" && target !== "next-turn") return;
+    const items = this.#queueOf(sessionId);
+    let changed = false;
+    // 被取消的 splice（outcome:'canceled'）会移除若干条待执行消息：宿主不会再为
+    // 它们发 user/message，故这里按目标从**最前面**摘掉（宿主的 claim 也是从前面取）。
+    const removedCount = Number(data?.removedCount);
+    if (data?.outcome === "canceled" && Number.isSafeInteger(removedCount) && removedCount > 0) {
+      if (this.#dropQueuedFront(items, target, removedCount)) changed = true;
+    }
+    const inserted = Array.isArray(data?.inserted) ? data.inserted : [];
+    for (const message of inserted) {
+      const itemId = typeof message?.id === "string" ? message.id : "";
+      if (itemId === "") continue;
+      const text = queueItemText(message?.content);
+      if (text.trim() === "") continue; // 没有文本 → 不是一条可展示的待执行消息
+      if (items.length >= QUEUE_MAX_ITEMS) {
+        this.#log("warn", "session.queue item cap reached", { sessionId, target });
+        break;
+      }
+      items.push({
+        itemId,
+        text,
+        target,
+        rpcId: typeof message?.source?.rpcId === "string" ? message.source.rpcId : "",
+      });
+      changed = true;
+    }
+    if (changed) this.#broadcastQueue(sessionId, target);
+  }
+
+  /**
+   * `user/message`（真人输入）→ 该消息已被消费，从待执行列表里摘掉。
+   *
+   * 宿主用 `source.rpcId` 标记「这条是我发起的请求」（= 我们传给 prompt 的
+   * requestId），与 inbox 里那一条一一对应；命中即出队。
+   */
+  #handleUserMessage(sessionId, event) {
+    const data = event?.data;
+    if (data?.source?.kind !== "user") return;
+    const rpcId = typeof data?.source?.rpcId === "string" ? data.source.rpcId : "";
+    if (rpcId === "") return;
+    const items = this.#queues.get(sessionId);
+    if (!items || items.length === 0) return;
+    const index = items.findIndex((item) => item.rpcId !== "" && item.rpcId === rpcId);
+    if (index < 0) return;
+    const target = items[index]?.target ?? "";
+    items.splice(index, 1);
+    this.#broadcastQueue(sessionId, target);
+  }
+
+  /** 该会话的待执行列表（不存在则建一个）。一个 session 一个列表，不串台。 */
+  #queueOf(sessionId) {
+    let items = this.#queues.get(sessionId);
+    if (items === undefined) {
+      items = [];
+      this.#queues.set(sessionId, items);
+    }
+    return items;
+  }
+
+  /** 从待执行列表里按目标摘掉最前面的 n 条（宿主取消排队时用）。 */
+  #dropQueuedFront(items, target, count) {
+    let dropped = 0;
+    for (let i = 0; i < items.length && dropped < count; ) {
+      if (items[i].target !== target) {
+        i++;
+        continue;
+      }
+      items.splice(i, 1);
+      dropped += 1;
+    }
+    return dropped > 0;
+  }
+
+  /**
+   * 广播该会话**当前全部**待执行消息（契约 §5.2 session.queue）。
+   * items 为空数组 = 「没有待执行消息」——也要发，客户端靠它清掉排队列表。
+   */
+  #broadcastQueue(sessionId, target) {
+    const items = (this.#queues.get(sessionId) ?? []).map((item) => ({
+      itemId: item.itemId,
+      text: item.text,
+      target: item.target,
+    }));
+    // 日志只打 sessionId / 条数 / target——绝不输出消息正文（可能含敏感内容）
+    this.#log("info", "session.queue", { sessionId, count: items.length, target });
+    this.#sendEvent("session.queue", { sessionId, items });
   }
 
   /** 归档集合（宿主没有 Workspace 注册表 → null，表示「不知道」而不是「空」）。 */
@@ -1173,8 +1323,24 @@ export class HostBridge {
           width: meta.width,
           height: meta.height,
           bytes: bytes.length,
+          // v1.1.1（契约 §5.10.1）：交付物图片的 ImageRef 带 source:"deliverable"
+          // （附件来源的图片**不带**这个字段——旧客户端按缺省 "attachment" 处理）。
+          source: "deliverable",
           thumb: await makeThumb(bytes, mediaType),
         };
+        // v1.1.1（契约 §5.10.2）：记进本会话的交付物历史条目——否则 turn 结束
+        // 刷新历史时，那条挂着图片的 assistant 消息被宿主的持久副本替换 →
+        // 图片「一闪而过然后消失」。
+        this.#rememberDeliveredImage(sessionId, {
+          seq: Math.max(0, eventSeq(event)),
+          ts: eventTime(event),
+          imageId,
+          mediaType,
+          width: meta.width,
+          height: meta.height,
+          bytes: bytes.length,
+          path,
+        });
         // 日志绝不输出路径/字节内容（路径可能含敏感目录名，base64 更不能落日志）
         this.#log("info", "delivered image bridged", {
           sessionId,
@@ -1205,6 +1371,97 @@ export class HostBridge {
       return bytes;
     } catch {
       return null;
+    }
+  }
+
+  // ---- v1.1.1（契约 §5.10.2）：交付物图片在历史里的位置 ------------------------
+
+  /**
+   * 记下本会话交付过的一张图片（历史回包要靠它补出独立图片消息）。
+   * 同一 imageId 重复 present（同一文件同一 turn）→ 幂等，不重复入列。
+   * @param {string} sessionId
+   * @param {object} entry {seq, ts, imageId, mediaType, width, height, bytes, path}
+   */
+  #rememberDeliveredImage(sessionId, entry) {
+    let entries = this.#deliveredEntries.get(sessionId);
+    if (entries === undefined) {
+      entries = [];
+      this.#deliveredEntries.set(sessionId, entries);
+    }
+    if (entries.some((item) => item.imageId === entry.imageId)) return;
+    entries.push(entry);
+  }
+
+  /**
+   * 交付物图片 → **独立**的历史消息（契约 §5.10.2）。
+   *
+   * 交付物图片**不挂**在 assistant 气泡上：那条气泡在 turn 结束后的历史刷新里
+   * 会被宿主的持久副本替换（副本里没有交付物图片）→ 图片闪一下就没了。
+   * 故这里补一条正文为空串的独立消息，缩略图内联（读不到文件则 thumb 留空，
+   * 只发元数据）。整页缩略图有总预算，超了后续图片只发元数据——但**消息本身保留**
+   * （客户端至少知道有这么一张图）。
+   * @param {string} sessionId
+   * @returns {Promise<object[]>} ChatMessage[]
+   */
+  async #deliveredHistoryMessages(sessionId) {
+    const entries = this.#deliveredEntries.get(sessionId);
+    if (!entries || entries.length === 0) return [];
+    const out = [];
+    let used = 0;
+    for (const entry of entries) {
+      let thumb = await this.#deliveredThumb(entry);
+      if (thumb !== "") {
+        const size = thumb.length - THUMB_DATA_URI_PREFIX.length;
+        if (used + size > THUMB_PAGE_BUDGET) thumb = "";
+        else used += size;
+      }
+      out.push({
+        id: `d${entry.imageId}`,
+        role: "assistant",
+        text: "",
+        ts: entry.ts,
+        seq: entry.seq,
+        images: [
+          {
+            imageId: entry.imageId,
+            mediaType: entry.mediaType,
+            width: entry.width,
+            height: entry.height,
+            bytes: entry.bytes,
+            source: "deliverable",
+            thumb,
+          },
+        ],
+      });
+    }
+    return out;
+  }
+
+  /** 交付物图片的缩略图（读盘 → 压缩）；读不到就只发元数据（thumb 留空）。 */
+  async #deliveredThumb(entry) {
+    const cached = this.#deliveredThumbs.get(entry.imageId);
+    if (cached !== undefined) return cached;
+    let thumb = "";
+    const bytes = await this.#readDeliveredFile(entry.path);
+    if (bytes !== null) {
+      try {
+        thumb = await makeThumb(bytes, entry.mediaType);
+      } catch {
+        thumb = "";
+      }
+    }
+    this.#deliveredThumbs.set(entry.imageId, thumb);
+    this.#pruneDeliveredThumbs();
+    return thumb;
+  }
+
+  /** 交付物缩略图缓存上限（避免长期运行把内存吃满）。 */
+  #pruneDeliveredThumbs() {
+    const limit = 64;
+    while (this.#deliveredThumbs.size > limit) {
+      const oldest = this.#deliveredThumbs.keys().next();
+      if (oldest.done) break;
+      this.#deliveredThumbs.delete(oldest.value);
     }
   }
 
@@ -1529,6 +1786,8 @@ export class HostBridge {
     const signal = this.#signal(30_000);
     try {
       const sc = this.#sc();
+      // v1.1.1（§5.10.2）：交付物图片作为**独立**的历史消息（两条回包路径都要带上）
+      const delivered = await this.#deliveredHistoryMessages(sessionId);
       let cursor = -1;
       let address = { kind: "session", sessionId };
       try {
@@ -1550,7 +1809,8 @@ export class HostBridge {
       }
       if (cursor < 0) {
         // 空会话（无任何事件）：直接回空页，不折腾 page
-        this.#reply(m, resultOf(m, { messages: [], steps: [], hasMore: false, oldestSeq: 0 }));
+        // （交付物图片仍要带上——它们不在宿主的会话日志里）
+        this.#reply(m, resultOf(m, { messages: delivered, steps: [], hasMore: false, oldestSeq: 0 }));
         return;
       }
       const request = { address, throughSeq: cursor, maxMessages };
@@ -1578,6 +1838,9 @@ export class HostBridge {
       }
       // v1.0.9（§5.10）：缩略图必须内联（客户端立刻显示）——这里补齐
       await attachThumbs(messages, this.#ctx);
+      // v1.1.1（§5.10.2）：交付物图片作为**独立**的历史消息追加进去
+      // （宿主的持久副本里没有它们 → 不补的话图片「一闪而过然后消失」）。
+      messages.push(...delivered);
       // v1.0.6（§5.7）：工作步骤（工具调用）——旧客户端只读 messages，不受影响
       const steps = mapHistorySteps(page?.records ?? []);
       // v1.0.9：帧预算守卫——中继的 1MiB 是 **ws 单帧**上限，超了 ws 直接断链
@@ -2074,19 +2337,31 @@ export class HostBridge {
       this.#reply(m, errorOf(m, "bad-params", "sessionId and non-empty text required"));
       return;
     }
+    // v1.1.1（契约 §5.1）：mode 只认两个字面量，缺省 'queue'。
+    // 其它值（含 null / 空串 / 大写）一律回 bad-params —— 默默当 queue 会让用户
+    // 以为消息插进了正在跑的 turn，实际却排在后面（行为与预期不符，且难排查）。
+    const mode = p.mode === undefined ? "queue" : p.mode;
+    if (mode !== "queue" && mode !== "steer") {
+      this.#reply(m, errorOf(m, "bad-params", "mode 只支持 queue / steer（缺省 queue）。"));
+      return;
+    }
     try {
       const value = await this.#sc().prompt(
         {
           requestId: randomUUID(),
           sessionId,
-          mode: "queue",
+          mode,
           content: [{ type: "text", text }],
         },
         this.#signal(30_000),
       );
       this.#reply(m, resultOf(m, { accepted: value?.accepted === true }));
     } catch (e) {
-      this.#reply(m, errorOf(m, "prompt-failed", errText(e)));
+      // 宿主拒绝（如 steer 不可用：session/steer-unavailable）时**原样**回宿主的
+      // 错误码与文案——吞掉的话客户端没法退回 queue 重发。
+      const err = hostErrorOf(e, "prompt-failed");
+      this.#log("warn", "prompt failed", { sessionId, mode, code: err.code });
+      this.#reply(m, errorOf(m, err.code, err.message));
     }
   }
 

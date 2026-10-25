@@ -33,7 +33,7 @@ node --check index.js client.js typert.host.js lib/*.mjs scripts/*.mjs   # 语�
 node -e "import('./lib/protocol.mjs').then(m=>m.assertKat())"           # KAT
 node scripts/verify-qr.mjs && node scripts/verify-pairing.mjs           # QR/配对 API 回归（需 devDependencies）
 node scripts/verify-steps.mjs                                          # v1.0.9 步骤/模式/权限/归档/模型/思考/强度 + 图片回归（无依赖，154 项）
-node scripts/verify-images.mjs                                         # v1.0.9 图片专项 + v1.1.0 present 投递文件桥接：元数据映射/缩略图降级/image.fetch/帧预算守卫/交付物图片（无依赖，100 项）
+node scripts/verify-images.mjs                                         # 图片专项 + 交付物桥接 + 排队(session.queue)/prompt mode：元数据映射/缩略图降级/image.fetch/帧预算守卫/交付物进历史/排队追踪（无依赖，151 项）
 node scripts/verify-settings.mjs                                       # v1.1.x 设置页/manifest/combo/信封自检 + Host 真跑一遍（112 项）
 node scripts/verify-relay-supervisor.mjs                               # v1.1.1 中继进程托管：决策/端口占用不抢/启停/看门狗/跨平台/bundle（无依赖，162 项）
 node scripts/sync-client-icon.mjs                                      # 改了 icon.svg 后同步 client.js 的图标 data-uri
@@ -221,8 +221,48 @@ present 出来的图当图片记**：
   不会撞）；同一文件同一 turn 重复 present → 同 id → 客户端幂等。
 - `image.fetch` 多一条来源：`#deliveredImages` 命中就直接读盘出大图（不走附件服务）。
 - **日志绝不写文件路径**（可能含敏感目录名），只打 imageId/尺寸/字节数。
-- 范围：**直播**桥接（事件流）；历史消息里的交付物不补图（文件卡片是另一条通道，未定义）。
-- 回归：`node scripts/verify-images.mjs` **100 项**（新增 12 项，含端到端事件桥接 + 接线断言）。
+- 范围：**直播**桥接（事件流）；历史消息里的交付物见 v1.1.2（§5.10.2）。
+- 回归：`node scripts/verify-images.mjs` **151 项**（v1.1.0 新增 12 项 + v1.1.2 新增 39 项）。
+
+## v1.1.2：排队（session.queue）+ 交付物图片进历史（2026-10-25，契约 §5.10.2 / §5.1）
+
+两个用户实测反馈驱动：
+
+1. **交付物一闪而过然后消失**——直播时图片挂到「正在流式的 assistant 消息」上，
+   turn 结束刷新历史时那条消息被**宿主持久副本替换**（副本里没有交付物图）→ 图没了。
+2. **agent 工作时手机上发消息的表现与桌面不一致，且不显示排队**。
+
+### 交付物图片进历史（§5.10.2）
+
+- 插件内存态 `#deliveredEntries`（sessionId → 交付图条目：seq/ts/imageId/媒体类型/尺寸/路径）
+  + `#deliveredThumbs`（imageId → 已压好的缩略图，缓存上限 64 条）。
+  `seq` 用**宿主事件的 seq**（排序稳定、不与消息 seq 撞），`ts` 用事件时间。
+- `session.history` 的两条回包路径（正常页 / 空会话页）都追加这些交付物图：
+  **独立**的 ChatMessage（`id:'d'+imageId`、`role:'assistant'`、`text:''`、
+  `images:[{…,source:'deliverable',thumb}]`）。缩略图真的内联（读盘 → `makeThumb`），
+  读不到就 thumb 留空只发元数据；整页缩略图受 `THUMB_PAGE_BUDGET` 约束（超了只丢缩略图，
+  **消息本身保留**）。**没有绕过**既有的 `fitReplyBudget` 帧预算守卫。
+- 交付物来源的 ImageRef 带 `source:'deliverable'`（附件来源**不带**该字段），
+  客户端据此把它渲染成**独立图片消息**而不是挂到 assistant 气泡上。
+
+### 排队与 steer（§5.1 / §5.2）
+
+- `session.prompt` 新增可选 `mode`：`'queue'`（缺省，追加到当前 turn 之后）/
+  `'steer'`（插入正在运行的 turn）。**只认这两个字面量**，其它值回 error `bad-params`
+  且**不转发宿主**（不默默当 queue）。宿主拒绝时**原样回宿主错误码**
+  （如 `session/steer-unavailable`）——注意这改变了老口径（一律 `prompt-failed`），
+  老客户端若精确匹配 `prompt-failed` 需留意。
+- 待执行消息追踪：会话事件总闸新增两个分支——
+  `agent/inbox/spliced`（`data.target` ∈ {`next-step`,`next-turn`}，
+  `data.inserted` 里每条取 id / `source.rpcId` / text 块文本；**无文本的跳过**）
+  → 入队；`user/message`（`data.source.kind==='user'` 且 rpcId 命中）→ 出队。
+  宿主取消排队（`outcome==='canceled'`）时按目标从队首摘除。
+- 每次增删后广播 `session.queue {sessionId, items:[{itemId,text,target}]}`
+  （**全量快照**，空数组也发；`rpcId` 只在插件内部用于匹配，**不进 wire**）。
+  每个 session 一份列表，互不串台；单会话条数上限 200。
+- 回归：`node scripts/verify-images.mjs` **151 项**（v1.1.0 的 12 项 + 本轮 39 项：
+  mode 转发/校验/宿主拒绝原样回、队列入队出队广播、交付物图进历史、接线层源码断言）。
+  另跑了 16 个变异点，**全部被杀死（存活率 0/16）**。
 
 ## v1.1.1：中继进程随插件托管（2026-10-25，跨平台）
 

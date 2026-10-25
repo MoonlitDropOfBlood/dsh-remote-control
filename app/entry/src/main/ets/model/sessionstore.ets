@@ -8,6 +8,8 @@
  *  - approval.* / question.* 生成待答卡片，resolved 消除；push.state 记录远端推送状态
  *  - Push Token 记录 + 链路在线时 push.register 上报（契约 §5.1/§6）
  *  - 推送点击待导航目标（EntryAbility 解析 intent 后写入，Index 消费）
+ *  - v1.1.1：交付物图片（source='deliverable'）独立成条（§5.10.2）；
+ *    session.queue 事件落地为每会话待执行消息快照（§5.2，只展示不猜测）
  * 本层不做加解密（链路层负责），状态一律 @ObservedV2 + @Trace，页面直接读即自动刷新。
  */
 import { preferences } from '@kit.ArkData';
@@ -26,6 +28,7 @@ import {
   DshrcMsg,
   DshrcPayload,
   DshrcQuestion,
+  DshrcQueueItem,
   DshrcSessionSummary,
   DshrcSubagentInfo,
   DshrcChatMessage,
@@ -53,6 +56,7 @@ import {
   TOPIC_SESSION_ADDED,
   TOPIC_SESSION_ARCHIVES,
   TOPIC_SESSION_MODEL_CHANGED,
+  TOPIC_SESSION_QUEUE,
   TOPIC_SESSION_REMOVED,
   TOPIC_SESSION_STATUS,
   TOPIC_SYSTEM_MESSAGE,
@@ -342,6 +346,13 @@ export class SessionStore {
   @Trace historyLoaded: boolean = false;
   // ---- 子代理目录（契约 §5.6 v1.0.5；活动会话投影 + 每父会话缓存）----
   @Trace activeSubagents: SubagentRow[] = [];
+  // ---- 待执行消息（契约 §5.2 v1.1.1 session.queue）----
+  /**
+   * 队列数据版本号：任何会话的待执行消息变化都自增（页面据此重建队列列表）。
+   * 队列**内容**存在内部 Map（queueCache）里——Map 不是可观察对象，
+   * 故用版本号把「内容变了」这件事暴露成 @Trace 变化，驱动 UI 刷新。
+   */
+  @Trace queueVersion: number = 0;
   // ---- 审批 / 提问（契约 §5.5）----
   @Trace approvals: ApprovalCard[] = [];
   @Trace questions: QuestionCard[] = [];
@@ -384,6 +395,8 @@ export class SessionStore {
   private modelCache: Map<string, DshrcModelSelection> = new Map<string, DshrcModelSelection>();
   /** v1.0.9：大图内存缓存（key = imageId + '@' + maxEdge），避免重复拉取。 */
   private imageCache: Map<string, string> = new Map<string, string>();
+  /** v1.1.1：每会话待执行消息（宿主 session.queue 事件，契约 §5.2）。 */
+  private queueCache: Map<string, DshrcQueueItem[]> = new Map<string, DshrcQueueItem[]>();
   private chatSeq: number = 0;
   /** 在途刷新（并发刷新合并到同一个 Promise，v1.0.6：不再直接 resolve 假装已刷新）。 */
   private pendingRefresh: Promise<SessionRefreshResult> | null = null;
@@ -441,6 +454,7 @@ export class SessionStore {
       this.capabilitiesLoaded = false;
       this.sessionModel = null;
       this.modelCache.clear();
+      this.queueCache.clear(); // v1.1.1：断开后不留上一台主机的待执行消息
     }
     if (s === 'error') {
       this.lastError = '连接错误（详见链路日志）';
@@ -598,6 +612,44 @@ export class SessionStore {
   runningOf(sid: string): boolean {
     const row: SessionRow | undefined = this.findRow(sid);
     return row !== undefined && row.running;
+  }
+
+  // ---- 待执行消息（契约 §5.2 v1.1.1 session.queue）----
+
+  /**
+   * 某会话的待执行消息（宿主 session.queue 事件；**只做展示，不做猜测**）。
+   * 没有事件过 / 宿主说 items 为空 → 返回空数组（页面据此隐藏该区，不留空白占位）。
+   */
+  queueItems(sid: string): DshrcQueueItem[] {
+    const items: DshrcQueueItem[] | undefined = this.queueCache.get(sid);
+    if (items === undefined) {
+      return [];
+    }
+    return items.slice();
+  }
+
+  /**
+   * session.queue 事件落地：整体覆盖该会话的待执行消息（宿主给的是**全量快照**，
+   * 不做增量猜测），并自增 queueVersion 驱动页面刷新。
+   */
+  private applyQueueSnapshot(sid: string, raw: DshrcQueueItem[] | undefined): void {
+    if (sid.length === 0) {
+      return;
+    }
+    const items: DshrcQueueItem[] = [];
+    if (raw !== undefined) {
+      for (let i: number = 0; i < raw.length; i++) {
+        const src: DshrcQueueItem = raw[i];
+        const item: DshrcQueueItem = {
+          itemId: src.itemId !== undefined ? src.itemId : '',
+          text: src.text !== undefined ? src.text : '',
+          target: src.target !== undefined ? src.target : 'next-turn'
+        };
+        items.push(item);
+      }
+    }
+    this.queueCache.set(sid, items);
+    this.queueVersion = this.queueVersion + 1;
   }
 
   /** 待处理的审批 + 提问总数（列表页角标）。 */
@@ -879,6 +931,10 @@ export class SessionStore {
         this.textCoveredByPage(messages, it)) {
         continue; // 直播副本已被 durable 历史覆盖，同一句话不显示两遍
       }
+      if (!prepend && it.isMessage() && it.text.length === 0 && it.images.length > 0 &&
+        this.imagesCoveredByPage(messages, it)) {
+        continue; // v1.1.1：直播的独立图片消息（交付物，正文为空）已被本页 durable 副本覆盖 → 不重复显示
+      }
       if (!prepend && it.isStep() && this.stepCoveredByPage(steps, it)) {
         continue; // 直播步骤已被本页持久步骤覆盖
       }
@@ -959,6 +1015,35 @@ export class SessionStore {
       }
     }
     return false;
+  }
+
+  /**
+   * 直播图片消息是否已被本页 durable 历史覆盖（**所有**图片都能在历史里找到才算覆盖）。
+   * 场景（契约 §5.10.2 v1.1.1）：交付物图片直播时是一条独立图片消息，
+   * 插件在 session.history 里也会把它作为独立历史消息返回 →
+   * 历史刷新后直播副本与 durable 副本重复，这里摘掉直播副本，只留一条。
+   */
+  private imagesCoveredByPage(messages: DshrcChatMessage[], it: TimelineItem): boolean {
+    for (let i: number = 0; i < it.images.length; i++) {
+      const imgId: string = it.images[i].imageId;
+      let found: boolean = false;
+      for (let j: number = 0; j < messages.length && !found; j++) {
+        const imgs: DshrcImageRef[] | undefined = messages[j].images;
+        if (imgs === undefined) {
+          continue;
+        }
+        for (let k: number = 0; k < imgs.length; k++) {
+          if (imgs[k].imageId === imgId) {
+            found = true;
+            break;
+          }
+        }
+      }
+      if (!found) {
+        return false;
+      }
+    }
+    return true;
   }
 
   /** 本地乐观追加一条用户消息（发送即上屏）。 */
@@ -1111,25 +1196,35 @@ export class SessionStore {
   // ---- 图片（契约 §5.10 v1.0.9）----
 
   /**
-   * assistant.image 事件（契约 §5.10 v1.0.9）：图片挂到**该会话当前正在流式的
-   * assistant 消息**上；没有正在流式的 assistant 消息时，按到达顺序**单独成一条
-   * 图片消息**（kind='message'、role='assistant'、text 为空串、images 带这一张）。
-   * 同一 imageId 重复到达时幂等（不重复挂）。
+   * assistant.image 事件（契约 §5.10 v1.0.9 + §5.10.2 v1.1.1）：
+   *  - **附件图片**（无 source / source='attachment'）：挂到该会话当前正在流式的
+   *    assistant 消息上；没有正在流式的 assistant 消息时，按到达顺序**单独成一条
+   *    图片消息**（kind='message'、role='assistant'、text 为空串、images 带这一张）。
+   *  - **交付物图片**（source='deliverable'，present 投递的文件）：**必须单独成一条**
+   *    图片消息，**不挂**到流式 assistant 消息上——挂上去会在 turn 结束的历史刷新里
+   *    被宿主的持久副本替换（副本里没有交付物图）→ 图片「一闪而过然后消失」。
+   * 同一 imageId 重复到达时幂等（不重复挂、不重复成条）。
    */
   private appendImage(sid: string, image: DshrcImageRef): void {
     if (sid.length === 0 || image.imageId.length === 0) {
       return;
     }
     const items: TimelineItem[] = this.cacheOf(sid);
-    for (let i: number = items.length - 1; i >= 0; i--) {
-      const it: TimelineItem = items[i];
-      if (it.isMessage() && it.role === 'assistant' && it.streaming) {
-        if (!this.hasImage(it, image.imageId)) {
-          it.images = it.images.concat([image]);
+    const isDeliverable: boolean = image.source !== undefined && image.source === 'deliverable';
+    if (!isDeliverable) {
+      for (let i: number = items.length - 1; i >= 0; i--) {
+        const it: TimelineItem = items[i];
+        if (it.isMessage() && it.role === 'assistant' && it.streaming) {
+          if (!this.hasImage(it, image.imageId)) {
+            it.images = it.images.concat([image]);
+          }
+          this.notifyActive(sid);
+          return;
         }
-        this.notifyActive(sid);
-        return;
       }
+    } else if (this.hasImageInItems(items, image.imageId)) {
+      // 幂等：同一交付物图片重复到达 → 不再单独成一条
+      return;
     }
     this.chatSeq = this.chatSeq + 1;
     const mi: TimelineItem = new TimelineItem('p' + this.chatSeq.toString(), 'message', Date.now());
@@ -1144,6 +1239,16 @@ export class SessionStore {
   private hasImage(it: TimelineItem, imageId: string): boolean {
     for (let i: number = 0; i < it.images.length; i++) {
       if (it.images[i].imageId === imageId) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** 会话里是否已经出现过这张图（交付物图片幂等判定；跨消息查）。 */
+  private hasImageInItems(items: TimelineItem[], imageId: string): boolean {
+    for (let i: number = 0; i < items.length; i++) {
+      if (this.hasImage(items[i], imageId)) {
         return true;
       }
     }
@@ -1236,6 +1341,7 @@ export class SessionStore {
       if (!alive.has(keys[j])) {
         this.cache.delete(keys[j]);
         this.histMeta.delete(keys[j]);
+        this.queueCache.delete(keys[j]); // v1.1.1：会话没了，它的待执行消息也没了
       }
     }
     if (this.activeId.length > 0 && !alive.has(this.activeId)) {
@@ -1467,6 +1573,12 @@ export class SessionStore {
             this.sessionModel = sel;
           }
         }
+        break;
+      }
+      case TOPIC_SESSION_QUEUE: {
+        // 契约 §5.2 v1.1.1：待执行消息全量快照（排队中 / 已插入当前 turn）——只展示，不猜测
+        const sidQ: string = data.sessionId !== undefined ? data.sessionId : '';
+        this.applyQueueSnapshot(sidQ, data.items);
         break;
       }
       case TOPIC_ASSISTANT_DELTA: {

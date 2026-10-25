@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <!-- DSH Pocket v7-A: line-art phone + family line-art whale -->
+  <defs>
+    <linearGradient id="gA" x1="2" y1="2" x2="46" y2="46" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#4D6BFE"/>
+      <stop offset="1" stop-color="#00B8A9"/>
+    </linearGradient>
+  </defs>
+  <rect x="2" y="2" width="44" height="44" rx="11" fill="url(#gA)"/>
+  <rect x="11" y="7" width="26" height="34" rx="5" fill="url(#gA)" stroke="#fff" stroke-width="2.8"/>
+  <path d="M20.5 37.6 H27.5" fill="none" stroke="#fff" stroke-opacity=".55" stroke-width="1.8" stroke-linecap="round"/>
+  <g transform="translate(6.81,8.38) scale(0.6250)">
+    <path d="M11.5 27.5 C11.5 21.5 18 17.5 26 17.5 C33 17.5 37 21 37 25.5 C37 30 32 32.5 25 32.5 C18.5 32.5 11.5 31.5 11.5 27.5 Z" fill="none" stroke="#fff" stroke-width="2.8" stroke-linejoin="round"/>
+    <path d="M37 25.2 L43.5 20 L41.5 25.4 L43.5 30.6 Z" fill="none" stroke="#fff" stroke-width="2.8" stroke-linejoin="round"/>
+    <circle cx="17.75" cy="23.69" r="1.4" fill="#fff"/>
+  </g>
+  <path d="M10 39.5 q3.5 -2.6 7 0 t7 0 t7 0 t7 0" fill="none" stroke="#fff" stroke-opacity=".5" stroke-width="1.6" stroke-linecap="round"/>
+</svg>

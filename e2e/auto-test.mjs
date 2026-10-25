@@ -13,16 +13,31 @@
 //
 // 用法: node auto-test.mjs [relayUrl]   （默认取插件配置的 relayUrl，再退到 ws://127.0.0.1:8787）
 //       E2E_LOOPBACK_ONLY=1 node auto-test.mjs   （只跑回环用例，手机在线也安全）
-import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { readFileSync, unlinkSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { RelayLink, createLoopbackPair } from "./link.mjs";
 import { createMockHost } from "./mock-host.mjs";
+import {
+  assertKat,
+  deriveKey,
+  makeProof,
+  verifyProof,
+  seal,
+  open,
+  EpochStore,
+  PROOF_VERSION,
+} from "./protocol.mjs";
+
+const HERE = fileURLToPath(new URL(".", import.meta.url));
+const RELAY_SERVER = join(HERE, "..", "relay", "server.js");
 
 /** 只跑回环用例（手机在线时用；不碰真实 channel / 真实中继）。 */
 const loopbackOnly = process.env.E2E_LOOPBACK_ONLY === "1";
 
-let cfg = { channel: "", secret: "", relayUrl: "" };
+let cfg = { channel: "", secret: "", relayUrl: "", relayToken: "" };
 if (!loopbackOnly) {
   cfg = JSON.parse(
     readFileSync(join(process.env.DSH_HOME ?? join(homedir(), ".dsh"), "remote-control", "config.json"), "utf8"),
@@ -54,6 +69,8 @@ if (!loopbackOnly) {
     channel,
     secret,
     role: "client",
+    // 中继自身鉴权（契约 §4 RELAY_TOKEN）：配置后 hello 必须带 token
+    token: cfg.relayToken || undefined,
     onStatus: (s) => {
       console.log("[status]", s);
       if (s === "ready") clearTimeout(t0);
@@ -310,10 +327,232 @@ async function v106LiveProbe() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// v1.1.3 用例（契约 §3.4.1 会话纪元 / §7 AAD 绑定 sid / §4 证明透传）
+// ---------------------------------------------------------------------------
+
+/**
+ * v1.1.3 自测链路（恒跑，不依赖真实中继/真实宿主）：
+ *   ① 证明 v2 自洽 + 验签（改一个字节即验签失败）
+ *   ② 加固模式往返（LoopbackLink 双端 pv>=2 → AAD 绑定 sid）
+ *   ③ 换 sid 解密必须失败（契约 §7 ③）
+ *   ④ 纪元回退必须被拒 + 同一证明重复幂等接受（契约 §7 ④）
+ *   ⑤ 收到的帧 sid 与钉扎值不符必须丢弃（契约 §7 ⑤）
+ *   ⑥ 纪元持久化：重启（新建 store）后继续递增
+ */
+async function v113ProofCase() {
+  console.log("");
+  console.log("--- v1.1.3 session-epoch / hardened-mode case (loopback) ---");
+  const channel = "E2EPROOFCANAL2345";
+  const secret = "e2e-v113-session-epoch-secret-0123456789";
+  const key = deriveKey(secret, channel);
+
+  // ① 证明 v2 自洽 + 验签
+  const proof = makeProof(key, "host", channel, { e: 3, ts: 1760000000123, pv: PROOF_VERSION, sid: "a1b2c3d4" });
+  check("证明 v2 字段齐全", proof.e === 3 && proof.ts === 1760000000123 && proof.pv === 2 && proof.sid === "a1b2c3d4" && typeof proof.sig === "string", JSON.stringify(proof));
+  check("证明 v2 验签通过", verifyProof(key, "host", channel, proof) === true);
+  check("证明 v2 换 role 验签失败", verifyProof(key, "client", channel, proof) === false);
+  check("证明 v2 篡改 e 后验签失败", verifyProof(key, "host", channel, { ...proof, e: 4 }) === false);
+  check("证明 v2 篡改 sid 后验签失败", verifyProof(key, "host", channel, { ...proof, sid: "ffffffff" }) === false);
+
+  // ③ 换 sid 解密必须失败（加固 AAD = "dshrc|role|seq|sid"）
+  const hardData = seal(key, "host", 7, { hello: "v113" }, undefined, "a1b2c3d4");
+  check("加固模式往返（同一 sid 可解密）", open(key, "host", 7, hardData, "a1b2c3d4").hello === "v113");
+  let sidSwapFailed = false;
+  try {
+    open(key, "host", 7, hardData, "ffffffff");
+  } catch {
+    sidSwapFailed = true;
+  }
+  check("换 sid 解密必须失败（契约 §7 ③）", sidSwapFailed === true);
+
+  // ② 加固模式往返（两端都 pv>=2 → 加固）
+  const seenHost = [];
+  const seenClient = [];
+  const { host, client } = createLoopbackPair({
+    channel,
+    secret,
+    onHostMessage: (m) => seenHost.push(m),
+    onClientMessage: (m) => seenClient.push(m),
+  });
+  check("回环两端都进入加固模式", host.mode === "hardened" && client.mode === "hardened", host.mode + "/" + client.mode);
+  check("回环两端互钉对方 sid", host.peerSid === client.sid && client.peerSid === host.sid, host.peerSid + "/" + client.sid);
+  client.send({ id: "x1", type: "ping", ts: Date.now(), payload: { n: 1 } });
+  await new Promise((r) => setTimeout(r, 50));
+  check("加固模式业务帧往返成功", seenHost.length === 1 && seenHost[0]?.payload?.n === 1, JSON.stringify(seenHost));
+
+  // ⑤ 收到的帧 sid 与钉扎值不符 → 丢弃
+  let delivered = null;
+  client.opts.onMessage = (m) => {
+    delivered = m;
+  };
+  const badSeq = 900;
+  const badData = seal(key, "host", badSeq, { hello: "mismatch" }, undefined, host.sid);
+  client._deliver(badData, badSeq, "host", "ffffffff");
+  check("sid 不匹配的帧被丢弃（契约 §7 ⑤）", delivered === null, JSON.stringify(delivered));
+  client._deliver(badData, badSeq, "host", host.sid);
+  check("sid 匹配的帧正常解出", delivered !== null && delivered.hello === "mismatch", JSON.stringify(delivered));
+
+  // ④ 纪元回退被拒 + 同一证明重复幂等接受
+  const store = new EpochStore(null);
+  const p5 = makeProof(key, "client", channel, { e: 5, ts: 1000, pv: 2, sid: "11111111" });
+  const p4 = makeProof(key, "client", channel, { e: 4, ts: 2000, pv: 2, sid: "22222222" });
+  const acc1 = store.acceptPeer("host", p5);
+  check("对端纪元首次接受", acc1.ok === true && acc1.duplicate === false, JSON.stringify(acc1));
+  const acc2 = store.acceptPeer("host", p5);
+  check("同一证明重复出现 → 幂等接受", acc2.ok === true && acc2.duplicate === true, JSON.stringify(acc2));
+  const acc3 = store.acceptPeer("host", p4);
+  check("纪元回退（e 更小）→ 拒绝", acc3.ok === false && acc3.reason === "epoch-regression", JSON.stringify(acc3));
+  const p5bis = makeProof(key, "client", channel, { e: 5, ts: 1000, pv: 2, sid: "33333333" });
+  const acc4 = store.acceptPeer("host", p5bis);
+  check("同纪元但 sid 不同（疑似重放）→ 拒绝", acc4.ok === false && acc4.reason === "epoch-regression", JSON.stringify(acc4));
+
+  // ④b 链路层：纪元回退 → **拒绝连接**（不是只丢帧）
+  const storeA = new EpochStore(null);
+  const storeB = new EpochStore(null);
+  // client 侧先接受过一个「纪元 10」的对端证明
+  const highProof = makeProof(key, "host", channel, { e: 10, ts: 1, pv: 2, sid: "aaaaaaaa" });
+  storeB.acceptPeer("host", highProof);
+  let rejectedStatus = "";
+  const { host: h2, client: c2 } = createLoopbackPair({
+    channel,
+    secret,
+    hostEpochStore: storeA,
+    clientEpochStore: storeB,
+    onStatus: (s) => {
+      if (String(s).includes("epoch")) rejectedStatus = String(s);
+    },
+  });
+  check("链路层纪元回退 → 拒绝连接", c2.closed === true && rejectedStatus.includes("epoch"), `closed=${c2.closed} status=${rejectedStatus}`);
+  h2.close();
+  c2.close();
+
+  // ⑥ 纪元持久化：换一个 store（模拟进程重启）后继续递增
+  const epochFile = join(tmpdir(), `dshrc-e2e-kat-epoch-${process.pid}.json`);
+  const s1 = new EpochStore(epochFile);
+  const e1 = s1.next();
+  const s2 = new EpochStore(epochFile); // 模拟重启
+  const e2 = s2.next();
+  check("纪元持久化：重启后继续递增", e2 === e1 + 1, `${e1} → ${e2}`);
+  try {
+    unlinkSync(epochFile);
+  } catch {
+    /* ignore */
+  }
+
+  host.close();
+  client.close();
+  console.log("v1.1.3 loopback case: PASS");
+}
+
+/**
+ * v1.1.3 中继侧用例（真实 relay 进程，临时端口 / 临时 channel，不碰真实链路）：
+ *   - welcome.peer / peer-joined.peer **逐字**复制对端证明
+ *   - 中继**不校验 sig**（错的 sig 也能连上）
+ *   - 双方 pv>=2 → 加固模式，业务帧经真实中继往返成功
+ */
+async function v113RelayCase() {
+  console.log("");
+  console.log("--- v1.1.3 relay proof-passthrough case (real relay, temp port) ---");
+  const channel = "E2EPROOFCANAL2345";
+  const secret = "e2e-v113-relay-secret-0123456789";
+  const key = deriveKey(secret, channel);
+
+  // 起一个临时中继（PORT=0 → 内核分配端口）
+  const child = spawn(process.execPath, [RELAY_SERVER], {
+    cwd: join(HERE, "..", "relay"),
+    env: { ...process.env, PORT: "0", LOG_LEVEL: "error" },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let out = "";
+  child.stdout.on("data", (d) => (out += d.toString()));
+  child.stderr.on("data", (d) => (out += d.toString()));
+  const port = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("relay start timeout: " + out)), 5000);
+    child.stdout.on("data", () => {
+      const m = out.match(/relay listening port=(\d+)/);
+      if (m) {
+        clearTimeout(timer);
+        resolve(Number(m[1]));
+      }
+    });
+    child.once("exit", (code) => {
+      clearTimeout(timer);
+      reject(new Error("relay exited early: code=" + code + " " + out));
+    });
+  });
+  const relayUrl = `ws://127.0.0.1:${port}`;
+
+  try {
+    const hostGot = [];
+    const clientGot = [];
+    const hostLink = new RelayLink({
+      relayUrl,
+      channel,
+      secret,
+      role: "host",
+      epochFile: join(tmpdir(), `dshrc-e2e-v113-relay-epoch-host-${process.pid}.json`),
+      onStatus: () => {},
+      onMessage: (m) => hostGot.push(m),
+    });
+    await waitUntil(() => hostLink.proof !== null, 3000);
+    await waitUntil(() => hostLink.peerProof !== null || hostLink.mode !== "compat", 3000);
+    // host 先上线：对端不在线 → welcome 不带 peer
+    check("中继：对端不在线时 welcome 不带 peer", hostLink.peerProof === null, JSON.stringify(hostLink.peerProof));
+
+    const clientLink = new RelayLink({
+      relayUrl,
+      channel,
+      secret,
+      role: "client",
+      epochFile: join(tmpdir(), `dshrc-e2e-v113-relay-epoch-client-${process.pid}.json`),
+      onStatus: () => {},
+      onMessage: (m) => clientGot.push(m),
+    });
+    await waitUntil(() => clientLink.peerProof !== null, 5000);
+    await waitUntil(() => hostLink.peerProof !== null, 5000);
+
+    // 证明逐字一致（e/ts/pv/sid/sig 全等）
+    const cp = clientLink.peerProof;
+    const hp = hostLink.peerProof;
+    check("welcome.peer 逐字复制对端证明", cp.role === "host" && cp.e === hostLink.proof.e && cp.ts === hostLink.proof.ts && cp.pv === hostLink.proof.pv && cp.sid === hostLink.proof.sid && cp.sig === hostLink.proof.sig, JSON.stringify(cp));
+    check("peer-joined.peer 逐字复制新上线方证明", hp.role === "client" && hp.e === clientLink.proof.e && hp.ts === clientLink.proof.ts && hp.pv === clientLink.proof.pv && hp.sid === clientLink.proof.sid && hp.sig === clientLink.proof.sig, JSON.stringify(hp));
+    check("对端证明验签通过", verifyProof(key, "host", channel, cp) === true && verifyProof(key, "client", channel, hp) === true);
+    check("双方 pv>=2 → 加固模式", clientLink.mode === "hardened" && hostLink.mode === "hardened", clientLink.mode + "/" + hostLink.mode);
+
+    // 经真实中继的业务帧往返（加固 AAD）
+    clientLink.send({ id: "r1", type: "ping", ts: Date.now(), payload: { via: "relay" } });
+    await waitUntil(() => hostGot.length > 0, 3000);
+    check("经真实中继的业务帧往返成功（加固 AAD）", hostGot.length === 1 && hostGot[0]?.payload?.via === "relay", JSON.stringify(hostGot));
+
+    hostLink.close();
+    clientLink.close();
+  } finally {
+    try {
+      child.kill("SIGTERM");
+    } catch {
+      /* ignore */
+    }
+  }
+  console.log("v1.1.3 relay case: PASS");
+}
+
+/** 等条件成立（最多 timeoutMs） */
+async function waitUntil(pred, timeoutMs) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < timeoutMs) {
+    if (pred()) return true;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  return false;
+}
+
 try {
   if (loopbackOnly) {
     // 只跑回环用例：手机在线也安全（不连真实中继、不占真实 channel）
     await v106LoopbackCase();
+    await v113ProofCase();
+    await v113RelayCase();
     console.log("E2E RESULT: PASS (loopback only)");
     done = true;
     process.exit(0);
@@ -355,6 +594,8 @@ try {
 
   // 5. v1.0.6+ 新链路：自测回环（恒跑）+ 真实宿主探针（尽力而为）
   await v106LoopbackCase();
+  await v113ProofCase();
+  await v113RelayCase();
   await v106LiveProbe();
 
   console.log("event counts:", JSON.stringify([...events]));

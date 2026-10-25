@@ -2,7 +2,7 @@
 // ⚠️ 自动生成，请勿手改 —— 源文件：../relay/server.js
 // 生成方式：node scripts/vendor-relay.mjs
 // 改动源文件后必须重新生成（门禁 scripts/verify-relay-supervisor.mjs 会校验同步）。
-// source-sha256:1da46fe7df57962b
+// source-sha256:bfab1839b8d109ce
 /**
  * dsh-remote-control-relay —— 公网 WebSocket 中继服务器（哑管道）
  *
@@ -24,10 +24,22 @@
  *   RELAY_CACHE_LIMIT       离线缓存条数上限（默认 256，契约值）
  *   RELAY_CACHE_TTL_MS      离线缓存 TTL（默认 86400000 = 24h，契约值）
  *   RELAY_MAX_PAYLOAD       单帧最大字节（默认 1048576 = 1MiB）
+ *   RELAY_TLS_CERT          可选；PEM 证书链**文件路径**（与 RELAY_TLS_KEY 同时设置才生效）
+ *   RELAY_TLS_KEY           可选；PEM 私钥**文件路径**（与 RELAY_TLS_CERT 同时设置才生效）
+ *
+ * 监听地址：**IPv4/IPv6 双栈**（默认绑定 '::'，Node 默认 ipv6Only=false）——
+ * 同一端口同时接受 ws://<IPv4>:port 与 ws://[<IPv6>]:port；
+ * 系统禁用 IPv6 时自动回落到 '0.0.0.0'（仅 IPv4，旧版行为）。
+ *
+ * TLS（契约 §3.4.2）：两个 TLS 环境变量都配置 → 以 **wss://**（HTTPS）提供服务；
+ * 都没配置 → 维持明文 ws://（默认行为不变）。
+ * 证书/私钥**读不到或非法 → 启动即失败**（绝不静默降级成明文）。
  */
 
 import { WebSocketServer, WebSocket } from 'ws';
 import { pathToFileURL } from 'node:url';
+import { readFileSync } from 'node:fs';
+import { createServer as createHttpsServer } from 'node:https';
 
 // ---------------------------------------------------------------------------
 // 常量（契约 §4）
@@ -49,6 +61,11 @@ const DEFAULTS = {
   cacheLimit: 256, // 离线缓存 256 条
   cacheTtlMs: 24 * 3600 * 1000, // 24h
   maxPayload: 1024 * 1024, // 1MiB（密文帧一般很小；防御性上限）
+  /**
+   * 监听地址候选（按顺序尝试）：'::' = IPv6/IPv4 双栈；'0.0.0.0' = 仅 IPv4 回落。
+   * 仅 IPv6 不可用（EAFNOSUPPORT/EADDRNOTAVAIL/…）时才自动回落到下一个候选。
+   */
+  listenHosts: ['::', '0.0.0.0'],
 };
 
 // ---------------------------------------------------------------------------
@@ -88,6 +105,39 @@ function portFromEnv(env) {
   return Number.isFinite(n) && n >= 0 ? Math.floor(n) : DEFAULTS.port;
 }
 
+/**
+ * TLS 配置（契约 §3.4.2）：RELAY_TLS_CERT / RELAY_TLS_KEY 是 **PEM 文件路径**。
+ *
+ * 返回 null = 不启用 TLS（默认，明文 ws://）。
+ * 抛错 = 配置有问题（只配了一个 / 文件读不到）——**启动即失败，不静默降级**。
+ */
+export function loadTlsConfig(env = process.env) {
+  const rawCert = typeof env.RELAY_TLS_CERT === 'string' ? env.RELAY_TLS_CERT.trim() : '';
+  const rawKey = typeof env.RELAY_TLS_KEY === 'string' ? env.RELAY_TLS_KEY.trim() : '';
+  if (rawCert === '' && rawKey === '') return null; // 默认：明文
+  if (rawCert === '' || rawKey === '') {
+    const missing = rawCert === '' ? 'RELAY_TLS_CERT' : 'RELAY_TLS_KEY';
+    const present = rawCert === '' ? 'RELAY_TLS_KEY' : 'RELAY_TLS_CERT';
+    throw new Error(
+      `TLS 配置不完整：${present} 已设置但 ${missing} 缺失。` +
+        '两个变量必须同时指向 PEM 文件（契约 §3.4.2）；如需明文 ws:// 请把两者都清空。',
+    );
+  }
+  let cert;
+  let key;
+  try {
+    cert = readFileSync(rawCert);
+  } catch (err) {
+    throw new Error(`读取 RELAY_TLS_CERT 失败（${rawCert}）：${err && err.message ? err.message : String(err)}`);
+  }
+  try {
+    key = readFileSync(rawKey);
+  } catch (err) {
+    throw new Error(`读取 RELAY_TLS_KEY 失败（${rawKey}）：${err && err.message ? err.message : String(err)}`);
+  }
+  return { cert, key, certPath: rawCert, keyPath: rawKey };
+}
+
 /** 从环境变量读配置（测试可直接传对象覆盖） */
 export function loadConfig(env = process.env) {
   return {
@@ -102,10 +152,58 @@ export function loadConfig(env = process.env) {
     cacheLimit: intFromEnv(env, 'RELAY_CACHE_LIMIT', DEFAULTS.cacheLimit),
     cacheTtlMs: intFromEnv(env, 'RELAY_CACHE_TTL_MS', DEFAULTS.cacheTtlMs),
     maxPayload: intFromEnv(env, 'RELAY_MAX_PAYLOAD', DEFAULTS.maxPayload),
+    listenHosts: [...DEFAULTS.listenHosts],
+    /** TLS 配置：null = 明文 ws://；{cert,key} = wss://（契约 §3.4.2） */
+    tls: loadTlsConfig(env),
   };
 }
 
 const otherRole = (role) => (role === 'host' ? 'client' : 'host');
+
+/**
+ * 握手证明字段（契约 §3.4.1）：`e`（纪元）/ `ts` / `pv`（协议版本）/ `sid` / `sig`。
+ *
+ * 中继是**哑管道**：它没有密钥，**不校验 sig、不改数值、不补默认值、不重排**——
+ * 只把对端 hello 里**出现的**字段逐字复制到 welcome.peer / peer-joined.peer。
+ * 旧端（v1.1.2 及以前）不带 e/ts/pv/sid → 复制结果里也就没有这些字段。
+ */
+const PROOF_FIELDS = ['e', 'ts', 'pv', 'sid', 'sig'];
+
+/** 逐字抽取对端 hello 里的证明字段（只取存在的；值原样保留，不做类型转换） */
+export function extractProof(msg) {
+  const proof = {};
+  if (!msg || typeof msg !== 'object') return proof;
+  for (const f of PROOF_FIELDS) {
+    if (msg[f] !== undefined) proof[f] = msg[f];
+  }
+  return proof;
+}
+
+/** 组成发往对端的 peer 证明对象：role + 对端 hello 里的证明字段（原样） */
+export function peerProofOf(role, proof) {
+  return { role, ...(proof ?? {}) };
+}
+
+/**
+ * 监听地址候选见 DEFAULTS.listenHosts：
+ *   '::'        —— IPv6 通配地址。Node 默认 ipv6Only=false → **一次绑定同时接收
+ *                  IPv6 与 IPv4**（IPv4 以 ::ffff:a.b.c.d 映射形式进来）。
+ *   '0.0.0.0'   —— 回落：系统禁用 IPv6 时保持旧版（仅 IPv4）行为。
+ */
+
+/** 只有「IPv6 不可用」这类错误才允许回落 IPv4；端口占用等错误照旧直接抛出 */
+const IPV6_UNAVAILABLE_CODES = new Set(['EAFNOSUPPORT', 'EADDRNOTAVAIL', 'EINVAL', 'EPROTONOSUPPORT']);
+
+/**
+ * 双栈下 IPv4 连接的对端地址形如 '::ffff:127.0.0.1'，
+ * 归一为 '127.0.0.1' —— 限速分桶与日志与旧版（IPv4-only 监听）保持一致，
+ * 纯 IPv6 地址（::1 等）原样保留。
+ */
+function normalizeIp(addr) {
+  if (typeof addr !== 'string' || addr === '') return 'unknown';
+  const m = addr.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i);
+  return m ? m[1] : addr;
+}
 
 // ---------------------------------------------------------------------------
 // 中继核心
@@ -247,6 +345,8 @@ export function createRelay(overrides = {}) {
     conn.helloDone = true;
     conn.role = role;
     conn.ch = ch;
+    // v1.1.3：原样留存对端 hello 的证明字段（只复制，不校验——中继无密钥）
+    conn.proof = extractProof(msg);
 
     const channel = getChannel(ch);
     // 同 channel 同 role 单活跃连接：新顶旧
@@ -264,15 +364,24 @@ export function createRelay(overrides = {}) {
       old.ch = null; // 防止它的 close 清理逻辑误删新连接 / 误发 peer-left（detachFromChannel 幂等跳过）
     }
 
-    sendJson(conn, {
+    // v1.1.3：welcome.peer = 对端**已在线**时，把对端 hello 的证明逐字复制过来；
+    // 对端不在线 → 不带 peer 字段（不补默认值）。
+    const peerRole = otherRole(role);
+    const peerConn = channel.conns[peerRole];
+    const welcome = {
       t: 'welcome',
       peers: { host: channel.conns.host !== null, client: channel.conns.client !== null },
-    });
+    };
+    if (peerConn) welcome.peer = peerProofOf(peerRole, peerConn.proof);
+    sendJson(conn, welcome);
 
-    // 仅在该 role 真正「新上线」时通知对端；顶替场景对端视角无变化，不发 peer-joined
-    if (!old) {
-      const peerConn = channel.conns[otherRole(role)];
-      if (peerConn) sendJson(peerConn, { t: 'peer-joined', role });
+    // v1.1.3：**顶替场景也要通知对端**（v1.1.2 时顶替对对端无影响，因为 sid 只用于
+    // 去重分桶；加固模式下对端**钉扎**了对端的 sid/纪元，顶替换了新连接（sid 与纪元
+    // 都变）→ 对端必须重新钉扎，否则新连接的帧全被当成「sid 不符」丢弃 → 链路死到
+    // 双方重连为止）。故这里**无条件**给在线的对端发 peer-joined（带新证明）。
+    // （peer-joined.peer = 新上线方自己的证明；顶替时是「新顶替者」的证明。）
+    if (peerConn) {
+      sendJson(peerConn, { t: 'peer-joined', role, peer: peerProofOf(role, conn.proof) });
     }
 
     flushCache(channel, role, conn);
@@ -370,7 +479,7 @@ export function createRelay(overrides = {}) {
   }
 
   function onConnection(ws, req) {
-    const ip = (req.socket && req.socket.remoteAddress) || 'unknown';
+    const ip = normalizeIp(req.socket && req.socket.remoteAddress);
     const conn = {
       ws,
       ip,
@@ -380,6 +489,8 @@ export function createRelay(overrides = {}) {
       lastRecvAt: Date.now(),
       lastSentAt: Date.now(),
       helloTimer: null,
+      /** v1.1.3：本连接 hello 里的证明字段（原样留存，供对端读取） */
+      proof: {},
     };
     conns.add(conn);
     log.info('connection open', { ip, conns: conns.size });
@@ -455,20 +566,96 @@ export function createRelay(overrides = {}) {
 
   // ---- 启停 -----------------------------------------------------------------
   let wss = null;
-  function start() {
-    wss = new WebSocketServer({ port: cfg.port, host: '0.0.0.0', maxPayload: cfg.maxPayload });
-    wss.on('connection', onConnection);
-    wss.on('error', (err) => log.error('server error', { err: String(err && err.message) }));
+  /** TLS 模式下由我们创建的 https server（明文模式为 null） */
+  let httpServer = null;
+  /** 实际生效的监听地址（'::' = 双栈，'0.0.0.0' = 仅 IPv4） */
+  let listenHost = null;
+
+  /**
+   * 在指定 host 上监听一次；成功 resolve {wss, httpServer}，失败 reject(error)。
+   * 失败时把 server 关掉，避免残留半开句柄。
+   *
+   * TLS 模式（契约 §3.4.2）：RELAY_TLS_CERT + RELAY_TLS_KEY 都配置时，
+   * 用 node:https 起 HTTPS 服务并把 upgrade 交给 ws —— 对外即 **wss://**。
+   * 证书/私钥非法 → createHttpsServer 直接抛错 → 启动失败（不降级明文）。
+   */
+  function listenOnce(host) {
     return new Promise((resolve, reject) => {
-      wss.once('listening', () => {
-        const addr = wss.address();
-        // 机器可读启动行（测试脚本依赖此行解析实际端口）
-        console.log(`relay listening port=${addr.port}`);
-        log.info('relay started', { port: addr.port, tokenRequired: cfg.token !== null });
-        resolve(addr.port);
+      let srv = null;
+      let server = null;
+      try {
+        if (cfg.tls) {
+          server = createHttpsServer({ cert: cfg.tls.cert, key: cfg.tls.key });
+          srv = new WebSocketServer({ server, maxPayload: cfg.maxPayload });
+        } else {
+          srv = new WebSocketServer({ port: cfg.port, host, maxPayload: cfg.maxPayload });
+        }
+      } catch (err) {
+        reject(
+          cfg.tls
+            ? new Error(
+                `TLS 证书/私钥非法（${cfg.tls.certPath} / ${cfg.tls.keyPath}）：${err && err.message ? err.message : String(err)}`,
+              )
+            : err,
+        );
+        return;
+      }
+      const target = server ?? srv; // 错误/监听事件来自底层 server
+      // 常驻的兜底 error 监听：避免 close 过程中的二次 error 变成 unhandled 'error'
+      target.on('error', () => {});
+      const onError = (err) => {
+        try {
+          srv.close(() => {});
+        } catch {
+          /* ignore */
+        }
+        try {
+          server?.close(() => {});
+        } catch {
+          /* ignore */
+        }
+        reject(err);
+      };
+      target.once('error', onError);
+      target.once('listening', () => {
+        target.off('error', onError);
+        resolve({ wss: srv, httpServer: server });
       });
-      wss.once('error', reject);
+      if (server) server.listen(cfg.port, host);
     });
+  }
+
+  async function start() {
+    let lastErr = null;
+    const candidates = Array.isArray(cfg.listenHosts) && cfg.listenHosts.length ? cfg.listenHosts : DEFAULTS.listenHosts;
+    for (const host of candidates) {
+      let res;
+      try {
+        res = await listenOnce(host);
+      } catch (err) {
+        lastErr = err;
+        if (!IPV6_UNAVAILABLE_CODES.has(err && err.code)) throw err;
+        log.warn('ipv6 listen unavailable, falling back to ipv4-only', { err: String(err && err.message) });
+        continue;
+      }
+      wss = res.wss;
+      httpServer = res.httpServer;
+      listenHost = host;
+      wss.on('connection', onConnection);
+      wss.on('error', (err) => log.error('server error', { err: String(err && err.message) }));
+      const addr = (httpServer ?? wss).address();
+      // 机器可读启动行（测试脚本依赖此行解析实际端口）
+      console.log(`relay listening port=${addr.port}`);
+      log.info('relay started', {
+        port: addr.port,
+        host,
+        dualStack: host === '::',
+        tokenRequired: cfg.token !== null,
+        tls: cfg.tls !== null && cfg.tls !== undefined,
+      });
+      return addr.port;
+    }
+    throw lastErr;
   }
 
   function stop() {
@@ -486,11 +673,38 @@ export function createRelay(overrides = {}) {
     rateBuckets.clear();
     return new Promise((resolve) => {
       if (!wss) return resolve();
-      wss.close(() => resolve());
+      wss.close(() => {
+        // TLS 模式：https server 是我们自己起的，wss.close() 不会关它 → 显式关掉
+        if (httpServer) {
+          try {
+            httpServer.close(() => resolve());
+            return;
+          } catch {
+            /* ignore */
+          }
+        }
+        resolve();
+      });
     });
   }
 
-  return { cfg, log, channels, conns, rateBuckets, start, stop };
+  return {
+    cfg,
+    log,
+    channels,
+    conns,
+    rateBuckets,
+    start,
+    stop,
+    /** 实际生效的监听地址（start() 之后才有值） */
+    get listenHost() {
+      return listenHost;
+    },
+    /** 是否启用了原生 TLS（契约 §3.4.2） */
+    get tlsEnabled() {
+      return Boolean(cfg.tls);
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -498,11 +712,22 @@ export function createRelay(overrides = {}) {
 // ---------------------------------------------------------------------------
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (isMain) {
-  const relay = createRelay();
+  let relay;
+  try {
+    relay = createRelay();
+  } catch (err) {
+    // TLS 配置有问题（证书读不到 / 非法 / 只配了一个变量）→ 启动即失败，
+    // 绝不静默降级成明文 ws://
+    console.error(`dsh-remote-control-relay failed to start: ${err && err.message ? err.message : String(err)}`);
+    process.exit(1);
+  }
   relay
     .start()
     .then((port) => {
-      relay.log.info(`dsh-remote-control-relay listening on ws://0.0.0.0:${port} (pid ${process.pid})`);
+      const h = relay.listenHost === '0.0.0.0' ? '0.0.0.0' : '[::]';
+      const dual = relay.listenHost === '::' ? 'IPv4+IPv6 双栈' : '仅 IPv4';
+      const scheme = relay.tlsEnabled ? 'wss' : 'ws';
+      relay.log.info(`dsh-remote-control-relay listening on ${scheme}://${h}:${port} (${dual}) (pid ${process.pid})`);
     })
     .catch((err) => {
       relay.log.error('failed to start', { err: String(err && err.message) });

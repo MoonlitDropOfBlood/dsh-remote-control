@@ -222,6 +222,35 @@ const CLIENT_ICON_MASK_URI =
             create: createPassthrough,
           },
         },
+        {
+          // v1.1.3：中继门口的鉴权令牌（对应中继的 RELAY_TOKEN）。
+          // 令牌进 transport hello（明文可见），因此设置页**不回显明文**——
+          // 只回 relayTokenSet（是否已设置），输入框留空即清除。
+          id: "dsh-remote-control#remoteControl/setRelayToken",
+          service: "remoteControl",
+          namespace: "remoteControl",
+          method: "setRelayToken",
+          invocation: { kind: "direct" },
+          parameters: [
+            {
+              name: "token",
+              wire: "token",
+              source: "json",
+              codec: {
+                mode: "strict",
+                typeSymbol: "dsh-remote-control#remoteControl/setRelayToken:token",
+                schema: passthrough(),
+                create: createPassthrough,
+              },
+            },
+          ],
+          result: {
+            mode: "strict",
+            typeSymbol: "dsh-remote-control#PairingResult",
+            schema: passthrough(),
+            create: createPassthrough,
+          },
+        },
       ],
     };
 
@@ -333,6 +362,8 @@ const CLIENT_ICON_MASK_URI =
         const [saving, setSaving] = React.useState(false);
         // 中继地址输入框的草稿：null = 跟随宿主返回的值（没在编辑）
         const [relayDraft, setRelayDraft] = React.useState(null);
+        // v1.1.3：中继令牌草稿（null = 跟随宿主值；宿主只回 relayTokenSet，不回明文）
+        const [tokenDraft, setTokenDraft] = React.useState(null);
         // 宿主最近一次返回的中继地址：用来判断「宿主值真的变了」还是「只是轮询刷新」
         const lastHostUrl = React.useRef(null);
 
@@ -430,8 +461,41 @@ const CLIENT_ICON_MASK_URI =
           [remote, load],
         );
 
-        const run = React.useCallback(
-          async function (fn, okHint) {
+        // v1.1.3：保存中继令牌（留空 = 清除）。令牌进 transport hello → 必须重连链路。
+        const saveToken = React.useCallback(
+          async function (draft) {
+            if (!remote) return;
+            setSaving(true);
+            try {
+              const res = unwrapRemote(await remote.setRelayToken(draft));
+              if (!res.ok) {
+                setState((s) => ({ ...s, hint: res.message, hintKind: "error" }));
+                return;
+              }
+              setTokenDraft(null);
+              setState({
+                loading: false,
+                value: res.value,
+                error: "",
+                hint: String(draft || "").trim() === "" ? "中继令牌已清除" : "中继令牌已更新",
+                hintKind: "ok",
+              });
+              await load();
+              setState((s) => ({
+                ...s,
+                hint: String(draft || "").trim() === "" ? "中继令牌已清除" : "中继令牌已更新",
+                hintKind: "ok",
+              }));
+            } catch (e) {
+              setState((s) => ({ ...s, hint: String((e && e.message) || e), hintKind: "error" }));
+            } finally {
+              setSaving(false);
+            }
+          },
+          [remote, load],
+        );
+
+        const run = React.useCallback(          async function (fn, okHint) {
             if (!remote) return;
             setBusy(true);
             try {
@@ -474,6 +538,9 @@ const CLIENT_ICON_MASK_URI =
         const channel = value.channel || "";
         const qrSvg = value.qrSvg || "";
         const relayInput = relayDraft === null ? relayUrl : relayDraft;
+        // v1.1.3：令牌只显示「是否已设置」（不回显明文）
+        const tokenSet = value.relayTokenSet === true;
+        const tokenInput = tokenDraft === null ? "" : tokenDraft;
         return React.createElement(
           "div",
           { className: "rc-page" },
@@ -531,6 +598,44 @@ const CLIENT_ICON_MASK_URI =
                 "span",
                 { className: "rc-note" },
                 "留空即取消中继配置（插件停止连接）。手机需能访问该地址，填 localhost 手机连不上。",
+              ),
+            ),
+            // v1.1.3：中继门口的鉴权令牌（对应中继环境变量 RELAY_TOKEN）。
+            // 令牌会随配对二维码带给手机（契约 §3.5 的 t= 参数），也会放进
+            // transport hello——所以**不回显明文**，只显示「已设置 / 未设置」。
+            React.createElement(
+              "div",
+              { className: "rc-field" },
+              React.createElement("span", { className: "rc-label" }, "中继令牌"),
+              React.createElement(
+                "div",
+                { className: "rc-row" },
+                React.createElement("input", {
+                  type: "password",
+                  className: "rc-input",
+                  value: tokenInput,
+                  placeholder: tokenSet ? "已设置（留空并保存 = 清除）" : "可选：与中继的 RELAY_TOKEN 相同",
+                  spellCheck: false,
+                  autoComplete: "off",
+                  onChange: (e) => setTokenDraft(e && e.target ? e.target.value : ""),
+                }),
+                React.createElement(
+                  "button",
+                  {
+                    type: "button",
+                    className: "rc-btn",
+                    disabled: saving || busy,
+                    onClick: () => saveToken(tokenInput),
+                  },
+                  saving ? "保存中…" : "保存",
+                ),
+              ),
+              React.createElement(
+                "span",
+                { className: "rc-note" },
+                tokenSet
+                  ? "已设置：手机扫码时会自动带上。中继端需用同一个 RELAY_TOKEN 启动；留空保存即清除。"
+                  : "未设置：中继未配置 RELAY_TOKEN 时不需要填。设置后手机扫码会自动带上。",
               ),
             ),
             React.createElement(

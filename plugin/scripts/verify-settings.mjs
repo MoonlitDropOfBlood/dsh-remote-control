@@ -54,7 +54,7 @@ const { TYPERT } = await import("../typert.host.js");
 check("TYPERT.package 等于包名", TYPERT.package === pkg.name, TYPERT.package + " vs " + pkg.name);
 check("TYPERT.face 是 host", TYPERT.face === "host", TYPERT.face);
 check("TYPERT.schemas 是数组", Array.isArray(TYPERT.schemas));
-check("TYPERT.invocations 是数组且有 4 条", Array.isArray(TYPERT.invocations) && TYPERT.invocations.length === 4, String(TYPERT.invocations?.length));
+check("TYPERT.invocations 是数组且有 5 条", Array.isArray(TYPERT.invocations) && TYPERT.invocations.length === 5, String(TYPERT.invocations?.length));
 
 /** 收集 manifest 里所有 strict codec。 */
 function collectCodecs(manifest) {
@@ -157,7 +157,7 @@ check("client.js 的 CSS 用了 DSH 设计变量", clientSrc.includes("--dsw-ali
 check("index.js 默认导出类插件", /export default class RemoteControlService extends TypertRemoteService/.test(indexSrc));
 check("index.js 导出类本身（便于测试/引用）", /export class RemoteControlService extends TypertRemoteService/.test(indexSrc));
 check("类插件服务名为 remoteControl", /super\(ctx,\s*"remoteControl"\)/.test(indexSrc));
-for (const method of ["getPairing", "rotateSecret", "setHidden", "setRelayUrl"]) {
+for (const method of ["getPairing", "rotateSecret", "setHidden", "setRelayUrl", "setRelayToken"]) {
   check("index.js 标记 Remote 方法 " + method, indexSrc.includes('"' + method + '"'));
 }
 check("index.js 仍保留函数式 apply 入口", /export function apply\(ctx, config\)/.test(indexSrc));
@@ -190,8 +190,8 @@ await service[Service.init]();
 check("类插件注册为 remoteControl 服务", service.name === "remoteControl", String(service.name));
 const marked = remoteMethods(service).map((m) => m.method).sort();
 check(
-  "四个 Remote 方法都被标记",
-  JSON.stringify(marked) === JSON.stringify(["getPairing", "rotateSecret", "setHidden", "setRelayUrl"]),
+  "五个 Remote 方法都被标记",
+  JSON.stringify(marked) === JSON.stringify(["getPairing", "rotateSecret", "setHidden", "setRelayToken", "setRelayUrl"]),
   JSON.stringify(marked),
 );
 
@@ -273,6 +273,44 @@ const again = await service.setRelayUrl("ws://127.0.0.1:9/ws");
 check("清除后重新填写可以再次保存", again.ok === true && again.value?.relayUrl === "ws://127.0.0.1:9/ws", JSON.stringify(again).slice(0, 120));
 check("重新填写后链路重新建立", service._host.relay !== null);
 check("重新填写后返回体仍无 secret 明文", !JSON.stringify(again).includes(service._host.cfg.secret));
+
+// ---- setRelayToken：中继门口的令牌（v1.1.3）--------------------------------
+// 令牌会出现在 transport hello 里（明文可读）→ 返回体**绝不能**含明文，
+// 只有 relayTokenSet（是否已设置）；非法值一律被拒且不落盘。
+const badTokens = [
+  [123, "非字符串"],
+  ["x".repeat(513), "超长"],
+  ["has space", "含空格"],
+  ["tab\there", "含控制符"],
+];
+for (const bad of badTokens) {
+  const res = await service.setRelayToken(bad[0]);
+  check("setRelayToken 拒绝 " + bad[1], res.ok === false && res.error?.code === "bad-params", JSON.stringify(res).slice(0, 120));
+  check("setRelayToken 拒绝 " + bad[1] + " 时有中文原因", String(res.error?.message || "").length > 0);
+}
+check("被拒的令牌没有落盘", !readFileSync2(tempConfigPath, "utf8").includes("has space"));
+
+const GOOD_TOKEN = "s3cret-relay-token_123";
+const tokenRes = await service.setRelayToken(GOOD_TOKEN);
+check("setRelayToken 接受合法令牌", tokenRes.ok === true, JSON.stringify(tokenRes).slice(0, 160));
+check("setRelayToken 返回体不含令牌明文", !JSON.stringify(tokenRes).includes(GOOD_TOKEN));
+check("setRelayToken 返回体 relayTokenSet 为 true", tokenRes.value?.relayTokenSet === true, JSON.stringify(tokenRes.value?.relayTokenSet));
+check("setRelayToken 落盘了令牌", readFileSync2(tempConfigPath, "utf8").includes(GOOD_TOKEN));
+check("setRelayToken 内存 cfg.relayToken 已更新", service._host.cfg.relayToken === GOOD_TOKEN);
+const clearedToken = await service.setRelayToken("");
+check("setRelayToken('') 清除令牌", clearedToken.ok === true && clearedToken.value?.relayTokenSet === false, JSON.stringify(clearedToken.value?.relayTokenSet));
+check("清除后磁盘上不再有令牌", !readFileSync2(tempConfigPath, "utf8").includes(GOOD_TOKEN));
+
+// ---- 纪元（v1.1.3 抗重放）-------------------------------------------------
+// 纪元必须**先落盘再使用**、跨重启单调递增；轮换密钥（换 channel+secret）要重置锚点，
+// 否则「手机清过数据 → 纪元归 1」会被对端判成回退而硬断（无逃生口）。
+const { bumpSelfEpoch, readEpoch, normalizeEpoch } = await import("../lib/config.mjs");
+const e1 = bumpSelfEpoch();
+const e2 = bumpSelfEpoch();
+check("纪元每次自增 1", e2 === e1 + 1, `${e1} -> ${e2}`);
+check("纪元已落盘（跨重启保留）", readEpoch().self === e2, JSON.stringify(readEpoch()));
+check("纪元字段缺失时补默认值", normalizeEpoch(undefined).self === 0 && normalizeEpoch(undefined).peer === 0, JSON.stringify(normalizeEpoch(undefined)));
+check("坏纪元值回落默认值", normalizeEpoch({ self: "x", peer: null }).self === 0, JSON.stringify(normalizeEpoch({ self: "x", peer: null })));
 
 rmSync(tmpHome, { recursive: true, force: true });
 

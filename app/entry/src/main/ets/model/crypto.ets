@@ -8,6 +8,8 @@
  *                      info=UTF8("e2e|" + channel), L=32)
  *   - frame.data = base64url( iv(12) || ciphertext || tag(16) )   ← v1.0.1 布局
  *   - AAD = UTF8("dshrc|" + 发送方 role + "|" + seq)
+ *     （v1.1.3 加固模式：双方 pv>=2 时再追加 "|" + 发送方 sid —— 契约 §7）
+ *   - 握手证明 v2（契约 §3.4.1）：hello2|role|channel|e|ts|pv|sid 的 HMAC
  *   - KAT（契约 §7）：assertKat() 在连接建立前执行，逐字节核对 key/ct/tag（空 AAD）。
  *
  * cryptoFramework 的 GCM 用法（官方文档 crypto-aes-sym-encrypt-decrypt-gcm）：
@@ -23,6 +25,7 @@ import { util } from '@kit.ArkTS';
 import { BusinessError } from '@kit.BasicServicesKit';
 import {
   AAD_PREFIX,
+  HELLO_SIG2_PREFIX,
   HELLO_SIG_PREFIX,
   HKDF_INFO_PREFIX,
   HKDF_KEY_LEN,
@@ -161,7 +164,7 @@ export async function hmacSha256(key: Uint8Array, data: Uint8Array): Promise<Uin
 }
 
 /**
- * hello 帧 sig（契约 §3.4）：
+ * hello 帧 sig（契约 §3.4，v1 格式，**保留**：旧端互操作 + 单测）：
  * base64url(HMAC-SHA256(key, UTF8("hello|" + role + "|" + channel)))
  */
 export async function helloSig(key: Uint8Array, role: string, channel: string): Promise<string> {
@@ -170,9 +173,37 @@ export async function helloSig(key: Uint8Array, role: string, channel: string): 
   return base64UrlEncode(macBytes);
 }
 
-/** AAD（契约 §7）：UTF8("dshrc|" + 发送方 role + "|" + seq)。 */
-export function aadOf(role: string, seq: number): Uint8Array {
-  return utf8Encode(AAD_PREFIX + role + '|' + seq.toString());
+/**
+ * v2 握手证明 sig（契约 §3.4.1，v1.1.3 抗重放）：
+ * base64url(HMAC-SHA256(key, UTF8("hello2|" + role + "|" + channel + "|" + e + "|" + ts
+ *                              + "|" + pv + "|" + sid)))
+ * - e   : 会话纪元（发送方自己的纪元号，跨进程重启单调递增）
+ * - ts  : 发送时刻 Unix 毫秒（仅诊断用，不参与安全判定）
+ * - pv  : 握手证明版本（v1.1.3 = 2）
+ * - sid : 发送方的连接实例 id（8 位十六进制）
+ * 数字一律用十进制字符串拼接（与契约逐字一致）。
+ */
+export async function helloSig2(key: Uint8Array, role: string, channel: string,
+  epoch: number, ts: number, pv: number, sid: string): Promise<string> {
+  const macData: Uint8Array = utf8Encode(HELLO_SIG2_PREFIX + role + '|' + channel + '|' +
+    epoch.toString() + '|' + ts.toString() + '|' + pv.toString() + '|' + sid);
+  const macBytes: Uint8Array = await hmacSha256(key, macData);
+  return base64UrlEncode(macBytes);
+}
+
+/**
+ * AAD（契约 §7）：
+ *  - 兼容模式（任一方 pv<2）：UTF8("dshrc|" + 发送方 role + "|" + seq)
+ *  - 加固模式（双方 pv>=2）：UTF8("dshrc|" + 发送方 role + "|" + seq + "|" + sid)
+ *    sid = **发送方**自己的连接实例 id（= 该帧的 frame.sid）。
+ * 不传 sid（空串/undefined）→ 旧 AAD 格式（v1.1.2 行为）。
+ */
+export function aadOf(role: string, seq: number, sid?: string): Uint8Array {
+  let s: string = AAD_PREFIX + role + '|' + seq.toString();
+  if (sid !== undefined && sid.length > 0) {
+    s = s + '|' + sid;
+  }
+  return utf8Encode(s);
 }
 
 /** 导入 32 字节裸 key 为 AES256 SymKey。 */
@@ -239,12 +270,14 @@ async function gcmDecrypt(key: Uint8Array, ivBuf: Uint8Array, aad: Uint8Array,
 
 /**
  * 加密明文为 frame.data（契约 §7 v1.0.1）：base64url( iv(12) || ct || tag(16) )。
- * AAD = UTF8("dshrc|" + role + "|" + seq)。iv 缺省时用 CSPRNG 随机 12 字节；KAT 传固定 iv。
+ * AAD = UTF8("dshrc|" + role + "|" + seq)（加固模式再追加 "|" + sid）。
+ * iv 缺省时用 CSPRNG 随机 12 字节；KAT 传固定 iv。
+ * sid 缺省（兼容模式）→ 旧 AAD 格式。
  */
 export async function seal(key: Uint8Array, role: string, seq: number, plaintext: string,
-  iv?: Uint8Array): Promise<string> {
+  iv?: Uint8Array, sid?: string): Promise<string> {
   const ivBuf: Uint8Array = iv !== undefined ? iv : randomBytes(IV_LEN);
-  const aad: Uint8Array = aadOf(role, seq);
+  const aad: Uint8Array = aadOf(role, seq, sid);
   const ctTag: Uint8Array = await gcmEncrypt(key, ivBuf, aad, utf8Encode(plaintext));
   return base64UrlEncode(concatBytes(ivBuf, ctTag));
 }
@@ -252,15 +285,17 @@ export async function seal(key: Uint8Array, role: string, seq: number, plaintext
 /**
  * 解密 frame.data（iv||ct||tag 布局）。role 为发送方 role（对 client 收帧而言是 "host"），
  * seq 为该消息的 frame.seq。认证失败抛错（调用方丢弃该帧）。
+ * sid 缺省（兼容模式）→ 旧 AAD 格式；加固模式传**发送方**的 sid。
  */
-export async function open(key: Uint8Array, role: string, seq: number, data: string): Promise<string> {
+export async function open(key: Uint8Array, role: string, seq: number, data: string,
+  sid?: string): Promise<string> {
   const raw: Uint8Array = base64UrlDecode(data);
   if (raw.length < IV_LEN + TAG_LEN) {
     throw new Error('open: ciphertext too short');
   }
   const ivBuf: Uint8Array = raw.slice(0, IV_LEN);
   const ctTag: Uint8Array = raw.slice(IV_LEN);
-  const aad: Uint8Array = aadOf(role, seq);
+  const aad: Uint8Array = aadOf(role, seq, sid);
   const pt: Uint8Array = await gcmDecrypt(key, ivBuf, aad, ctTag);
   return utf8Decode(pt);
 }
@@ -271,8 +306,9 @@ export async function open(key: Uint8Array, role: string, seq: number, data: str
  *  1. deriveKey(KAT_SECRET, KAT_CHANNEL) 的 hex == KAT_KEY_HEX
  *  2. 固定 ivHex 加密 KAT_PT（空 AAD）得到的 ct||tag hex == KAT_CT_HEX || KAT_TAG_HEX
  *  3. 用 ct||tag + 固定 iv 解密还原 KAT_PT
- *  4. AAD 绑定：seal(role=host,seq=7) 能被 open(role=host,seq=7) 还原，
- *     但 open(role=client,seq=7) 必须失败（防串帧/重放）
+ *  4. AAD 绑定（契约 §7 断言 ①②③）：
+ *     seal(role=host,seq=7) 能被 open(role=host,seq=7) 还原，
+ *     但换 role / 换 seq / 换 sid（加固模式）都必须**解密失败**。
  */
 export async function assertKat(): Promise<boolean> {
   // 1. HKDF key（契约 §7 keyHex）
@@ -303,7 +339,7 @@ export async function assertKat(): Promise<boolean> {
     throw new Error('KAT decrypt mismatch: got ' + roundtrip);
   }
 
-  // 4. AAD 绑定往返 + 跨 role 必须失败
+  // 4. AAD 绑定往返 + 跨 role / 跨 seq 必须失败
   const sample: string = '{"hello":"world"}';
   const sealed: string = await seal(key, 'host', 7, sample);
   const back: string = await open(key, 'host', 7, sealed);
@@ -318,6 +354,59 @@ export async function assertKat(): Promise<boolean> {
   }
   if (!crossRejected) {
     throw new Error('KAT aad role binding not enforced');
+  }
+  // 契约 §7 断言 ②：换 seq 解密必须失败
+  let seqRejected: boolean = false;
+  try {
+    await open(key, 'host', 8, sealed);
+  } catch (e) {
+    seqRejected = true;
+  }
+  if (!seqRejected) {
+    throw new Error('KAT aad seq binding not enforced');
+  }
+
+  // 4b. 加固模式 AAD 绑定 sid（契约 §7 v1.1.3 断言 ③：换 sid 解密必须失败）
+  const katSid: string = 'a1b2c3d4';
+  const sealedBound: string = await seal(key, 'host', 7, sample, undefined, katSid);
+  const boundBack: string = await open(key, 'host', 7, sealedBound, katSid);
+  if (boundBack !== sample) {
+    throw new Error('KAT aad sid roundtrip mismatch: got ' + boundBack);
+  }
+  let sidRejected: boolean = false;
+  try {
+    await open(key, 'host', 7, sealedBound, 'ffffffff');
+  } catch (e) {
+    sidRejected = true;
+  }
+  if (!sidRejected) {
+    throw new Error('KAT aad sid binding not enforced');
+  }
+  // 加固模式与兼容模式的 AAD 不同 → 用旧 AAD 解密加固密文也必须失败
+  let modeRejected: boolean = false;
+  try {
+    await open(key, 'host', 7, sealedBound);
+  } catch (e) {
+    modeRejected = true;
+  }
+  if (!modeRejected) {
+    throw new Error('KAT hardened/compat aad separation not enforced');
+  }
+
+  // 4c. v2 握手证明自洽（契约 §3.4.1）：同一组参数两次签名一致，
+  //     改 sid / 改纪元后签名必须不同（验签方据此拒收伪造证明）。
+  const sig2: string = await helloSig2(key, 'host', KAT_CHANNEL, 7, 1700000000000, 2, katSid);
+  const sig2Again: string = await helloSig2(key, 'host', KAT_CHANNEL, 7, 1700000000000, 2, katSid);
+  if (sig2 !== sig2Again) {
+    throw new Error('KAT helloSig2 not deterministic');
+  }
+  const sig2OtherSid: string = await helloSig2(key, 'host', KAT_CHANNEL, 7, 1700000000000, 2, 'ffffffff');
+  if (sig2OtherSid === sig2) {
+    throw new Error('KAT helloSig2 sid not bound');
+  }
+  const sig2OtherEpoch: string = await helloSig2(key, 'host', KAT_CHANNEL, 6, 1700000000000, 2, katSid);
+  if (sig2OtherEpoch === sig2) {
+    throw new Error('KAT helloSig2 epoch not bound');
   }
 
   // 5. HMAC-SHA256 向量（真机坑：createMac 只认摘要名——验不出就别连）

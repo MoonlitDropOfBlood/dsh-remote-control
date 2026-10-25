@@ -30,6 +30,18 @@ export const HKDF_KEY_LEN: number = 32;
 /** hello 签名原文（契约 §3.4）：UTF8("hello|" + role + "|" + channel)。 */
 export const HELLO_SIG_PREFIX: string = 'hello|';
 
+/**
+ * v2 握手证明原文前缀（契约 §3.4.1，v1.1.3）：
+ * UTF8("hello2|" + role + "|" + channel + "|" + e + "|" + ts + "|" + pv + "|" + sid)。
+ */
+export const HELLO_SIG2_PREFIX: string = 'hello2|';
+
+/**
+ * 传输层握手证明版本 pv（契约 §3.4.1）：v1.1.3 = 2；v1.1.2 及以前不带该字段（视为 1）。
+ * 本端恒为 2（v1.1.3）；对端 pv 由中继透传的证明给出。
+ */
+export const PROTO_HELLO_V2: number = 2;
+
 /** AAD 原文（契约 §7）：UTF8("dshrc|" + 发送方 role + "|" + seq)。 */
 export const AAD_PREFIX: string = 'dshrc|';
 
@@ -55,6 +67,8 @@ export const BACKOFF_MAX_MS: number = 60000; // 上限 60s，带抖动
 
 /** 发送端实例 id（契约 §4 v1.0.2）：每条 WS 连接生成一次，8 位十六进制随机。 */
 export const SID_LEN: number = 8;
+/** 连接实例 id 的格式（8 位十六进制，契约 §4 v1.0.2；v1.1.3 证明里的 sid 也用同一格式）。 */
+export const SID_PATTERN: RegExp = /^[0-9a-f]{8}$/i;
 /** 去重键兜底桶：缺 sid 的帧按 "legacy":seq 处理（契约 §4 v1.0.2）。 */
 export const SID_LEGACY: string = 'legacy';
 /** seen 分桶裁剪（契约 §4 v1.0.2）：单 sid 桶上限、总 sid 桶上限。 */
@@ -494,6 +508,26 @@ export interface DshrcRelayFrame {
   urgent?: boolean; // frame（可选）
   code?: string; // error
   message?: string; // error
+  // v1.1.3（契约 §3.4.1）：hello 帧携带的会话纪元证明
+  e?: number; // hello：会话纪元（跨进程重启单调递增，每条新连接 +1）
+  ts?: number; // hello：发送时刻 Unix 毫秒（仅诊断用，不参与安全判定）
+  pv?: number; // hello：握手证明版本（v1.1.3 = 2；旧端不带 → 视为 1）
+  peer?: DshrcPeerProof; // welcome / peer-joined：对端 hello 证明（中继原样透传）
+}
+
+/**
+ * 对端 hello 证明（契约 §3.4.1 / §4）：
+ * 中继没有密钥，只能**原样复制**对端 hello 里的证明字段（不重排、不补默认值、不校验）。
+ * 接收方用本端 key 验签：sig = base64url(HMAC-SHA256(key,
+ *   UTF8("hello2|" + role + "|" + channel + "|" + e + "|" + ts + "|" + pv + "|" + sid)))。
+ */
+export interface DshrcPeerProof {
+  role?: string; // 对端角色（host / client）
+  e?: number; // 会话纪元
+  ts?: number; // 发送时刻 Unix 毫秒（仅诊断用）
+  pv?: number; // 握手证明版本（>=2 才有 v2 证明）
+  sid?: string; // 对端连接实例 id（8 位十六进制）
+  sig?: string; // v2 证明串（base64url）
 }
 
 /** welcome.peers（契约 §4）。 */

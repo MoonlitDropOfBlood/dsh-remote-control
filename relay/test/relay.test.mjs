@@ -230,9 +230,14 @@ test('同 channel 同 role 新连接顶掉旧连接（旧收 error replaced 后�
     const closed = await host1.waitClose();
     assert.equal(closed.code, 4001);
 
-    // 对端视角：host 角色始终在线（不应收到 peer-left / peer-joined 抖动）
+    // 对端视角：host 角色始终在线 → **不发 peer-left**（没下线，只是换了身份）；
+    // 但 v1.1.3 起**必须**发 peer-joined（带新顶替者的证明）——加固模式下对端要重新钉扎
+    // sid/纪元，否则新帧会被当成「sid 不符」全丢掉。
     await sleep(200);
-    assert.equal(client.msgs.filter((m) => m.t === 'peer-left' || m.t === 'peer-joined').length, 0);
+    assert.equal(client.msgs.filter((m) => m.t === 'peer-left').length, 0, '顶替不应发 peer-left');
+    const rejoin = client.msgs.filter((m) => m.t === 'peer-joined');
+    assert.equal(rejoin.length, 1, '顶替应发一次 peer-joined');
+    assert.equal(rejoin[0].role, 'host');
 
     // 转发走新连接
     client.send({ t: 'frame', seq: 7, data: 'Zm9v' });

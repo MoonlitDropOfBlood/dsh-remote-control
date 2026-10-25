@@ -8,13 +8,15 @@
  *    迁移成一个名为「默认远程」的 profile（老用户零操作升级）
  *  - activate() = 切到该远程并连接：savePairing 同步旧键（兼容旧链路逻辑）
  *    → dshrcLink.stop() → dshrcLink.start(toLinkConfig(...))，并刷新 lastUsedAt
+ *  - v1.1.3 会话纪元（契约 §3.4.1）：selfEpoch/peerEpoch/peerSid 存在档案里
+ *    （每个远程独立）→ activate 时注入链路，链路每次变更回调写回并持久化
  *  - secret / relayToken 只存本地、绝不写日志（AGENTS.md 硬性约定）
  */
 import { preferences } from '@kit.ArkData';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { Context } from '@kit.AbilityKit';
 import { logDshrc } from './logger';
-import { dshrcLink } from './link';
+import { LinkConfig, LinkEpochState, dshrcLink } from './link';
 import { APP_NAME, APP_VERSION, PairingConfig, loadPairing, savePairing, toLinkConfig } from './store';
 
 const TAG: string = 'dshrc-connections';
@@ -26,6 +28,8 @@ const KEY_REMOTES: string = 'remotes';
 const KEY_ACTIVE_REMOTE: string = 'activeRemoteId';
 /** 迁移旧单条配对时的默认名称。 */
 const DEFAULT_REMOTE_NAME: string = '默认远程';
+/** v1.1.3：尚未接受过任何对端证明时的「已接受纪元」缺省值（-1 = 无）。 */
+const EPOCH_PEER_NONE: number = -1;
 
 /** 远程配置的持久化形态（JSON 往返用；字段可选 → 兼容早期/损坏数据）。 */
 export interface RemoteProfileJson {
@@ -36,6 +40,10 @@ export interface RemoteProfileJson {
   secret?: string;
   relayToken?: string;
   lastUsedAt?: number;
+  // v1.1.3 会话纪元（契约 §3.4.1）：自己的纪元 / 已接受的对端纪元 / 已钉扎的对端 sid
+  selfEpoch?: number;
+  peerEpoch?: number;
+  peerSid?: string;
 }
 
 /** 局部更新用的补丁（只带要改的字段）。 */
@@ -57,6 +65,15 @@ export class RemoteProfile {
   @Trace secret: string = '';
   @Trace relayToken: string = '';
   @Trace lastUsedAt: number = 0;
+  /**
+   * v1.1.3 会话纪元（契约 §3.4.1）：
+   *  - selfEpoch   : 本端自己的纪元（每条新连接 +1，跨进程重启单调递增）
+   *  - peerEpoch   : 已接受的对端最高纪元（-1 = 尚未接受过任何对端证明）
+   *  - peerSid     : 已钉扎的对端 sid（加固模式下收到的 frame.sid 必须等于它）
+   */
+  @Trace selfEpoch: number = 0;
+  @Trace peerEpoch: number = EPOCH_PEER_NONE;
+  @Trace peerSid: string = '';
 
   /** 链路层/旧单条键共用的配对视图（顺带 trim）。 */
   toPairingConfig(): PairingConfig {
@@ -201,6 +218,7 @@ export class ConnectionStore {
   /**
    * 切到该远程并连接：保存 activeId + 同步旧单条配对键 → 断开旧链路 → 起新链路。
    * lastUsedAt 同步刷新（列表按最近使用排序时可参考）。
+   * v1.1.3：纪元状态随档案注入链路（自己的纪元跨重启单调 + 已接受的对端纪元/钉扎 sid）。
    */
   activate(context: Context, id: string): void {
     const p: RemoteProfile | undefined = this.profileOf(id);
@@ -215,9 +233,32 @@ export class ConnectionStore {
     savePairing(context, cfg);
     this.persist();
     dshrcLink.stop();
-    dshrcLink.start(toLinkConfig(cfg, APP_NAME, APP_VERSION)).catch((e: Error): void => {
+    const lc: LinkConfig = toLinkConfig(cfg, APP_NAME, APP_VERSION);
+    // v1.1.3：纪元状态 + 变更回调（链路层「先持久化再使用」的落地点）
+    lc.epoch = { self: p.selfEpoch, peer: p.peerEpoch, peerSid: p.peerSid };
+    lc.onEpoch = (st: LinkEpochState): void => {
+      this.applyEpoch(p.id, st);
+    };
+    dshrcLink.start(lc).catch((e: Error): void => {
       logDshrc(TAG, 'warn', 'link start failed: ' + e.message);
     });
+  }
+
+  /**
+   * 落盘纪元状态（契约 §3.4.1）：链路层每条新连接把 self +1，或接受对端证明时
+   * 更新 peer/peerSid —— 都通过这里写回档案并持久化（跨进程重启仍单调）。
+   */
+  applyEpoch(id: string, st: LinkEpochState): void {
+    const p: RemoteProfile | undefined = this.profileOf(id);
+    if (p === undefined) {
+      return;
+    }
+    if (p.selfEpoch !== st.self || p.peerEpoch !== st.peer || p.peerSid !== st.peerSid) {
+      p.selfEpoch = st.self;
+      p.peerEpoch = st.peer;
+      p.peerSid = st.peerSid;
+      this.persist();
+    }
   }
 
   /** 当前使用的远程档案（未选择返回 undefined）。 */
@@ -283,7 +324,11 @@ export class ConnectionStore {
         channel: p.channel,
         secret: p.secret,
         relayToken: p.relayToken,
-        lastUsedAt: p.lastUsedAt
+        lastUsedAt: p.lastUsedAt,
+        // v1.1.3 会话纪元
+        selfEpoch: p.selfEpoch,
+        peerEpoch: p.peerEpoch,
+        peerSid: p.peerSid
       };
       arr.push(item);
     }
@@ -307,6 +352,10 @@ export class ConnectionStore {
         p.secret = item.secret !== undefined ? item.secret : '';
         p.relayToken = item.relayToken !== undefined ? item.relayToken : '';
         p.lastUsedAt = item.lastUsedAt !== undefined ? item.lastUsedAt : 0;
+        // v1.1.3：老数据缺纪元字段 → 补默认值（自己的纪元 0 / 未接受过对端 -1 / 无钉扎 sid）
+        p.selfEpoch = item.selfEpoch !== undefined ? item.selfEpoch : 0;
+        p.peerEpoch = item.peerEpoch !== undefined ? item.peerEpoch : EPOCH_PEER_NONE;
+        p.peerSid = item.peerSid !== undefined ? item.peerSid : '';
         if (p.id.length > 0) {
           out.push(p);
         }

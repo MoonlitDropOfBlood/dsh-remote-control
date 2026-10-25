@@ -144,6 +144,36 @@ export const TYPERT = {
       },
       sourceLocation: { file: "index.js", line: 1, column: 1 },
     },
+    {
+      // v1.1.3：中继门口的鉴权令牌（对应中继的 RELAY_TOKEN）。
+      // 令牌会出现在 transport hello 里（明文可读），所以设置页不回显明文，
+      // 只回 relayTokenSet；配对二维码会带上它（契约 §3.5 的 t= 参数）。
+      id: "dsh-remote-control#remoteControl/setRelayToken",
+      service: "remoteControl",
+      namespace: "remoteControl",
+      method: "setRelayToken",
+      invocation: { kind: "direct" },
+      parameters: [
+        {
+          name: "token",
+          wire: "token",
+          source: "json",
+          codec: {
+            mode: "strict",
+            typeSymbol: "dsh-remote-control#remoteControl/setRelayToken:token",
+            schema: z.string(),
+            create: createStringSchema,
+          },
+        },
+      ],
+      result: {
+        mode: "strict",
+        typeSymbol: "dsh-remote-control#PairingResult",
+        schema: pairingResultSchema,
+        create: createPairingResult,
+      },
+      sourceLocation: { file: "index.js", line: 1, column: 1 },
+    },
   ],
   model: {
     services: [

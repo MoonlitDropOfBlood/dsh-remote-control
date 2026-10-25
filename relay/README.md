@@ -37,6 +37,8 @@ dsh-remote-control 的**公网 WebSocket 中继服务器**（哑管道）。
 |---|---|---|
 | `PORT` | `8787` | 监听端口 |
 | `RELAY_TOKEN` | （空=不校验） | 配置后 `hello` 必须带匹配 `token` 字段，否则 `error bad-hello` 并断开 |
+| `RELAY_TLS_CERT` | （空=明文） | PEM 证书链**文件路径**；与 `RELAY_TLS_KEY` 同时设置才生效 → 提供 `wss://` |
+| `RELAY_TLS_KEY` | （空=明文） | PEM 私钥**文件路径**；只配一个 / 读不到 / 证书非法 → **启动即失败**（不降级明文） |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` / `silent` |
 | `RELAY_HELLO_TIMEOUT_MS` | `10000` | 连接后多久内必须 hello，超时断开 |
 | `RELAY_PING_INTERVAL_MS` | `30000` | 无消息多久发一次心跳（应用层 ping + ws 协议 ping） |
@@ -53,17 +55,48 @@ dsh-remote-control 的**公网 WebSocket 中继服务器**（哑管道）。
 
 ```bash
 npm install
-npm start          # 监听 ws://0.0.0.0:8787
+npm start          # 双栈监听：ws://<IPv4>:8787 与 ws://[<IPv6>]:8787 都可用
 PORT=9000 RELAY_TOKEN=$(openssl rand -hex 16) npm start
 
-npm test           # node:test 全量测试（10 项）
+npm test           # node:test 全量测试（16 项）
 npm run smoke      # 本机端到端 smoke：hello→frame 互转→断线→离线补发
 ```
+
+## 监听地址：IPv4 / IPv6 双栈
+
+中继默认绑定 **`::`（IPv6 通配地址，Node 默认 `ipv6Only=false`）** —— 一次绑定同时接收
+IPv6 与 IPv4（IPv4 以 `::ffff:a.b.c.d` 映射形式进来）：
+
+| 客户端 | 连接地址示例 |
+|---|---|
+| IPv4（同机/局域网） | `ws://127.0.0.1:8787` / `ws://192.168.1.2:8787` |
+| IPv6（同机 loopback） | `ws://[::1]:8787` |
+| IPv6（本机公网地址，手机直连） | `ws://[2001:db8::1234]:8787`（文档示例，使用时替换为实际地址） |
+
+要点：
+
+- **IPv6 字面量必须带方括号**：`ws://[<IPv6>]:<port>`，否则 URL 解析会失败。
+- 若本机系统**禁用了 IPv6**（`EAFNOSUPPORT` / `EADDRNOTAVAIL` / `EINVAL`），
+  中继会**自动回落到 `0.0.0.0`**（仅 IPv4，行为与旧版一致）并在日志里打一条
+  `ipv6 listen unavailable, falling back to ipv4-only` 警告；端口占用等其它错误照旧直接失败。
+- 端口占用（`EADDRINUSE`）**不会**触发回落 —— 仍按原行为报错退出。
+- 监听候选顺序可在代码层覆盖（测试用）：`createRelay({ listenHosts: ['0.0.0.0'] })`；
+  不通过环境变量暴露，避免误改线上行为。
+- 双栈下 IPv4 客户端的对端地址会显示为 `::ffff:127.0.0.1`，中继会**归一为 `127.0.0.1`**
+  再用于 hello 限速分桶与日志 —— 与旧版（IPv4-only 监听）行为一致，不会绕过限速。
+- 手机直连公网 IPv6 还需要**放行主机防火墙**（Windows Defender 防火墙入站规则），
+  以及运营商/路由器允许入站 IPv6；中继只管监听，不管网络可达性。
 
 验证连通（需要先 `npm i -D ws` 的项目里或用 curl 检查端口）：
 
 ```bash
 curl -i http://127.0.0.1:8787/   # 期望 426 Upgrade Required（HTTP 探测会拿到 WS 升级要求）
+```
+
+IPv6 连通自检（Node ≥ 20）：
+
+```bash
+node -e "const WebSocket=require('ws');const w=new WebSocket('ws://[::1]:8787');w.on('open',()=>{console.log('IPv6 OK');w.close()});w.on('error',e=>console.log('IPv6 FAIL',e.code))"
 ```
 
 ## 生产部署（VPS，systemd + Caddy 反代 WSS）
@@ -190,6 +223,10 @@ docker run -d --name dsh-relay -p 8787:8787 -e RELAY_TOKEN=$(openssl rand -hex 1
 
 镜像基于 `node:22-alpine`，以非 root 用户 `node` 运行，`PORT` 仍可用环境变量覆盖（容器内建议保持 8787 并映射端口）。
 
+> **IPv6 提示**：中继进程内部是双栈监听，但 Docker 的 `-p 8787:8787` 只在宿主机的
+> IPv4 上发布（除非 daemon 侧开启 IPv6 端口发布）。需要让手机直连宿主 IPv6 时，
+> 可改用 `--network host`（Linux）或在 daemon 侧启用 IPv6 发布。
+
 ## 安全注意事项
 
 - **中继只见密文**：`frame.data` 是端到端 AES-256-GCM 密文，中继不持有密钥、不解析内容；
@@ -218,5 +255,6 @@ dsh-remote-control-relay/
 └── test/
     ├── helpers.mjs       # 起真实子进程 + 带消息缓冲的 ws Peer
     ├── raw-socket.mjs    # 原始 TCP WS 客户端（永不 pong，用于心跳判死测试）
-    └── relay.test.mjs    # 10 项 node:test 测试
+    ├── relay.test.mjs    # 10 项 node:test 测试
+    └── ipv6.test.mjs     # 6 项双栈测试（IPv4/IPv6 同端口共存、IPv6 loopback、跨族转发、回落）
 ```

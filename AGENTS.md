@@ -21,10 +21,10 @@
 | 目录 | 语言 | 职责 | 验收命令 |
 |---|---|---|---|
 | [plugin/](plugin/AGENTS.md) | Node.js | DSH 插件：sessionController 桥接、事件桥接、审批瀑布、QR 配对、Push | `node --check` × N；plugin_manager install |
-| [relay/](relay/AGENTS.md) | Node.js | 中继服务器：hello 校验、转发、离线缓存、限速、心跳 | `npm test`（10 用例） |
+| [relay/](relay/AGENTS.md) | Node.js | 中继服务器：hello 校验、转发、离线缓存、限速、心跳 | `npm test`（16 用例） |
 | [app/](app/AGENTS.md) | ArkTS | HarmonyOS 手机 App（DevEco 工程） | `devecocli build` + linter-cli 0 ERROR |
 | [e2e/](e2e/AGENTS.md) | Node.js | 协议参考实现 + mock 两端 + 自动化联调 | `node auto-test.mjs` |
-| [docs/PROTOCOL.md](docs/PROTOCOL.md) | — | **线协议契约 v1.1.1（唯一事实源，三方共同合同）** | 改协议必须先改它 |
+| [docs/PROTOCOL.md](docs/PROTOCOL.md) | — | **线协议契约 v1.1.3（唯一事实源，三方共同合同）** | 改协议必须先改它 |
 
 ## 快速开始
 
@@ -36,9 +36,10 @@ cd relay && npm install && node server.js            # 中继（默认 8787；�
 
 ## 全局约定
 
-1. **协议以 docs/PROTOCOL.md 为准**（**v1.1.1**：v1.0.9 会话消息里的图片（§5.10「缩略图内联 +
+1. **协议以 docs/PROTOCOL.md 为准**（**v1.1.3**：v1.0.9 会话消息里的图片（§5.10「缩略图内联 +
    大图按需拉取」）→ v1.1.0 present 投递的文件也上手机（§5.10.1）→ v1.1.2 交付物图片进历史
-   （§5.10.2）+ 排队事件 session.queue 与 session.prompt 的 mode:queue|steer（§5.1/§5.2））。
+   （§5.10.2）+ 排队事件 session.queue（§5.1/§5.2）→ **v1.1.3 抗重放的会话纪元**
+   （§3.4.1 hello 证明 v2 + AAD 绑定 sid + 纪元单调性；§3.4.2 中继原生 TLS））。
    改任何一端的 wire 行为必须先改契约，三方同步。
 2. **KAT 是硬验收**：契约 §7 测试向量（key/iv/ct/tag/hmac）在 plugin 与 app 各有一份自测，
    连接建立前执行，失败禁连。加密链路每一环（HKDF/AES/HMAC）都必须进 KAT。

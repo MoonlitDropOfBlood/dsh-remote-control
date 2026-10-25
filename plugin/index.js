@@ -35,7 +35,7 @@
 import { Service } from "@deepseek-ai/cordis";
 import { Remote, TypertRemoteService } from "@deepseek-ai/dsh-typert-protocol";
 import { assertKat } from "./lib/protocol.mjs";
-import { loadConfig, saveConfig, dataDir } from "./lib/config.mjs";
+import { loadConfig, saveConfig, dataDir, bumpSelfEpoch, readEpoch, savePeerEpoch } from "./lib/config.mjs";
 import { RelayClient } from "./lib/relay-client.mjs";
 import { RelaySupervisor, shouldTickWatchdog } from "./lib/relay-supervisor.mjs";
 import { PushSender, pushConfigured, pushUnavailableReason } from "./lib/push.mjs";
@@ -214,6 +214,8 @@ export function startRemoteHost(ctx, rowConfig) {
         // （审计实测：enabled=false 时看门狗仍把 0.0.0.0 的中继拉了起来）。
         autoStart: state.cfg.enabled === true && state.cfg.autoStartRelay !== false,
         relayToken: state.cfg.relayToken,
+        // v1.1.3：托管中继的 TLS（契约 §3.4.2）——两个路径都填才起 wss://。
+        tls: { cert: state.cfg.relayTlsCert, key: state.cfg.relayTlsKey },
       });
       state.relayProcess = snapshot;
       if (snapshot.managed) {
@@ -272,6 +274,15 @@ export function startRemoteHost(ctx, rowConfig) {
       relayToken: state.cfg.relayToken,
       role: "host",
       log,
+      // v1.1.3 会话纪元（契约 §3.4.1）：抗重放的持久化锚点。
+      //   nextSelfEpoch —— 自纪元 +1，**先落盘再使用**（崩溃也不得复用纪元）；
+      //   peerState/savePeerEpoch —— 已接受的对端纪元 + 钉扎 sid（回退检测）。
+      // 落盘失败时 relay-client 会拒绝开链路（纪元不可持久化 = 重放窗口）。
+      epoch: {
+        nextSelfEpoch: () => bumpSelfEpoch(),
+        peerState: () => readEpoch(),
+        savePeerEpoch: (peer, peerSid) => savePeerEpoch(peer, peerSid),
+      },
       onStatus: (s, detail) => {
         log("info", "relay " + s + (detail ? ": " + detail : ""), {
           relayUrl: state.cfg.relayUrl,
@@ -416,7 +427,7 @@ export class RemoteControlService extends TypertRemoteService {
         e,
       );
     }
-    for (const method of ["getPairing", "rotateSecret", "setHidden", "setRelayUrl"]) {
+    for (const method of ["getPairing", "rotateSecret", "setHidden", "setRelayUrl", "setRelayToken"]) {
       try {
         markRemoteMethod(this, method, method);
       } catch (e) {
@@ -582,6 +593,69 @@ export class RemoteControlService extends TypertRemoteService {
     const value = pairingValue(host.cfg, note, raw !== "");
     return { ok: true, value: withRelayProcess(value, host) };
   }
+
+  /**
+   * 设置页直改**中继鉴权令牌**（v1.1.3，契约 §3.4.2 / §3.5 的 `t=` 参数）。
+   *
+   * 令牌会出现在 transport hello 里（**明文可读**）——所以：
+   *  - 返回体里**没有令牌明文**，只有 `relayTokenSet`（是否已设置）；
+   *  - 令牌由用户自己填（须与中继的 RELAY_TOKEN 一致），配对二维码会自动带上它。
+   *
+   * 改令牌必须**重连链路**（transport hello 的内容变了）。
+   *
+   * @param {string} token 令牌；空串 = 清除
+   * @returns {Promise<{ok:true,value:object}|{ok:false,error:{code:string,message:string}}>}
+   */
+  async setRelayToken(token) {
+    const host = this._host;
+    if (!host || !host.cfg) {
+      return { ok: false, error: { code: "not-ready", message: "插件尚未初始化。" } };
+    }
+    if (typeof token !== "string") {
+      return { ok: false, error: { code: "bad-params", message: "中继令牌必须是字符串。" } };
+    }
+    const raw = token.trim();
+    if (raw.length > 512) {
+      return { ok: false, error: { code: "bad-params", message: "中继令牌过长（上限 512 字符）。" } };
+    }
+    if (raw !== "" && !/^[\x21-\x7e]+$/.test(raw)) {
+      // 只接受可打印 ASCII（不含空格/控制符）：令牌走 JSON 与 query 参数，
+      // 空白与控制字符会引出「配对串对不上」的玄学问题。
+      return {
+        ok: false,
+        error: {
+          code: "bad-params",
+          message: "中继令牌只能包含可打印 ASCII 字符（不能有空格或控制字符）。",
+        },
+      };
+    }
+    try {
+      const fresh = loadConfig().config;
+      fresh.relayToken = raw;
+      saveConfig(fresh);
+    } catch (e) {
+      return {
+        ok: false,
+        error: { code: "config-save-failed", message: "保存中继令牌失败：" + String(e && e.message) },
+      };
+    }
+    host.cfg.relayToken = raw;
+    host.log("info", "relay token updated", { cleared: raw === "" });
+
+    let note = "";
+    if (raw === "") {
+      host.stopLink?.();
+    } else {
+      const link = host.startLink ? host.startLink() : { ok: false, message: "链路控制不可用。" };
+      note = link.ok
+        ? link.mode === "reload"
+          ? "中继令牌已更新，链路已重连。"
+          : "中继令牌已更新，链路已启动。"
+        : "中继令牌已保存，但链路未启动：" + (link.message || "未知原因");
+    }
+    const value = pairingValue(host.cfg, note, host.cfg.relayUrl !== "" && host.cfg.hidden !== true);
+    return { ok: true, value: withRelayProcess(value, host) };
+  }
 }
 
 /**
@@ -601,6 +675,11 @@ function pairingValue(cfg, note, withQr) {
     note: typeof note === "string" ? note : "",
     /** v1.1.1：中继进程托管状态（设置页展示；老客户端忽略即可）。 */
     relayProcess: null,
+    /**
+     * v1.1.3：中继令牌**是否已设置**（**没有明文**——令牌会出现在 transport hello 里，
+     * 明文回显等于把门口钥匙挂墙上）。设置页据此显示「已设置 / 未设置」。
+     */
+    relayTokenSet: typeof cfg?.relayToken === "string" && cfg.relayToken.length > 0,
   };
   if (!withQr || value.hidden) return value;
   try {

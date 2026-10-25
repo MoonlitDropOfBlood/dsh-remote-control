@@ -414,7 +414,48 @@ function stubEntry() {
     String(capturedEnv?.ELECTRON_RUN_AS_NODE),
   );
   check("跨平台：注入父子绑定变量", capturedEnv?.DSHRC_RELAY_PARENT_WATCHDOG === "1");
+  check("TLS：未配置时不注入 TLS 变量（默认明文 ws://）",
+    capturedEnv?.RELAY_TLS_CERT === undefined && capturedEnv?.RELAY_TLS_KEY === undefined,
+    String(capturedEnv?.RELAY_TLS_CERT));
   await sup.stop();
+}
+
+// ---------------------------------------------------------------------------
+// 12b. v1.1.3：TLS 环境变量接线（契约 §3.4.2）
+//   两个都配 → 透传给子进程；只配一个 → **拒绝启动**（绝不静默降级成明文）。
+// ---------------------------------------------------------------------------
+{
+  let capturedEnv = null;
+  const sup = new RelaySupervisor({
+    entry: stubEntry(),
+    spawnFn: (file, args, opts) => {
+      capturedEnv = opts.env;
+      return realSpawn(file, args, opts);
+    },
+  });
+  const port = await freePort();
+  await sup.ensure("ws://127.0.0.1:" + port, { tls: { cert: "C:/tmp/cert.pem", key: "C:/tmp/key.pem" } });
+  check("TLS：两个路径都配 → 透传 RELAY_TLS_CERT/KEY",
+    capturedEnv?.RELAY_TLS_CERT === "C:/tmp/cert.pem" && capturedEnv?.RELAY_TLS_KEY === "C:/tmp/key.pem",
+    JSON.stringify({ c: capturedEnv?.RELAY_TLS_CERT, k: capturedEnv?.RELAY_TLS_KEY }));
+  await sup.stop();
+
+  const sup2 = new RelaySupervisor({
+    entry: stubEntry(),
+    spawnFn: () => {
+      throw new Error("只配一半 TLS 时不该 spawn");
+    },
+  });
+  let halfErr = null;
+  try {
+    await sup2.ensure("ws://127.0.0.1:" + (await freePort()), { tls: { cert: "C:/tmp/cert.pem", key: "" } });
+  } catch (e) {
+    halfErr = e;
+  }
+  check("TLS：只配一半 → 启动前就拒绝（不静默按明文跑）",
+    halfErr !== null && /TLS/i.test(String(halfErr && halfErr.message)),
+    String(halfErr && halfErr.message));
+  await sup2.stop();
 }
 
 // ---------------------------------------------------------------------------
@@ -935,7 +976,7 @@ function stubEntry() {
   // 第三轮 #1/#2：世代号守卫要夹在端口探测与 start() 之间
   const iProbe = supSrc.indexOf("await isRelayPortBusy(target.port, target.host)");
   const iEpoch = supSrc.indexOf("this.epoch !== baseEpoch");
-  const iStart = supSrc.indexOf("await this.start(target.port, opts.relayToken)");
+  const iStart = supSrc.indexOf("await this.start(target.port, opts.relayToken, opts.tls)");
   check("结构：世代号守卫夹在探测与 start 之间（stop 竞态）", iProbe >= 0 && iEpoch > iProbe && iStart > iEpoch);
 
   // M29：isChildAlive 要同时看 exitCode 与 signalCode

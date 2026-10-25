@@ -36,6 +36,7 @@ node scripts/verify-steps.mjs                                          # v1.0.9 
 node scripts/verify-images.mjs                                         # 图片专项 + 交付物桥接 + 排队(session.queue)/宿主投递设置(busyEnter)：元数据映射/缩略图降级/image.fetch/帧预算守卫/交付物进历史/排队追踪（无依赖，153 项）
 node scripts/verify-settings.mjs                                       # v1.1.x 设置页/manifest/combo/信封自检 + Host 真跑一遍（112 项）
 node scripts/verify-relay-supervisor.mjs                               # v1.1.1 中继进程托管：决策/端口占用不抢/启停/看门狗/跨平台/bundle（无依赖，162 项）
+node scripts/verify-crypto.mjs                                          # v1.1.3 加密层/抗重放：KAT+AAD 两模式+sid 绑定+证明 v2+纪元单调性+接线层（无依赖，45 项）
 node scripts/sync-client-icon.mjs                                      # 改了 icon.svg 后同步 client.js 的图标 data-uri
 ```
 
@@ -446,3 +447,23 @@ Remote 方法（返回 `{ok:true,value}` 或 `{ok:false,error:{code,message}}`�
   <style> 时 client-modules 的 `claimStyles(ownerId)` 扫描已经过去，不认领会被别的包收养。
 - 回归：`node scripts/verify-settings.mjs`（**112 项**，含双层信封解包用例 + combo 拼接安全 +
   Host 半边真跑一遍 + setRelayUrl 校验/落盘/清除/回环警告）+ `node scripts/verify-pairing.mjs`（47 项）。
+
+## v1.1.3：抗重放的会话纪元 + 中继令牌/TLS（2026-10-26，契约 §3.4.1 / §3.4.2）
+
+- **握手证明 v2**：传输层 hello 带 `e`(纪元)/`ts`/`pv=2`/`sid`，`sig` = 
+  `base64url(HMAC-SHA256(key, UTF8("hello2|"+role+"|"+channel+"|"+e+"|"+ts+"|"+pv+"|"+sid)))`
+  （旧的 `hello|role|channel` 保留）。**中继是哑管道**：它在 `welcome.peer` /
+  `peer-joined.peer` 里**逐字复制**对端证明（无密钥，不校验）。
+- **纪元（epoch）**：自己每条新连接 +1 且**先落盘再使用**；接收方持久化「已接受的对端最高
+  纪元 + 钉扎的 sid」——对端 `e <= 已接受值` → **拒绝连接**（回退 = 疑似重放）；
+  同一份证明重复（welcome 与 peer-joined 都带）→ 幂等接受不更新。
+- **sid 钉扎**：加固模式下收到的帧 `frame.sid` 与钉扎值不符 → **丢弃**（跨会话重放）。
+- **AAD 两模式**：兼容 `dshrc|role|seq`；加固 `dshrc|role|seq|sid`（发送方自己的 sid）。
+  模式由「双方 pv≥2」决定，**必须一致** → 发送方**收到 welcome 之后**才发业务帧。
+- **中继令牌（`RELAY_TOKEN`）进设置页**：契约 §3.5 的 `t=` 参数早就通了，缺的是**入口**——
+  新增 `setRelayToken(token)` Remote 方法 + 设置页输入框。令牌会出现在 transport hello 里
+  （明文可读）→ **设置页不回显明文**，只回 `relayTokenSet`（是否已设置）；留空保存 = 清除。
+  改令牌必须**重连链路**（transport hello 变了）。
+- **中继 TLS**：中继认 `RELAY_TLS_CERT` / `RELAY_TLS_KEY`（PEM 文件路径）→ 提供 `wss://`；
+  配了一半/文件读不到 → **启动即失败**（绝不静默降级成明文）。TLS 是抗重放最彻底的防线
+  （服务端身份认证 → 中继无法冒充对端），纪元是纵深防御。

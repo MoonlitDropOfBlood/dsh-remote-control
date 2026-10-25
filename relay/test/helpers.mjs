@@ -37,8 +37,18 @@ export async function startServer(env = {}) {
   return {
     port,
     url: `ws://127.0.0.1:${port}`,
+    ipv6Url: `ws://[::1]:${port}`,
     child,
     output: () => out,
+    /** 等子进程输出里出现某个模式（stdout 分块到达，断言前需要等一拍） */
+    async waitForOutput(re, { timeout = 3000 } = {}) {
+      const t0 = Date.now();
+      while (Date.now() - t0 < timeout) {
+        if (re.test(out)) return true;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      throw new Error(`timeout waiting for output ${re}; output:\n${out}`);
+    },
     async kill() {
       if (child.exitCode !== null) return;
       const exited = once(child, 'exit');
@@ -103,8 +113,8 @@ export class Peer {
   }
 
   /** 打开连接；若给 hello 则立即发送（自动带 sig 占位） */
-  static async open(url, hello) {
-    const ws = new WebSocket(url);
+  static async open(url, hello, opts) {
+    const ws = new WebSocket(url, opts);
     const peer = new Peer(ws);
     await once(ws, 'open');
     if (hello) ws.send(JSON.stringify({ t: 'hello', sig: 'test-sig', ...hello }));

@@ -13,7 +13,7 @@
 import { spawn } from "node:child_process";
 import { mkdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { dataDir, generateChannel, generateSecret, loadConfig, saveConfig } from "./config.mjs";
+import { dataDir, defaultEpoch, generateChannel, generateSecret, loadConfig, saveConfig } from "./config.mjs";
 import { encodeToMatrix, toAscii, toSvg } from "./qr.mjs";
 
 /** 二维码 SVG 文件名（位于 dataDir() 下）。 */
@@ -195,6 +195,11 @@ export function rotatePairingIdentity(deps) {
     const fresh = loadConfig().config;
     fresh.channel = newChannel;
     fresh.secret = newSecret;
+    // v1.1.3：**重置纪元锚点**（契约 §3.4.1）——换了 channel 就是换了「对端身份」，
+    // 旧锚点对新 channel 无意义；更重要的是它是**逃生口**：手机清过数据 → 它的纪元
+    // 归 1 → 本机记着「已接受的对端纪元 = N」→ 双方互判回退 → 硬断且无路可走。
+    // 轮换密钥（换 channel+secret）后双方都是新身份 → 锚点归零，重新配对即可恢复。
+    fresh.epoch = defaultEpoch();
     savedPath = saveConfig(fresh);
   } catch (e) {
     return {

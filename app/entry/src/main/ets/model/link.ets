@@ -1,16 +1,25 @@
 /*
  * Copyright (c) 2026 dukedsh.
- * dsh-remote-control-app 链路层：WebSocket 客户端 → 中继（契约 §4；仓库根 docs/PROTOCOL.md v1.0.2）。
+ * dsh-remote-control-app 链路层：WebSocket 客户端 → 中继（契约 §4；仓库根 docs/PROTOCOL.md v1.1.3）。
  * 职责：
  *  - 连接前先跑 assertKat()（契约 §7 KAT 逐字节自检），失败则不建链
  *  - 连接 / 断线重连（指数退避 1s→60s + 抖动）
- *  - 收到 welcome 前发 hello（sig = base64url(HMAC-SHA256(key,"hello|client|"+channel))）
+ *  - 收到 welcome 前发 hello（v1.1.3：sig = base64url(HMAC-SHA256(key,
+ *    "hello2|client|"+channel+"|"+e+"|"+ts+"|"+pv+"|"+sid))，并带 e/ts/pv/sid）
  *  - 30s 无帧发 ping；90s 无任何消息判死并重连
  *  - sid/seq（契约 §4 v1.0.2）：每条 WS 连接（含重连）生成一次 8 位十六进制 sid，
  *    seq 每条连接从 1 开始；接收去重键为 sid+":"+seq（缺 sid 按 "legacy"），
  *    seen 按 sid 分桶（单桶 >4096 裁剪最旧，总桶 >64 淘汰最旧）
- *  - 业务消息收发加解密（AES-256-GCM，iv||ct||tag；AAD 仍为 "dshrc|"+发送方role+"|"+seq）
+ *  - 业务消息收发加解密（AES-256-GCM，iv||ct||tag）
  *  - Correlator 请求-响应关联（result{id,ok,value|error}）
+ *
+ * v1.1.3 会话纪元（契约 §3.4.1，抗重放）：
+ *  - 传输层 hello 带 e(纪元)/ts/pv(=2)/sid，证明串覆盖它们（hello2|…）
+ *  - 对端证明来自 welcome.peer / peer-joined.peer（中继原样透传）→ 验签 → 判模式 →
+ *    钉扎对端 sid → 纪元回退即拒绝连接
+ *  - 模式：双方 pv>=2 = 加固（AAD = "dshrc|role|seq|sid"，sid = 发送方自己）；
+ *    任一方 pv<2 = 兼容（AAD = "dshrc|role|seq"）
+ *  - 业务帧必须在**知道对端 pv 之后**才发（否则双方 AAD 选得不一样）
  */
 import { webSocket } from '@kit.NetworkKit';
 import { BusinessError } from '@kit.BasicServicesKit';
@@ -34,6 +43,7 @@ import {
   DshrcSubagentInfo,
   DshrcRelayFrame,
   DshrcRelayPeers,
+  DshrcPeerProof,
   FRAME_ERROR,
   FRAME_FRAME,
   FRAME_HELLO,
@@ -65,23 +75,40 @@ import {
   MSG_QUESTION_ANSWER,
   MSG_PUSH_REGISTER,
   MSG_PING,
+  PROTO_HELLO_V2,
   PROTO_VERSION,
   ROLE_CLIENT,
+  ROLE_HOST,
   SEEN_BUCKET_MAX,
   SEEN_MAX_SIDS,
   SID_LEGACY,
   SID_LEN,
+  SID_PATTERN,
   makeMsg
 } from './protocol';
-import { assertKat, deriveKey, helloSig, open, seal } from './crypto';
+import { assertKat, deriveKey, helloSig, helloSig2, open, seal } from './crypto';
 import { postBusMsg, postLinkPeers, postLinkState } from './events';
 
 const TAG: string = 'dshrc-link';
 const DEFAULT_REQ_TIMEOUT_MS: number = 15000;
 const HOST_HELLO_TIMEOUT_MS: number = 15000;
+/** 加固模式下连续 sid 不匹配（对端换了连接实例）达到该次数 → 重连自愈（契约 §3.4.1 钉扎语义）。 */
+const SID_MISMATCH_RECONNECT_THRESHOLD: number = 3;
 
 /** 链路状态（字符串字面量，UI 直接展示）。 */
 export type LinkState = 'idle' | 'deriving' | 'connecting' | 'handshaking' | 'online' | 'reconnecting' | 'stopped' | 'error';
+
+/**
+ * 会话纪元状态（契约 §3.4.1，v1.1.3）：
+ *  - self   : 本端自己的纪元（每条新连接 +1，**先持久化再使用**）
+ *  - peer   : 已接受的对端最高纪元（-1 = 尚未接受过任何对端证明）
+ *  - peerSid: 已钉扎的对端 sid（加固模式下必须与收到的 frame.sid 一致）
+ */
+export interface LinkEpochState {
+  self: number;
+  peer: number;
+  peerSid: string;
+}
 
 /** 配置（由配对页写入）。 */
 export interface LinkConfig {
@@ -91,6 +118,10 @@ export interface LinkConfig {
   relayToken: string;
   clientName: string;
   appVersion: string;
+  /** v1.1.3：纪元状态（缺省 = 不持久化，仅进程内自增；生产路径由 connections.ets 注入）。 */
+  epoch?: LinkEpochState;
+  /** v1.1.3：纪元状态变更回调（**先持久化再使用**的要求由调用方兑现）。 */
+  onEpoch?: (s: LinkEpochState) => void;
 }
 
 /** 对端在线状态（welcome.peers / peer-joined / peer-left 维护）。 */
@@ -221,6 +252,19 @@ export class DshrcLink {
   private helloTimerId: number = -1;
   private reconnectTimerId: number = -1;
   private katChecked: boolean = false; // 契约 §7 KAT 已通过（连接前执行一次）
+  // ---- v1.1.3 会话纪元（契约 §3.4.1）----
+  /** 纪元状态（self=自己的纪元 / peer=已接受的对端纪元 / peerSid=已钉扎的对端 sid）。 */
+  private epoch: LinkEpochState = { self: 0, peer: -1, peerSid: '' };
+  /** 对端握手证明版本 pv（0 = 未知；>=2 = 支持 v2 证明）。 */
+  private peerPv: number = 0;
+  /** 是否已知对端 pv（未知时**不能**发业务帧：否则 AAD 模式会选错）。 */
+  private peerPvKnown: boolean = false;
+  /** 当前模式：true = 加固（AAD 绑定 sid），false = 兼容（旧 AAD）。 */
+  private hardened: boolean = false;
+  /** 本连接是否已发过业务 hello（契约：收到 welcome 之后才发）。 */
+  private businessHelloSent: boolean = false;
+  /** 加固模式下连续 sid 不匹配的帧数（达到阈值 → 重连自愈）。 */
+  private sidMismatchCount: number = 0;
 
   /** UI 回调（在 UIAbility 主线程设置；WS 回调也在主线程分发）。 */
   onState: ((s: LinkState) => void) | null = null;
@@ -272,6 +316,16 @@ export class DshrcLink {
     this.sid = '';
     this.reconnectAttempts = 0;
     this.peers = { host: false, client: false };
+    // v1.1.3：纪元状态从配置注入（持久化在远程档案里 → 跨进程重启单调）。
+    const ep: LinkEpochState | undefined = cfg.epoch;
+    if (ep !== undefined) {
+      this.epoch = { self: ep.self, peer: ep.peer, peerSid: ep.peerSid };
+    }
+    this.peerPv = 0;
+    this.peerPvKnown = false;
+    this.hardened = false;
+    this.businessHelloSent = false;
+    this.sidMismatchCount = 0;
     this.setState('deriving');
     try {
       // 契约 §7：KAT 必须在连接建立前执行；成功后缓存，进程内只跑一次。
@@ -363,6 +417,15 @@ export class DshrcLink {
     // 契约 §4 v1.0.2：每条 WS 连接（含重连）生成新 sid，seq 从 1 重新开始
     this.sid = newSid();
     this.sendSeq = 0;
+    // 每条新连接重新判定模式（对端 pv 只能从本连接 welcome/peer-joined 的证明得知）
+    this.peerPv = 0;
+    this.peerPvKnown = false;
+    this.hardened = false;
+    this.businessHelloSent = false;
+    this.sidMismatchCount = 0;
+    // 契约 §3.4.1：每条新连接纪元 +1，**先持久化再使用**（跨进程重启必须单调）。
+    this.epoch.self = this.epoch.self + 1;
+    this.persistEpoch();
     const cfg: LinkConfig = this.cfg;
     this.setState(this.reconnectAttempts > 0 ? 'reconnecting' : 'connecting');
     const ws: webSocket.WebSocket = webSocket.createWebSocket();
@@ -413,7 +476,7 @@ export class DshrcLink {
     });
   }
 
-  /** WS 已建立：发送中继 hello（契约 §4）。 */
+  /** WS 已建立：发送中继 hello（契约 §4 + v1.1.3 §3.4.1 纪元证明 v2）。 */
   private onWsOpen(cfg: LinkConfig): void {
     this.setState('handshaking');
     this.lastRecvTs = Date.now();
@@ -422,8 +485,22 @@ export class DshrcLink {
     if (key === null) {
       return;
     }
-    helloSig(key, ROLE_CLIENT, cfg.channel).then((sig: string) => {
-      const hello: DshrcRelayFrame = { t: FRAME_HELLO, role: ROLE_CLIENT, ch: cfg.channel, sig: sig };
+    // v1.1.3：证明串覆盖 role/channel/纪元/时刻/版本/连接实例 id。
+    const epoch: number = this.epoch.self;
+    const ts: number = Date.now();
+    const pv: number = PROTO_HELLO_V2;
+    const sid: string = this.sid;
+    helloSig2(key, ROLE_CLIENT, cfg.channel, epoch, ts, pv, sid).then((sig: string) => {
+      const hello: DshrcRelayFrame = {
+        t: FRAME_HELLO,
+        role: ROLE_CLIENT,
+        ch: cfg.channel,
+        sig: sig,
+        e: epoch,
+        ts: ts,
+        pv: pv,
+        sid: sid
+      };
       if (cfg.relayToken.length > 0) {
         hello.token = cfg.relayToken;
       }
@@ -438,7 +515,7 @@ export class DshrcLink {
         }
       }, HELLO_TIMEOUT_MS);
     }).catch((e: BusinessError) => {
-      this.log('helloSig failed: ' + e.code);
+      this.log('helloSig2 failed: ' + e.code);
     });
   }
 
@@ -459,29 +536,25 @@ export class DshrcLink {
       case FRAME_WELCOME: {
         this.clearHelloTimer();
         this.reconnectAttempts = 0;
-        const peers: DshrcRelayPeers | undefined = frame.peers;
-        if (peers !== undefined) {
-          this.peers = { host: peers.host, client: peers.client };
-        }
-        this.setState('online');
-        this.startHeartbeat();
-        this.log('online, peers=' + JSON.stringify(this.peers));
-        this.emitPeers();
-        this.sendBusinessHello();
+        this.handleWelcome(frame).catch((e: Error) => {
+          this.log('welcome handling failed: ' + e.message);
+        });
         break;
       }
       case FRAME_PEER_JOINED: {
-        if (frame.role === 'host') {
+        if (frame.role === ROLE_HOST) {
           // host（重）上线：v1.0.2 起 host 每条连接生成新 sid 并重置 seq，
           // 去重按 sid 分桶，无需清空游标（契约 §4 v1.0.2）。
           this.peers.host = true;
           this.emitPeers();
-          this.log('host joined');
+          this.handlePeerJoined(frame).catch((e: Error) => {
+            this.log('peer-joined handling failed: ' + e.message);
+          });
         }
         break;
       }
       case FRAME_PEER_LEFT: {
-        if (frame.role === 'host') {
+        if (frame.role === ROLE_HOST) {
           this.peers.host = false;
           this.emitPeers();
           this.log('host left');
@@ -529,7 +602,190 @@ export class DshrcLink {
     }
   }
 
-  /** 密文帧：按 sid+":"+seq 去重 → 解密 → 业务分发（契约 §4 v1.0.2）。 */
+  // ---- v1.1.3 会话纪元（契约 §3.4.1）------------------------------------
+
+  /**
+   * welcome 处理（契约 §4 + §3.4.1）：
+   *  - 取对端 hello 证明（`welcome.peer`，中继原样透传）→ 验签 → 纪元单调性 → 钉扎 sid；
+   *  - 判定模式（双方 pv>=2 = 加固）；**知道对端 pv 之前不发业务帧**（否则 AAD 会选错）；
+   *  - 对端在线但没带证明 → 旧端（pv 视为 1）→ 兼容模式。
+   */
+  private async handleWelcome(frame: DshrcRelayFrame): Promise<void> {
+    const peers: DshrcRelayPeers | undefined = frame.peers;
+    if (peers !== undefined) {
+      this.peers = { host: peers.host, client: peers.client };
+    } else {
+      // 极老中继不带 peers：无从判断对端是否在线 → 退回兼容模式（v1.1.2 行为）。
+      this.log('welcome without peers field (legacy relay), compat mode');
+    }
+    const proof: DshrcPeerProof | undefined = frame.peer;
+    if (proof !== undefined) {
+      const accepted: boolean = await this.acceptPeerProof(proof);
+      if (!accepted) {
+        return; // 已拒绝连接（状态已置 error，停止自动重连）
+      }
+    } else if (peers === undefined || peers.host) {
+      // 对端在线却没带证明 → 旧端（pv 缺省视为 1）→ 兼容模式。
+      this.peerPv = 1;
+      this.peerPvKnown = true;
+      this.applyMode();
+    }
+    // 对端离线（peers.host=false）且没有证明 → 对端 pv 未知：
+    // **不发业务帧**（否则 AAD 模式可能与对端选得不一样）→ 等 peer-joined 拿到证明。
+    this.setState('online');
+    this.startHeartbeat();
+    this.log('online, peers=' + JSON.stringify(this.peers));
+    this.emitPeers();
+    this.maybeSendBusinessHello();
+  }
+
+  /**
+   * peer-joined 处理（契约 §4 + §3.4.1）：host 上线时中继带上它的 hello 证明。
+   * 证明里带新的 sid（host 每条连接一个新 sid）→ 重新钉扎；纪元必须比已接受值大。
+   */
+  private async handlePeerJoined(frame: DshrcRelayFrame): Promise<void> {
+    const proof: DshrcPeerProof | undefined = frame.peer;
+    if (proof !== undefined) {
+      const accepted: boolean = await this.acceptPeerProof(proof);
+      if (!accepted) {
+        return; // 已拒绝连接
+      }
+      this.log('host joined (proof accepted, epoch=' + this.epoch.peer.toString() + ')');
+    } else {
+      // 旧端上线（无证明）→ 兼容模式
+      this.peerPv = 1;
+      this.peerPvKnown = true;
+      this.applyMode();
+      this.log('host joined (legacy peer, no proof)');
+    }
+    this.maybeSendBusinessHello();
+  }
+
+  /**
+   * 接受对端 hello 证明（契约 §3.4.1）：
+   *  1. pv>=2 → 用本端 key 验 v2 证明串；验不过 → **拒绝连接**（疑似伪造/重放）。
+   *  2. 纪元单调性：同一 (e,sid) 重复出现 → 幂等接受（welcome 与 peer-joined 都带）；
+   *     e <= 已接受纪元 → **拒绝连接**（纪元回退 = 疑似重放）。
+   *  3. 通过 → 钉扎对端 sid + 持久化「已接受的对端纪元」。
+   */
+  private async acceptPeerProof(proof: DshrcPeerProof): Promise<boolean> {
+    const key: Uint8Array | null = this.key;
+    const cfg: LinkConfig | null = this.cfg;
+    if (key === null || cfg === null) {
+      return false;
+    }
+    const role: string = proof.role !== undefined && proof.role.length > 0 ? proof.role : ROLE_HOST;
+    const pv: number = proof.pv !== undefined ? proof.pv : 1;
+    const epoch: number = proof.e !== undefined ? proof.e : 0;
+    const ts: number = proof.ts !== undefined ? proof.ts : 0;
+    const sid: string = proof.sid !== undefined ? proof.sid : '';
+    const sig: string = proof.sig !== undefined ? proof.sig : '';
+    // 1) 验签（只有 pv>=2 才有 v2 证明）
+    if (pv >= PROTO_HELLO_V2) {
+      if (!Number.isInteger(epoch) || epoch < 0) {
+        this.rejectPeerProof('proof has bad epoch');
+        return false;
+      }
+      if (!SID_PATTERN.test(sid)) {
+        this.rejectPeerProof('proof has bad sid');
+        return false;
+      }
+      if (sig.length === 0) {
+        this.rejectPeerProof('proof incomplete (pv>=2 but no sig)');
+        return false;
+      }
+      let expect: string = '';
+      try {
+        expect = await helloSig2(key, role, cfg.channel, epoch, ts, pv, sid);
+      } catch (e) {
+        this.rejectPeerProof('proof verify error');
+        return false;
+      }
+      if (expect !== sig) {
+        this.rejectPeerProof('proof signature mismatch (pv=' + pv.toString() + ')');
+        return false;
+      }
+    }
+    // 2) 纪元单调性（抗回滚）
+    const lastEpoch: number = this.epoch.peer;
+    const lastSid: string = this.epoch.peerSid;
+    if (lastEpoch >= 0) {
+      if (epoch === lastEpoch && sid === lastSid) {
+        // 同一份证明重复出现（welcome + peer-joined）→ 幂等接受，不更新持久化值。
+        this.peerPv = pv;
+        this.peerPvKnown = true;
+        this.applyMode();
+        return true;
+      }
+      if (epoch <= lastEpoch) {
+        this.rejectPeerProof('peer epoch rollback (e=' + epoch.toString() +
+          ' <= accepted ' + lastEpoch.toString() + ')');
+        return false;
+      }
+    }
+    // 3) 接受：钉扎 sid + 持久化已接受纪元
+    this.epoch.peer = epoch;
+    this.epoch.peerSid = sid;
+    this.persistEpoch();
+    this.peerPv = pv;
+    this.peerPvKnown = true;
+    this.applyMode();
+    return true;
+  }
+
+  /** 拒绝连接（验签失败 / 纪元回退）：终局错误，停止自动重连。 */
+  private rejectPeerProof(reason: string): void {
+    this.log('peer proof rejected: ' + reason);
+    this.shouldRun = false;
+    this.clearHeartbeatTimer();
+    this.clearHelloTimer();
+    this.clearReconnectTimer();
+    this.setState('error');
+    this.peers = { host: false, client: false };
+    this.emitPeers();
+    this.stopInternal('peer-proof-rejected');
+  }
+
+  /** 模式判定（契约 §3.4.1）：本端 pv>=2 且对端 pv>=2 = 加固，否则兼容。 */
+  private applyMode(): void {
+    const before: boolean = this.hardened;
+    this.hardened = this.peerPvKnown && this.peerPv >= PROTO_HELLO_V2;
+    if (this.hardened !== before) {
+      this.log('mode: ' + (this.hardened ? 'hardened (aad bound to sid)' : 'compat (legacy aad)'));
+    }
+  }
+
+  /** 持久化纪元状态（先持久化再使用——契约 §3.4.1）。 */
+  private persistEpoch(): void {
+    const cfg: LinkConfig | null = this.cfg;
+    if (cfg === null) {
+      return;
+    }
+    const cb: ((s: LinkEpochState) => void) | undefined = cfg.onEpoch;
+    if (cb === undefined) {
+      return;
+    }
+    const st: LinkEpochState = {
+      self: this.epoch.self,
+      peer: this.epoch.peer,
+      peerSid: this.epoch.peerSid
+    };
+    cb(st);
+  }
+
+  /**
+   * 业务 hello（契约 §5.1）只在**知道对端 pv 之后**发——
+   * 否则 AAD 模式会与对端选得不一样（加固 AAD 多一段 sid），双方都解不开。
+   */
+  private maybeSendBusinessHello(): void {
+    if (!this.peerPvKnown || this.businessHelloSent) {
+      return;
+    }
+    this.businessHelloSent = true;
+    this.sendBusinessHello();
+  }
+
+  /** 密文帧：按 sid+":"+seq 去重 → 解密 → 业务分发（契约 §4 v1.0.2 + §3.4.1 钉扎）。 */
   private onRelayFrame(frame: DshrcRelayFrame): void {
     const key: Uint8Array | null = this.key;
     const sid: string = frame.sid !== undefined ? frame.sid : SID_LEGACY;
@@ -538,30 +794,60 @@ export class DshrcLink {
     if (key === null || seq <= 0 || data.length === 0) {
       return;
     }
+    // 加固模式：帧的 sid 必须等于**已钉扎的对端 sid**，否则丢弃（契约 §3.4.1）。
+    if (this.hardened) {
+      const pinned: string = this.epoch.peerSid;
+      if (pinned.length === 0 || sid !== pinned) {
+        this.sidMismatchCount = this.sidMismatchCount + 1;
+        this.log('frame sid not pinned, dropped (mismatch=' + this.sidMismatchCount.toString() + ')');
+        if (this.sidMismatchCount >= SID_MISMATCH_RECONNECT_THRESHOLD) {
+          // 对端换了连接实例（host 重启）而中继没发 peer-joined → 重连取新 welcome 证明自愈。
+          this.sidMismatchCount = 0;
+          this.log('too many sid mismatches, reconnecting to re-pin peer');
+          this.forceReconnect('sid-mismatch');
+        }
+        return;
+      }
+      this.sidMismatchCount = 0;
+    }
     if (this.isDuplicate(sid, seq)) {
       this.log('dup frame ' + sid + ':' + seq.toString() + ' dropped');
       return;
     }
-    open(key, 'host', seq, data).then((pt: string) => {
-      let m: DshrcMsg;
-      try {
-        m = JSON.parse(pt) as DshrcMsg;
-      } catch (e) {
-        this.log('bad business json, dropped');
-        return;
-      }
-      if (this.correlator.deliver(m)) {
-        return;
-      }
-      // 直接回调（兼容，sessionstore 实时更新走这条）+ 事件总线并行广播。
-      if (this.onEvent !== null) {
-        this.onEvent(m);
-      }
-      postBusMsg(m);
+    if (this.hardened) {
+      // AAD 绑定**发送方**（host）的 sid —— 与钉扎值一致（上面已校验）。
+      open(key, ROLE_HOST, seq, data, sid).then((pt: string) => {
+        this.dispatchPlain(pt);
+      }).catch((e: BusinessError) => {
+        this.log('decrypt failed seq=' + seq + ' err=' + e.code);
+      });
+      return;
+    }
+    open(key, ROLE_HOST, seq, data).then((pt: string) => {
+      this.dispatchPlain(pt);
     }).catch((e: BusinessError) => {
       // 认证失败（AAD/密钥不匹配）：丢弃该帧
       this.log('decrypt failed seq=' + seq + ' err=' + e.code);
     });
+  }
+
+  /** 解密后的业务消息：JSON 解析 → 请求-响应关联 / 事件分发。 */
+  private dispatchPlain(pt: string): void {
+    let m: DshrcMsg;
+    try {
+      m = JSON.parse(pt) as DshrcMsg;
+    } catch (e) {
+      this.log('bad business json, dropped');
+      return;
+    }
+    if (this.correlator.deliver(m)) {
+      return;
+    }
+    // 直接回调（兼容，sessionstore 实时更新走这条）+ 事件总线并行广播。
+    if (this.onEvent !== null) {
+      this.onEvent(m);
+    }
+    postBusMsg(m);
   }
 
   /**
@@ -689,7 +975,11 @@ export class DshrcLink {
     }, 5000);
   }
 
-  /** 业务层 hello（契约 §5.1，连接后首条；host 离线时中继缓存补发）。 */
+  /**
+   * 业务层 hello（契约 §5.1，连接后首条；host 离线时中继缓存补发）。
+   * payload.sig 仍用 v1 证明串（`hello|role|channel`）——旧插件互操作；
+   * v2 证明（契约 §3.4.1）只用于**传输层** hello 帧。
+   */
   private sendBusinessHello(): void {
     const key: Uint8Array | null = this.key;
     const cfg: LinkConfig | null = this.cfg;
@@ -729,6 +1019,10 @@ export class DshrcLink {
     const to: number = timeoutMs !== undefined ? timeoutMs : DEFAULT_REQ_TIMEOUT_MS;
     if (this.state !== 'online') {
       return Promise.reject(new Error('link not online'));
+    }
+    // 契约 §3.4.1：还不知道对端 pv → 不知道该用哪种 AAD → 不能发业务帧。
+    if (!this.peerPvKnown) {
+      return Promise.reject(new Error('peer mode unknown (host proof not received)'));
     }
     return this.correlator.request((m: DshrcMsg) => {
       this.sealAndSend(m);
@@ -998,19 +1292,36 @@ export class DshrcLink {
     });
   }
 
-  /** 加密并发送一条业务消息（v1.0.2：sid 随帧携带，seq 每条连接从 1 递增；AAD 仍为 client|seq）。 */
+  /**
+   * 加密并发送一条业务消息（v1.0.2：sid 随帧携带，seq 每条连接从 1 递增）。
+   * AAD（契约 §7）：兼容模式 = "dshrc|client|seq"；加固模式 = "dshrc|client|seq|" + 本端 sid。
+   */
   private sealAndSend(m: DshrcMsg): void {
     const key: Uint8Array | null = this.key;
     if (key === null || this.ws === null || this.sid.length === 0) {
       throw new Error('link not ready');
     }
+    if (!this.peerPvKnown) {
+      throw new Error('peer mode unknown');
+    }
     this.sendSeq = this.sendSeq + 1;
     const seq: number = this.sendSeq;
     const sid: string = this.sid; // 捕获本条连接的 sid（重连后旧帧不会串桶）
     const pt: string = JSON.stringify(m);
-    seal(key, ROLE_CLIENT, seq, pt).then((data: string) => {
+    const sendSealed: (data: string) => void = (data: string): void => {
       const frame: DshrcRelayFrame = { t: FRAME_FRAME, sid: sid, seq: seq, data: data };
       this.sendRelayJson(JSON.stringify(frame));
+    };
+    if (this.hardened) {
+      seal(key, ROLE_CLIENT, seq, pt, undefined, sid).then((data: string) => {
+        sendSealed(data);
+      }).catch((e: BusinessError) => {
+        this.log('seal failed: ' + e.code);
+      });
+      return;
+    }
+    seal(key, ROLE_CLIENT, seq, pt).then((data: string) => {
+      sendSealed(data);
     }).catch((e: BusinessError) => {
       this.log('seal failed: ' + e.code);
     });

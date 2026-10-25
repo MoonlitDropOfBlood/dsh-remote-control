@@ -195,3 +195,13 @@ grep -rnE "@State|@Prop|@Link|@ObjectLink|@Observed[^V]|@Provide|@Consume|@Watch
   （`FS_SMALL` + `label_secondary`），复用气泡的正文主题会让「思考」和「回答」分不开
   （用户反馈「思考中的文字颜色和之前版本不一致」）。`setupMarkdownTheme()` 拆成
   `applyMarkdownTheme(ctrl, dim)`，两套主题同源。
+- **v1.1.3 抗重放：会话纪元（契约 §3.4.1）**——手机端是 **client 角色**：
+  - 传输层 hello 带 `e`(纪元)/`ts`/`pv=2`/`sid`，`sig` 换成 v2 证明串
+    `hello2|role|channel|e|ts|pv|sid`（旧的 `hello|role|channel` 保留给旧插件互操作）。
+  - **对端证明从 `welcome.peer` / `peer-joined.peer` 拿**（中继原样透传，插件的证明）→
+    验签 → 判定模式（双方 pv≥2 = 加固）→ **钉扎插件的 sid** → 收帧时 sid 不符即丢。
+  - **纪元持久化**：自己的纪元跨重启单调递增（存在远程配置里）；「已接受的对端最高纪元」
+    也持久化——对端纪元回退（≤ 已接受值）= **拒绝连接**（同一份证明重复出现则幂等接受）。
+  - **AAD 两模式**：兼容 `dshrc|role|seq`；加固 `dshrc|role|seq|sid`（sid = 发送方自己）。
+  - **业务 hello 必须在 welcome 之后发**（否则还不知道对端 pv → AAD 选错）。
+  - 自己的 sid 本来就有（`newSid()`），只是过去没进 AAD。

@@ -7,7 +7,8 @@ WebSocket 哑管道：在 host 与 client 之间**只转发密文帧**，不理�
 
 ```
 server.js           单文件可跑（Node ≥20 + ws）；导出 createRelay/loadConfig 供测试注入
-test/               node:test × 10（hello 校验/转发/离线缓存/顶替/限速/心跳/seq 透传）
+test/               node:test × 29（hello 校验/转发/离线缓存/顶替/限速/心跳/seq 透传/IPv4+IPv6 双栈
+                    + v1.1.3 证明透传/TLS）
 scripts/smoke.mjs   端到端冒烟（npm run smoke）
 README.md           部署文档（systemd + Caddy WSS 反代 + Docker）
 Dockerfile          node:22-alpine，非 root
@@ -16,7 +17,7 @@ Dockerfile          node:22-alpine，非 root
 ## 构建与验收
 
 ```bash
-npm install && npm test        # 10/10 必须全绿
+npm install && npm test        # 29/29 必须全绿
 npm run smoke                  # 真实双端冒烟
 PORT=8788 node server.js       # 本机起（联调常用 8788）
 ```
@@ -30,7 +31,9 @@ PORT=8788 node server.js       # 本机起（联调常用 8788）
   误杀新连接 seq=1 的首帧（实测 bug）。
 - **离线缓存**：256 条 / 24h，FIFO 丢旧；补发 urgent 优先、其余按 seq 升序。
 - **同 channel 同 role 单活跃连接**：新顶旧（旧连接收 `error:replaced` + close 4001，
-  对端不发 peer-joined/left，避免抖动）。
+  **不发 peer-left**；v1.1.3 起顶替时**要发 peer-joined**（带新证明，对端要重新钉扎））。
+- **双栈监听**：默认绑定 `::`（IPv4+IPv6），仅 IPv6 不可用时回落 `0.0.0.0`；
+  IPv4-mapped 对端地址必须归一为普通 IPv4，保持限速分桶与旧行为一致。
 - 心跳：30s 无帧发 ping（应用层 + ws 协议层双发），90s 无消息判死；
   detach 必须幂等（不等异步 close 事件，保证重连看到干净状态）。
 - 端口解析允许 `PORT=0`（内核随机端口，测试用）——`intFromEnv` 的 `>0` 判断曾把 0
@@ -46,3 +49,16 @@ PORT=8788 node server.js       # 本机起（联调常用 8788）
 
 见 README.md：零公网部署跑在 PC 上即可（手机连 `ws://<PC-IP>:<port>`）；
 公网部署用 systemd + Caddy 反代 WSS。RELAY_TOKEN 可选（配置后 hello 必须带 token）。
+
+### v1.1.3：证明透传 + 原生 TLS（契约 §3.4.1 / §3.4.2）
+
+- **哑管道 + 证明透传**：中继**不校验** `sig`（没有密钥），只把对端 hello 里的
+  `e/ts/pv/sid/sig` **逐字复制**到 `welcome.peer` / `peer-joined.peer`
+  （`extractProof` / `peerProofOf`）。复制时**不重排、不补默认值**。
+- **顶替场景也发 peer-joined**（v1.1.3 修订）：加固模式下对端钉着对端的 sid/纪元，
+  顶替换了新连接（sid 与纪元都变）→ 对端必须重新钉扎，否则新帧全被丢弃、链路死到重连。
+  （v1.1.2 顶替不对端有影响：那时 sid 只用于去重分桶。）
+- **原生 TLS**：`RELAY_TLS_CERT` / `RELAY_TLS_KEY`（**PEM 文件路径**）都配 → 以
+  **wss://** 提供服务；都没配 → 明文 ws://（默认不变）；**只配一个 / 文件读不到 /
+  证书非法 → 启动即失败**（绝不静默降级成明文）。TLS 是抗重放最彻底的防线
+  （服务端身份认证 → 中继无法冒充对端）。

@@ -285,6 +285,7 @@ export class RelaySupervisor {
    * @param {object} [opts]
    * @param {boolean} [opts.autoStart]  默认 true
    * @param {string} [opts.relayToken]  中继自身 token（配置了才带）
+   * @param {{cert?:string,key?:string}} [opts.tls] 中继 TLS 证书/私钥**文件路径**（契约 §3.4.2）
    * @returns {Promise<object>} 状态快照
    */
   async ensure(relayUrl, opts = {}) {
@@ -417,16 +418,17 @@ export class RelaySupervisor {
       });
       return this.status;
     }
-    return await this.start(target.port, opts.relayToken);
+    return await this.start(target.port, opts.relayToken, opts.tls);
   }
 
   /**
    * 真正 spawn 中继子进程。
    * @param {number} port
    * @param {string} [relayToken]
+   * @param {{cert?:string,key?:string}} [tls] TLS 证书/私钥**文件路径**（契约 §3.4.2）
    * @returns {Promise<object>} 状态快照
    */
-  async start(port, relayToken = "") {
+  async start(port, relayToken = "", tls = null) {
     const env = {
       ...process.env,
       PORT: String(port),
@@ -442,6 +444,17 @@ export class RelaySupervisor {
     }
     if (typeof relayToken === "string" && relayToken !== "") {
       env.RELAY_TOKEN = relayToken;
+    }
+    // v1.1.3：TLS（契约 §3.4.2）——两个都配了才让中继起 wss://；
+    // 只配一个 → 中继启动即失败（不静默降级明文），这里提前拒绝，别白等。
+    const tlsCert = typeof tls?.cert === "string" ? tls.cert.trim() : "";
+    const tlsKey = typeof tls?.key === "string" ? tls.key.trim() : "";
+    if (tlsCert !== "" || tlsKey !== "") {
+      if (tlsCert === "" || tlsKey === "") {
+        throw new Error("TLS 配置不完整：证书与私钥路径必须同时提供（契约 §3.4.2）。");
+      }
+      env.RELAY_TLS_CERT = tlsCert;
+      env.RELAY_TLS_KEY = tlsKey;
     }
     let child;
     try {

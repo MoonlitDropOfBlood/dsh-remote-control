@@ -516,7 +516,9 @@ struct Index {
         if (this.store.pendingCount() > 0) {
           this.pendingBanner()
         }
-        Refresh({ refreshing: this.refreshing }) {
+        // V2 双向绑定（!!）：refreshing 不走 !! 的话组件拿不到「正在刷新」状态，
+        // 松手转圈立即弹回——用户看到的就是「下拉刷新没用」（真机实测）。
+        Refresh({ refreshing: this.refreshing!! }) {
           List({ space: SP_2 }) {
             if (this.listItems().length === 0) {
               ListItem() {

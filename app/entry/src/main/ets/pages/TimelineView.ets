@@ -406,13 +406,15 @@ struct StepGroup {
 
 /**
  * 「思考过程」折叠块（kind="reasoning"）：lightbulb 图标 + 标题 + 固定尺寸 chevron。
- * 默认收起，点标题行展开/收起；正文用 item.text（FS_SMALL + label_secondary），
- * 左缩进 + padding，刻意弱化——既不是等宽代码块，也不是助手气泡。
+ * 默认收起，点标题行展开/收起；展开正文走共享 MarkdownController 渲染
+ * （思考内容常含代码块/列表，纯 Text 展示会甩出一堆裸标记——用户反馈）。
  * 流式刷新：item 为 @Param，item.text 是 model 侧 @Trace 字段，原地增量更新即可自然刷新。
  */
 @ComponentV2
 struct ReasoningCard {
   @Require @Param item: TimelineItem;
+  /** 共享的 markdown 渲染控制器（与助手气泡同主题，页面级创建后下传）。 */
+  @Require @Param mdController: MarkdownController;
   /** 默认收起。 */
   @Local expanded: boolean = false;
 
@@ -443,11 +445,12 @@ struct ReasoningCard {
       })
 
       if (this.expanded) {
-        Text(this.item.text)
-          .fontSize(FS_SMALL)
-          .fontColor($r('app.color.label_secondary'))
-          .width('100%')
-          .padding({ left: SP_4, right: SP_2, top: SP_2, bottom: SP_2 })
+        Column() {
+          Markdown({ text: this.item.text, controller: this.mdController })
+            .width('100%')
+        }
+        .width('100%')
+        .padding({ left: SP_4, right: SP_2, top: SP_2, bottom: SP_2 })
       }
     }
     .width('100%')
@@ -475,8 +478,8 @@ export struct TimelineView {
           } else if (cell.item.head.kind === 'system') {
             SystemNote({ item: cell.item.head })
           } else if (cell.item.head.kind === 'reasoning') {
-            // 思考过程：独立折叠块，不进消息气泡、也不并入工作步骤分组
-            ReasoningCard({ item: cell.item.head })
+            // 思考过程：独立折叠块（展开正文走 markdown），不进消息气泡、也不并入工作步骤分组
+            ReasoningCard({ item: cell.item.head, mdController: this.mdController })
           } else {
             MessageBubble({ item: cell.item.head, mdController: this.mdController })
           }

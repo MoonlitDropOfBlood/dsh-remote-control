@@ -96,6 +96,8 @@ export struct SessionDetailPage {
   @Local followBottom: boolean = true;
   /** 模型选择面板是否展开（V2 bindSheet 用 $$ 双向绑定）。 */
   @Local modelSheetOpen: boolean = false;
+  /** 下拉刷新进行中（Refresh !! 双向绑定）。 */
+  @Local refreshing: boolean = false;
   /** 面板内选中的模型目录 id。 */
   @Local sheetModelId: string = '';
   /** 面板内选中的思考强度 id（'' = 默认）。 */
@@ -257,6 +259,22 @@ export struct SessionDetailPage {
       this.autoScrollPending = false;
       this.followBottom = this.nearBottom();
     }
+  }
+
+  /**
+   * 下拉刷新：重拉最新一页历史（wire 幂等，按 sid:seq 去重），完成后收起刷新态。
+   * 离线 / 空会话直接收起（Refresh 的转圈不能卡住）。
+   */
+  private doPullRefresh(): void {
+    if (this.sessionId.length === 0 || this.store.linkState !== 'online') {
+      this.refreshing = false;
+      return;
+    }
+    this.store.loadHistory(this.sessionId, false).then((): void => {
+      this.refreshing = false;
+    }).catch((): void => {
+      this.refreshing = false;
+    });
   }
 
   /**
@@ -825,44 +843,53 @@ export struct SessionDetailPage {
         this.subagentBar()
       }
 
-      Scroll(this.scroller) {
-        Column() {
-          this.historyBar()
-          if (this.store.timeline.length === 0) {
-            if (!this.store.historyLoading) {
-              this.emptyState()
+      // 下拉刷新（V2 !! 双向绑定）：重拉最新一页历史；Scroll 的贴底/跟随逻辑不受影响
+      //（Refresh 只在内容顶到顶时接管下拉手势，向上滚动照常）。
+      Refresh({ refreshing: this.refreshing!! }) {
+        Scroll(this.scroller) {
+          Column() {
+            this.historyBar()
+            if (this.store.timeline.length === 0) {
+              if (!this.store.historyLoading) {
+                this.emptyState()
+              }
+            } else {
+              TimelineView({
+                items: this.store.timeline,
+                mdController: this.mdCtrl
+              })
             }
-          } else {
-            TimelineView({
-              items: this.store.timeline,
-              mdController: this.mdCtrl
-            })
           }
+          .width('100%')
+          .padding({ left: SP_4, right: SP_4, top: SP_2, bottom: SP_3 })
         }
         .width('100%')
-        .padding({ left: SP_4, right: SP_4, top: SP_2, bottom: SP_3 })
+        .height('100%')
+        .scrollBar(BarState.Off)
+        .align(Alignment.Top)
+        // 滚动位置跟踪：用户手指滚动（Scroll 状态）时更新「是否仍在底部」；
+        // 触底（onScrollEdge）与停止滚动（onScrollStop）恢复跟随。
+        .onDidScroll((xOffset: number, yOffset: number, state: ScrollState): void => {
+          this.handleUserScroll(state);
+        })
+        .onScrollEdge((side: Edge): void => {
+          if (side === Edge.Bottom) {
+            this.followBottom = true;
+          }
+        })
+        .onScrollStop((): void => {
+          this.followBottom = this.nearBottom();
+        })
+        // 视口高度（vp）：用于「接近底部」的距离判定
+        .onAreaChange((oldArea: Area, newArea: Area): void => {
+          const h: Length = newArea.height;
+          this.viewportVp = typeof h === 'number' ? h : 0;
+        })
       }
       .width('100%')
       .layoutWeight(1)
-      .scrollBar(BarState.Off)
-      .align(Alignment.Top)
-      // 滚动位置跟踪：用户手指滚动（Scroll 状态）时更新「是否仍在底部」；
-      // 触底（onScrollEdge）与停止滚动（onScrollStop）恢复跟随。
-      .onDidScroll((xOffset: number, yOffset: number, state: ScrollState): void => {
-        this.handleUserScroll(state);
-      })
-      .onScrollEdge((side: Edge): void => {
-        if (side === Edge.Bottom) {
-          this.followBottom = true;
-        }
-      })
-      .onScrollStop((): void => {
-        this.followBottom = this.nearBottom();
-      })
-      // 视口高度（vp）：用于「接近底部」的距离判定
-      .onAreaChange((oldArea: Area, newArea: Area): void => {
-        const h: Length = newArea.height;
-        this.viewportVp = typeof h === 'number' ? h : 0;
+      .onRefreshing((): void => {
+        this.doPullRefresh();
       })
 
       // 本会话的审批 / 提问卡片（输入条上方；resolved / answered 后消失）

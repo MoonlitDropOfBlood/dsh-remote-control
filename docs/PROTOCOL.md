@@ -11,6 +11,11 @@
 > `session.prompt` **不再收客户端的 mode**（传了也忽略），插件读宿主「繁忙时的发送行为」
 > （`ui-conversation.busyEnter`）；`session.capabilities` 增 `busyEnter`（只读）；
 > 新增请求 `session.queue`（拉取队列快照，断线重连后补状态）。
+> **v1.1.3 于 2026-10-26 增补：抗重放的「会话纪元」**——传输层 hello 增 `e`(纪元)/`ts`/`pv`/`sid`
+> 且 HMAC 覆盖它们（`hello2|…` 串）；中继在 welcome/peer-joined 里**原样透传**对端证明；
+> 接收方**持久化**对端最高纪元（纪元回退 = 拒绝连接）+ **钉扎**对端 sid（跨会话重放直接丢弃）；
+> 双方 pv≥2 时业务帧 AAD 升级为 `dshrc|role|seq|sid`（v1.1.2 及以前是 `dshrc|role|seq`）。
+> 另：中继支持原生 TLS（`RELAY_TLS_CERT`/`RELAY_TLS_KEY` → 直接提供 `wss://`）。
 > 三个实现（DSH 插件 / 中继服务器 / HarmonyOS App）
 > 都必须以本文档为准；任何协议改动必须先改本文档并通知 Lead。
 
@@ -63,6 +68,51 @@ key = HKDF-SHA256(
 4. 轻量握手证明（防滥用，中继可选校验）：`hello` 帧携带
    `sig = base64url(HMAC-SHA256(key, UTF8("hello|" + role + "|" + channel)))`，role ∈ {host, client}。
 
+### 3.4.1 握手证明 v2：会话纪元（v1.1.3，抗重放）
+
+v1.1.2 及以前的传输层 `sig`（`hello|role|channel`）**只被携带、不被对端校验**（中继无密钥），
+于是「恶意/被攻陷的中继」可以把**旧会话录下的密文帧**重放进新会话（跨进程重启后去重表为空，
+旧帧会被当成新帧执行）。v1.1.3 用**会话纪元**堵这个窗口。
+
+**v2 证明串**（`hello` 帧的 `sig` 字段，取代 v1 的格式）：
+
+```
+sig = base64url(HMAC-SHA256(key, UTF8("hello2|" + role + "|" + channel + "|" + e + "|" + ts + "|" + pv + "|" + sid)))
+```
+
+| 字段 | 类型 | 含义 |
+|---|---|---|
+| `e` | int | **会话纪元**：发送方自己的纪元号，**跨进程重启单调递增**（每开一条新连接 +1），**必须持久化** |
+| `ts` | int | 发送时刻 Unix 毫秒（**仅诊断用**：不参与安全判定——不信任时钟） |
+| `pv` | int | 协议版本：v1.1.3 = **2**；v1.1.2 及以前**不带**该字段（视为 pv=1） |
+| `sid` | string | 发送方的连接实例 id（8 位十六进制，与 `frame.sid` 同值） |
+
+**模式协商**（双方各自独立判断，必须一致）：
+
+- **加固模式**：本端 `pv ≥ 2` **且** 对端 `pv ≥ 2`。
+  - 业务帧 AAD = `UTF8("dshrc|" + role + "|" + seq + "|" + sid)`（见 §7）；
+  - 接收方**钉扎**对端 `sid`（来自对端证明）：收到的业务帧 `frame.sid` 与钉扎值不符 → **丢弃**；
+  - 接收方**持久化**「已接受的对端最高纪元」：对端 `e ≤ 已接受值` → **拒绝连接**（纪元回退 = 疑似重放）。
+- **兼容模式**：任一方 `pv < 2`（旧端）。业务帧 AAD = `UTF8("dshrc|" + role + "|" + seq)`（v1.1.2 行为）。
+
+对端的 `pv/e/ts/sid/sig` 由中继在 `welcome` / `peer-joined` 里**原样透传**（§4）——
+中继没有密钥，**只能复制不能伪造**；接收方用本端 key 验签后即可信任。
+**发送方必须在收到 welcome 之后才发业务帧**（否则还不知道对端 pv → AAD 选错）。
+对端在线但**还没发过** hello 证明（旧端）时，按兼容模式处理。
+
+> 残余风险（写在明面上）：纪元与「已接受纪元」必须**持久化**才跨重启有效；
+> 若某一端在纪元持久化被清空（换机/清数据）后仍信任旧纪元，仍存在一次重放窗口。
+> 该窗口的根治手段是 TLS（`wss://`，服务端身份认证 → 中继无法冒充对端），
+> 见 §3.4.2。
+
+### 3.4.2 中继的 TLS（v1.1.3）
+
+中继可选原生 TLS：设置 `RELAY_TLS_CERT`（PEM 证书链）与 `RELAY_TLS_KEY`（PEM 私钥）后
+中继以 **HTTPS/WSS** 提供服务（否则是明文 HTTP/WS）。配置后插件/手机端的
+`relayUrl` 必须写成 `wss://<host>:<port>`（两端都支持 `ws://` 与 `wss://`）。
+TLS 提供服务端身份认证与链路机密性——它把「恶意中继」这个位置直接消灭，
+是抗重放最彻底的防线（应用层的纪元是纵深防御）。
+
 ### 3.5 配对二维码（v1.0.3）
 
 PC 端（DSH 插件）把配对信息编码成一条 URI 并渲染为二维码显示；手机端扫码后自动填参连接。
@@ -85,9 +135,9 @@ dshrc://pair?r=<encodeURIComponent(relayUrl)>&c=<channel>&s=<secret>[&t=<encodeU
 
 | 方向 | 消息 | 字段 | 说明 |
 |---|---|---|---|
-| peer→relay | `hello` | `t, role("host"\|"client"), ch, sig` | 连接后 10s 内必须发送，否则中继断开 |
-| relay→peer | `welcome` | `t, peers:{host:bool,client:bool}` | hello 校验通过后回 |
-| relay→peer | `peer-joined` / `peer-left` | `t, role` | 对端上线/下线 |
+| peer→relay | `hello` | `t, role("host"\|"client"), ch, sig`, v1.1.3 增 `e, ts, pv, sid` | 连接后 10s 内必须发送，否则中继断开 |
+| relay→peer | `welcome` | `t, peers:{host:bool,client:bool}`, v1.1.3 增 `peer:{role,e,ts,pv,sid,sig}` | hello 校验通过后回；`peer` = 对端在线时**原样复制**的对端 hello 证明 |
+| relay→peer | `peer-joined` / `peer-left` | `t, role`, v1.1.3 增 `peer:{role,e,ts,pv,sid,sig}` | 对端上线/下线；`peer-joined` 带新上线方的证明 |
 | peer→relay | `frame` | `t, sid, seq(number), data(base64 ciphertext)`, 可选 `urgent`(bool) | 转发给对端；`sid` 见下方 v1.0.2 |
 | relay→peer | `frame` | `t, from("host"\|"client"), sid, seq, data` | 原样转发 |
 | 双向 | `ping` / `pong` | `t` | 应用层心跳，30s 无帧即发；90s 无任何消息判死 |
@@ -98,6 +148,9 @@ dshrc://pair?r=<encodeURIComponent(relayUrl)>&c=<channel>&s=<secret>[&t=<encodeU
 - **离线缓存**：对端不在线时，中继缓存发往该端的 `frame`，上限 256 条 / 24h（FIFO 丢旧），重连后按 seq 顺序补发。
   `urgent` 标记的帧（审批/提问）优先补发。
 - seq 为发送端单调递增序号（**每条连接从 1 开始**），用于去重与排序；接收端容忍乱序（按 seq 缓冲或直接上交应用层均可）。
+- **v1.1.3：中继是哑管道**——它**不验证** `sig`（没有密钥），只**原样复制**对端 hello 证明到
+  `welcome.peer` / `peer-joined.peer`。复制时**字段必须逐字透传**（不重排、不补默认值、
+  不校验数值），否则对端验签失败。`peer-joined` 只在该 role **真正新上线**时发（顶替场景对端视角无变化）。
   **v1.0.2 去重键修正**：`sid` 是发送端实例 id（每条 WebSocket 连接生成一次，8 位十六进制随机，随每帧携带）；
   接收端去重键为 `sid + ":" + seq`（不是裸 seq——否则新客户端的 seq=1 会被误判为旧客户端的重复帧）。
   `seen` 表按 sid 分桶，单 sid 超过 4096 项或总 sid 数超过 64 时淘汰最旧。缺 `sid` 的帧按 `"legacy":seq` 处理。
@@ -414,8 +467,11 @@ v1.1.1 的口径：
 - 算法：AES-256-GCM，IV 12 字节/消息（CSPRNG 随机）。
   **载荷布局（v1.0.1 修正）**：`frame.data = base64url( iv(12) || ciphertext || tag(16) )`，
   即 IV 随消息一起走，整个 data 对中继不透明。
-- AAD：`UTF8("dshrc|" + role + "|" + seq)`，role 为**发送方** role，seq 为该消息的 `frame.seq`。
-  （AAD 绑定序号防重放/串帧；两端实现必须支持。）
+- AAD：**兼容模式**（v1.1.2 及以前，或任一方 pv<2）= `UTF8("dshrc|" + role + "|" + seq)`，
+  role 为**发送方** role，seq 为该消息的 `frame.seq`。
+  **加固模式**（v1.1.3，双方 pv≥2）= `UTF8("dshrc|" + role + "|" + seq + "|" + sid)`，
+  `sid` 为**发送方**的连接实例 id（= 该帧的 `frame.sid`）。
+  （AAD 绑定序号防重放/串帧；加固模式再绑定连接纪元，防跨会话重放。两端实现必须支持。）
 
 已知答案测试（KAT）。注意：KAT 中的 channel 字面量仅为测试输入（不参与格式校验），
 实现方**照抄字面量和期望值**即可；运行时生成的 channel 必须满足 §3/§4 的 `^[A-Z2-7]{16,64}$`：
@@ -434,8 +490,14 @@ ctHex   = 72b6fd46c5981533620ae9edc88cf0d607c89b5ad3da2d5ddd0548d6aef0c53e
           4b242be9c97ead9930a1374918a2f46dc861811055c1cbe1a3
 tagHex  = 292260ad46868699ac0bda00a1336cb4
 AAD     = ""   ← 注意：本 KAT 用空 AAD，便于对齐；AAD 绑定逻辑单独测试：
-           encrypt(role="host", seq=7) 时 AAD = "dshrc|host|7" 的 UTF-8 字节。
+           encrypt(role="host", seq=7) 时 AAD = "dshrc|host|7" 的 UTF-8 字节
+           （v1.1.3 加固模式再加 "|sid"，如 "dshrc|host|7|a1b2c3d4"）。
 ```
+
+> **v1.1.3：§7 的固定向量（key/iv/ct/tag）不变**（用的仍是空 AAD）——
+> 变的只是 AAD 的**格式**与新增的绑定维度，两端实现各自补这些断言：
+> ① 换 role 解密必须失败；② 换 seq 解密必须失败；③ **换 sid 解密必须失败**（加固模式）；
+> ④ 纪元回退（对端 e ≤ 已接受值）必须**拒绝连接**；⑤ 收到的帧 `frame.sid` 与钉扎值不符必须**丢弃**。
 
 实现方自测：解密 ctHex+tagHex 必须还原 pt；用自己的 iv 加密 pt 必须得到相同 ctHex/tagHex。
 

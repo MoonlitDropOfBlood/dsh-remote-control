@@ -692,13 +692,22 @@ export struct SessionDetailPage {
    * 待执行消息（宿主 session.queue 事件，契约 §5.2 v1.1.1）。
    * 读 store.queueVersion（@Trace）建立响应式依赖——队列内容存在 store 内部 Map 里，
    * 版本号一变即触发本页重渲染；宿主说「没有待执行消息」→ 空数组（不显示该区）。
+   * v1.1.2：**只显示排队项**（target='next-turn'）；已插入当前 turn 的（next-step）
+   * 不在排队信息里显示（用户反馈）——已交给当前任务，等它消费即可。
    */
   private pendingQueue(): DshrcQueueItem[] {
     const version: number = this.store.queueVersion;
     if (version < 0) {
       return [];
     }
-    return this.store.queueItems(this.sessionId);
+    const all: DshrcQueueItem[] = this.store.queueItems(this.sessionId);
+    const queued: DshrcQueueItem[] = [];
+    for (let i: number = 0; i < all.length; i++) {
+      if (all[i].target !== 'next-step') {
+        queued.push(all[i]);
+      }
+    }
+    return queued;
   }
 
   /**
@@ -713,8 +722,8 @@ export struct SessionDetailPage {
 
   /**
    * 待执行消息列表（宿主 session.queue 事件，契约 §5.2 v1.1.1）：
-   * 文本与状态**直接来自宿主**（只做展示，不做猜测）；target='next-step' → 「已插入」，
-   * 其余（'next-turn'）→ 「排队中」。空列表时整块不渲染（不留空白占位）。
+   * 文本**直接来自宿主**（只做展示，不做猜测）；列表只含排队项（next-step 已过滤，
+   * v1.1.2 用户反馈），徽标统一「排队中」。空列表时整块不渲染（不留空白占位）。
    */
   @Builder
   pendingQueueBar() {
@@ -733,12 +742,12 @@ export struct SessionDetailPage {
               .maxLines(1)
               .textOverflow({ overflow: TextOverflow.Ellipsis })
               .layoutWeight(1)
-            Text(cell.item.target === 'next-step' ? '已插入' : '排队中')
+            Text('排队中')
               .fontSize(FS_CAPTION)
-              .fontColor(cell.item.target === 'next-step' ? $r('app.color.brand_label') : $r('app.color.state_warn'))
+              .fontColor($r('app.color.state_warn'))
               .padding({ left: SP_2, right: SP_2, top: 1, bottom: 1 })
               .borderRadius(RADIUS_PILL)
-              .backgroundColor(cell.item.target === 'next-step' ? $r('app.color.brand_tint') : $r('app.color.state_warn_tint'))
+              .backgroundColor($r('app.color.state_warn_tint'))
               .margin({ left: SP_2 })
           }
           .width('100%')

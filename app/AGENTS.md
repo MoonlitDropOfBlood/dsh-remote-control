@@ -177,6 +177,14 @@ grep -rnE "@State|@Prop|@Link|@ObjectLink|@Observed[^V]|@Provide|@Consume|@Watch
   - `session.capabilities` 回 `busyEnter`（只读）→ `store.busyEnter` → 详情页显示
     「繁忙时：排队发送（跟随 DSH 设置）」这类**只读**提示（原可切换的两段式胶囊已删除）。
   - 宿主拒绝插话时**插件自动退回 queue**（桌面端此时置灰 steer，手机不能把消息弄丢）。
+- **排队列表只显示排队项**（v1.1.2 用户反馈）：`pendingQueue()` 过滤 `target==='next-step'`
+  （已插入当前 turn 的不显示——它们已被当前任务持有，等消费即可），徽标统一「排队中」。
+- **时间线 Repeat 是全量加载模式：key 相同 → 复用节点、不重跑 each**（官方语义）。
+  所以 `mergeHistory` **绝不能给同 key 换新实例**（直播步骤 `'s'+callId` 与历史步骤同 key；
+  重复拉页时消息同 id）——屏幕卡片绑旧实例，换实例后 @Trace 更新永远到不了 UI
+  （症状：下拉刷新后步骤永远停在 running，列表不再更新）。修法：`oldById` 复用旧实例 +
+  `transferTimelineFields()` 原地搬字段（身份稳定 + @Trace 原地更新），另加 `reusedIds`
+  防同实例进两个数组。见全局记忆 arkui-repeat-refresh-not-updating。
 - **思考块用独立的 markdown 控制器**（`mdCtrlReasoning`）：思考块刻意弱化
   （`FS_SMALL` + `label_secondary`），复用气泡的正文主题会让「思考」和「回答」分不开
   （用户反馈「思考中的文字颜色和之前版本不一致」）。`setupMarkdownTheme()` 拆成

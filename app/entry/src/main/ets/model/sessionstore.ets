@@ -968,6 +968,17 @@ export class SessionStore {
       live.push(it);
     }
     durable.sort((a: TimelineItem, b: TimelineItem): number => a.seq - b.seq);
+    // v1.1.2 修复「下拉刷新后列表不再更新」：全量加载模式的 Repeat 按 key 复用节点、
+    // **不会重新执行 each**——如果这里给同 key 换新实例（直播步骤 's'+callId 与历史步骤
+    // 同 key；重复拉同一页时消息同 id），屏幕上的卡片仍绑着旧实例，后续 @Trace 更新
+    // 打在旧实例上永远到不了 UI（步骤永远停在 running）。官方口径：身份稳定 + @Trace
+    // 原地更新。故页项先查旧实例：同 id 就把字段搬运过去、**复用旧实例**。
+    const oldById: Map<string, TimelineItem> = new Map<string, TimelineItem>();
+    for (let k2: number = 0; k2 < items.length; k2++) {
+      if (!oldById.has(items[k2].id)) {
+        oldById.set(items[k2].id, items[k2]);
+      }
+    }
     const pageItems: TimelineItem[] = [];
     for (let m: number = 0; m < messages.length; m++) {
       const msg: DshrcChatMessage = messages[m];
@@ -981,7 +992,13 @@ export class SessionStore {
       mi.seq = msg.seq;
       // v1.0.9：历史消息里的图片（旧插件不返该字段 → 空数组）
       mi.images = msg.images !== undefined ? msg.images : [];
-      pageItems.push(mi);
+      const priorM: TimelineItem | undefined = oldById.get(mi.id);
+      if (priorM !== undefined) {
+        this.transferTimelineFields(priorM, mi);
+        pageItems.push(priorM);
+      } else {
+        pageItems.push(mi);
+      }
     }
     for (let n: number = 0; n < steps.length; n++) {
       const st: DshrcStepRecord = steps[n];
@@ -995,11 +1012,36 @@ export class SessionStore {
       si.turn = st.turn;
       si.step = st.step;
       si.seq = st.seq;
-      pageItems.push(si);
+      // 同 key（'s'+callId）复用旧实例：直播步骤 → 持久步骤的字段搬运（status 定稿）
+      const priorS: TimelineItem | undefined = oldById.get(si.id);
+      if (priorS !== undefined) {
+        this.transferTimelineFields(priorS, si);
+        pageItems.push(priorS);
+      } else {
+        pageItems.push(si);
+      }
     }
     pageItems.sort((a: TimelineItem, b: TimelineItem): number => a.seq - b.seq);
-    const body: TimelineItem[] = prepend ? pageItems.concat(durable) : durable.concat(pageItems);
-    const merged: TimelineItem[] = body.concat(live);
+    // 防重保险：被页项复用的旧实例不得同时留在 durable/live（同对象进两个数组会双渲染；
+    // 正常路径到不了这里，防御未来改动引入的回归）
+    const reusedIds: Set<string> = new Set<string>();
+    for (let p: number = 0; p < pageItems.length; p++) {
+      reusedIds.add(pageItems[p].id);
+    }
+    const durableKept: TimelineItem[] = [];
+    for (let q: number = 0; q < durable.length; q++) {
+      if (!reusedIds.has(durable[q].id)) {
+        durableKept.push(durable[q]);
+      }
+    }
+    const liveKept: TimelineItem[] = [];
+    for (let r: number = 0; r < live.length; r++) {
+      if (!reusedIds.has(live[r].id)) {
+        liveKept.push(live[r]);
+      }
+    }
+    const body: TimelineItem[] = prepend ? pageItems.concat(durableKept) : durableKept.concat(pageItems);
+    const merged: TimelineItem[] = body.concat(liveKept);
     this.cache.set(sid, merged);
     // v1.0.9 自愈：turn.end 事件若在断线窗口丢失，流式光标（▍）会残留在已结束的
     // 消息上。宿主侧该会话已不在运行（running=false）时不可能存在进行中的流——
@@ -1008,6 +1050,31 @@ export class SessionStore {
       this.finalizeStaleStreaming(sid, merged);
     }
     this.notifyActive(sid);
+  }
+
+  /**
+   * 把「新构造的页项」字段搬运到「同 id 的旧实例」上（v1.1.2）。
+   *
+   * 全量加载模式的 Repeat 按 key 复用节点且不重跑 each——屏幕上的组件绑的是旧实例，
+   * 换实例等于把 UI 与数据切断。故历史合并时**身份不变、内容原地更新**：
+   * 全部 @Trace 字段照搬（id 不动），组件靠 @Trace 感知内容变化。
+   */
+  private transferTimelineFields(dst: TimelineItem, src: TimelineItem): void {
+    dst.kind = src.kind;
+    dst.role = src.role;
+    dst.text = src.text;
+    dst.streaming = src.streaming;
+    dst.ts = src.ts;
+    dst.errorText = src.errorText;
+    dst.seq = src.seq;
+    dst.callId = src.callId;
+    dst.toolName = src.toolName;
+    dst.argsText = src.argsText;
+    dst.status = src.status;
+    dst.resultText = src.resultText;
+    dst.turn = src.turn;
+    dst.step = src.step;
+    dst.images = src.images;
   }
 
   /** 静默清掉残留的流式标志（不自增 ts / 不加错误文案——只是光标回收）。 */

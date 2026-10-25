@@ -33,7 +33,7 @@ node --check index.js client.js typert.host.js lib/*.mjs scripts/*.mjs   # 语�
 node -e "import('./lib/protocol.mjs').then(m=>m.assertKat())"           # KAT
 node scripts/verify-qr.mjs && node scripts/verify-pairing.mjs           # QR/配对 API 回归（需 devDependencies）
 node scripts/verify-steps.mjs                                          # v1.0.9 步骤/模式/权限/归档/模型/思考/强度 + 图片回归（无依赖，154 项）
-node scripts/verify-images.mjs                                         # v1.0.9 图片专项：元数据映射/缩略图降级/image.fetch 缓存与报错/帧预算守卫（无依赖，88 项）
+node scripts/verify-images.mjs                                         # v1.0.9 图片专项 + v1.1.0 present 投递文件桥接：元数据映射/缩略图降级/image.fetch/帧预算守卫/交付物图片（无依赖，100 项）
 node scripts/verify-settings.mjs                                       # v1.1.x 设置页/manifest/combo/信封自检 + Host 真跑一遍（112 项）
 node scripts/verify-relay-supervisor.mjs                               # v1.1.1 中继进程托管：决策/端口占用不抢/启停/看门狗/跨平台/bundle（无依赖，162 项）
 node scripts/sync-client-icon.mjs                                      # 改了 icon.svg 后同步 client.js 的图标 data-uri
@@ -194,9 +194,35 @@ node scripts/sync-client-icon.mjs                                      # 改了 
 - **日志绝不输出 data URI / base64**（可能含敏感图）：只打 imageId、字节数、尺寸。
 - 回归：`node scripts/verify-steps.mjs` 目前 **154 项**（新增 image 块识别、ImageRef 形状、
   无 "[图片]" 占位符、缩略图超限降级/整页预算、image.fetch 校验与缓存、assistant.image 广播）
-  + `node scripts/verify-images.mjs` **88 项**（图片专项：元数据映射、缩略图降级阶梯、
+  + `node scripts/verify-images.mjs` **100 项**（图片专项：元数据映射、缩略图降级阶梯、
   image.fetch 缓存命中/重启后报错、日志无 base64、**帧预算守卫**：剥缩略图 → 丢 images[] →
-  overflow 回 error、预算常量关系、多图历史回包不超明文预算）。
+  overflow 回 error、预算常量关系、多图历史回包不超明文预算、
+  **present 投递的文件桥接**（扩展名认类型 / 读尺寸 / 事件→assistant.image /
+  image.fetch 取大图 / 非图片跳过 / 日志不泄路径 / 事件闸源码断言））。
+
+## v1.1.0：present 投递的图片也上手机（2026-10-25，契约 §5.10.1）
+
+**用户实测反馈**：「桌面看得到图，手机消息里没有」。根因不在 App——**宿主根本没把
+present 出来的图当图片记**：
+
+- `present` 工具（`dsh-tool-present`）投递文件时，宿主追加的是会话事件
+  `deliverables/presented` = `{turn, callId, files:[{path, name?, description?}]}`，
+  **只有路径**——不是 `content` 块里的 `type:"image"` 附件引用。
+- 而插件的图片桥（`imageBlocksOf`）只认附件块 → 这类图**永远进不了 wire**。
+  宿主另一条路（`image/offload` 事件）才是真附件块，那条路插件本来就支持。
+
+修法（`lib/host-bridge.mjs` 的会话事件总闸 + `lib/images.mjs`）：
+
+- 事件闸新增 `deliverables/presented` 分支 → `#emitDeliveredImages()`：
+  按**扩展名**认图片（`mediaTypeOfPath`：png/jpg/jpeg/gif/webp，其余跳过）→
+  读字节（上限 20MB）→ `imageMetaOf()` 量尺寸 → `makeThumb()` 压略图 →
+  按 §5.10 **同一套** `assistant.image` 事件发出去（wire 形状不变）。
+- `imageId` 命名空间隔离：`d` + sha1(path+turn) 前 16 位（宿主 attachmentId 是随机 uuid，
+  不会撞）；同一文件同一 turn 重复 present → 同 id → 客户端幂等。
+- `image.fetch` 多一条来源：`#deliveredImages` 命中就直接读盘出大图（不走附件服务）。
+- **日志绝不写文件路径**（可能含敏感目录名），只打 imageId/尺寸/字节数。
+- 范围：**直播**桥接（事件流）；历史消息里的交付物不补图（文件卡片是另一条通道，未定义）。
+- 回归：`node scripts/verify-images.mjs` **100 项**（新增 12 项，含端到端事件桥接 + 接线断言）。
 
 ## v1.1.1：中继进程随插件托管（2026-10-25，跨平台）
 

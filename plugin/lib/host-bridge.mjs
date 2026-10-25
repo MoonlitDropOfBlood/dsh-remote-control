@@ -18,8 +18,13 @@
 //      session.create 的 agentPreset / permission 字段。
 //   5. v1.0.9（§5.10）：会话消息里的图片——历史消息带 images[]（内联缩略图）、
 //      直播 assistant.image 事件、image.fetch 拉大图。
-import { randomUUID } from "node:crypto";
+//   6. present 工具投递的文件（deliverables/presented 事件）里的**图片**：
+//      宿主把它们记成「文件路径」，不是图片附件块 → 不桥接的话手机端永远看不到
+//      （用户反馈：桌面看得到、手机消息里没有）。故按扩展名认图片、读字节、
+//      生成缩略图，按 §5.10 的 assistant.image / image.fetch 通道发给手机。
+import { randomUUID, createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { hostname } from "node:os";
 import { createRequire } from "node:module";
 import { msg, sanitizeEnvelope } from "./protocol.mjs";
@@ -33,10 +38,32 @@ import {
   clampMaxEdge,
   fitReplyBudget,
   imageBlocksOf,
+  imageMetaOf,
   imageRefMeta,
   makeLarge,
   makeThumb,
+  mediaTypeOfPath,
 } from "./images.mjs";
+
+/**
+ * present 投递文件的字节上限（超过就不桥接：内存与带宽都不值得）。
+ * 20MB 足够覆盖绝大多数截图/预览图。
+ */
+const DELIVERED_MAX_BYTES = 20 * 1024 * 1024;
+
+/**
+ * present 投递文件的 imageId：`d` + sha1(path+turn) 前 16 位。
+ *
+ * 命名空间与宿主附件 id（随机 uuid）不冲突；同一文件在同一 turn 里稳定，
+ * 重复 present 同一张图 → 同一 imageId → 手机端幂等不重复挂。
+ * @param {string} path 文件绝对路径
+ * @param {unknown} turn 宿主回合号
+ * @returns {string} imageId
+ */
+function deliveredImageId(path, turn) {
+  const h = createHash("sha1").update(`${path}#${String(turn ?? "")}`).digest("hex");
+  return `d${h.slice(0, 16)}`;
+}
 
 /** 从本包 package.json 读版本；失败给 unknown（不抛出）。 */
 function pluginVersion() {
@@ -777,6 +804,8 @@ export class HostBridge {
   #pushToken = ""; // 手机 push.register 上报的 token（内存态）
   // v1.0.9（§5.10）：imageId -> 宿主附件引用（image.fetch 用；插件重启后为空）
   #imageRefs = new Map();
+  // present 投递的图片文件：imageId -> { path, mediaType }（image.fetch 读盘用）
+  #deliveredImages = new Map();
   // v1.0.9（§5.10）：`${imageId}:${maxEdge}` -> 已缩放的大图（避免重复压缩）
   #imageCache = new Map();
   #disposers = [];
@@ -917,6 +946,12 @@ export class HostBridge {
       if (type === "assistant/message") {
         // v1.0.9（§5.10）：助手消息里的图片 → 广播 assistant.image（带内联缩略图）
         this.#emitAssistantImages(sessionId, event);
+        return;
+      }
+      if (type === "deliverables/presented") {
+        // present 工具投递的文件：宿主记的是**路径**，不是图片附件块 →
+        // 不桥接的话手机端永远看不到这些图（用户反馈：桌面有、手机没有）。
+        void this.#emitDeliveredImages(sessionId, event);
         return;
       }
       // 其余事件（user/message、turn/*、step/* …）忽略
@@ -1081,8 +1116,7 @@ export class HostBridge {
    * 逐张生成缩略图并广播 assistant.image。
    * @param {string} sessionId
    * @param {object[]} refs 宿主附件引用
-   */
-  async #sendAssistantImages(sessionId, refs) {
+   */  async #sendAssistantImages(sessionId, refs) {
     const attachments = attachmentsOf(this.#ctx);
     for (const ref of refs) {
       const image = imageRefMeta(ref);
@@ -1110,6 +1144,71 @@ export class HostBridge {
   }
 
   /**
+   * present 投递的文件（deliverables/presented）里的**图片** → assistant.image。
+   *
+   * 宿主对「present 出来的文件」只记路径（没有附件引用、没有尺寸），
+   * 所以图片块那条路（imageBlocksOf）永远看不到它们 → 手机端一片空白。
+   * 这里自己认类型、读字节、量尺寸、压缩略图，按 §5.10 同一套通道发出去。
+   *
+   * 非图片文件（.md/.zip/…）跳过：文件卡片是另一条通道，不在本轮范围。
+   * @param {string} sessionId
+   * @param {any} event 宿主会话事件（data.files = [{path, name?, description?}]）
+   */
+  async #emitDeliveredImages(sessionId, event) {
+    try {
+      const files = Array.isArray(event?.data?.files) ? event.data.files : [];
+      for (const file of files) {
+        const path = typeof file?.path === "string" ? file.path.trim() : "";
+        if (path === "") continue;
+        const mediaType = mediaTypeOfPath(path);
+        if (mediaType === "") continue; // 非图片 → 跳过
+        const bytes = await this.#readDeliveredFile(path);
+        if (bytes === null) continue;
+        const meta = await imageMetaOf(bytes);
+        const imageId = deliveredImageId(path, event?.data?.turn);
+        this.#deliveredImages.set(imageId, { path, mediaType });
+        const image = {
+          imageId,
+          mediaType,
+          width: meta.width,
+          height: meta.height,
+          bytes: bytes.length,
+          thumb: await makeThumb(bytes, mediaType),
+        };
+        // 日志绝不输出路径/字节内容（路径可能含敏感目录名，base64 更不能落日志）
+        this.#log("info", "delivered image bridged", {
+          sessionId,
+          imageId,
+          mediaType,
+          width: image.width,
+          height: image.height,
+          bytes: image.bytes,
+          thumbBytes: image.thumb.length,
+        });
+        this.#sendEvent("assistant.image", { sessionId, image });
+      }
+    } catch (e) {
+      this.#log("warn", "delivered image bridge error", { sessionId, error: errText(e) });
+    }
+  }
+
+  /**
+   * 读 present 投递的文件字节（超限 / 读不到 → null，绝不抛）。
+   * @param {string} path 绝对路径
+   * @returns {Promise<Buffer|null>}
+   */
+  async #readDeliveredFile(path) {
+    try {
+      const bytes = await readFile(path);
+      if (!bytes || bytes.length === 0) return null;
+      if (bytes.length > DELIVERED_MAX_BYTES) return null; // 太大不桥接（避免内存/带宽事故）
+      return bytes;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * 契约 §5.1 image.fetch：拉取大图（等比缩放 + JPEG q85，base64 ≤ 1MiB 预算）。
    *
    * 失败**不影响**会话其余功能（图片可选，不阻塞消息流）：一切失败都回 error。
@@ -1124,7 +1223,8 @@ export class HostBridge {
     }
     const maxEdge = clampMaxEdge(p.maxEdge);
     const ref = this.#imageRefs.get(imageId);
-    if (!ref) {
+    const delivered = ref ? null : this.#deliveredImages.get(imageId);
+    if (!ref && !delivered) {
       // 插件重启后缓存为空（或该图不在本次会话里）——回明确文案，不崩
       this.#reply(
         m,
@@ -1143,17 +1243,26 @@ export class HostBridge {
       return;
     }
     try {
-      const attachments = attachmentsOf(this.#ctx);
-      if (!attachments) {
-        this.#reply(m, errorOf(m, "service-unavailable", "attachments service unavailable"));
-        return;
+      // 两条来源：宿主附件（读附件服务）/ present 投递的文件（直接读盘）
+      let bytes = null;
+      let mediaType = "";
+      if (delivered) {
+        bytes = await this.#readDeliveredFile(delivered.path);
+        mediaType = delivered.mediaType;
+      } else {
+        const attachments = attachmentsOf(this.#ctx);
+        if (!attachments) {
+          this.#reply(m, errorOf(m, "service-unavailable", "attachments service unavailable"));
+          return;
+        }
+        bytes = await readAttachmentBytes(attachments, ref, this.#signal(30_000));
+        mediaType = typeof ref?.mediaType === "string" ? ref.mediaType : "";
       }
-      const bytes = await readAttachmentBytes(attachments, ref, this.#signal(30_000));
       if (!bytes) {
         this.#reply(m, errorOf(m, "image-read-failed", "无法读取该图片的原始字节。"));
         return;
       }
-      const out = await makeLarge(bytes, ref.mediaType, maxEdge);
+      const out = await makeLarge(bytes, mediaType, maxEdge);
       const value = {
         imageId,
         mediaType: out.mediaType,

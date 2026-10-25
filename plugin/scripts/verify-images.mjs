@@ -12,6 +12,9 @@
 //      回明确中文错误（不崩）、日志里**绝不**出现 data URI / base64。
 //
 // 用法：node scripts/verify-images.mjs（在 plugin/ 目录下）
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   HostBridge,
   attachThumbs,
@@ -32,10 +35,12 @@ import {
   clampMaxEdge,
   fitReplyBudget,
   imageBlocksOf,
+  imageMetaOf,
   imageRefMeta,
   loadSharp,
   makeLarge,
   makeThumb,
+  mediaTypeOfPath,
   setSharpResolver,
 } from "../lib/images.mjs";
 
@@ -608,6 +613,144 @@ setSharpResolver(null);
     0,
   );
   check("多图历史：缩略图总量受页预算约束", thumbs <= 10 && replyBytes <= REPLY_PLAIN_MAX_BYTES, `${thumbs} 张缩略图`);
+}
+
+// ---------------------------------------------------------------------------
+// present 投递的文件（deliverables/presented）→ 图片桥接
+//
+// 宿主把 present 出来的文件记成**路径**（deliverables/presented 事件），
+// 不是图片附件块 → 插件的图片桥（imageBlocksOf）看不到它们 →
+// 手机端消息里永远没有这些图（用户反馈：桌面看得到、手机没有）。
+//
+// 覆盖：类型识别 / 尺寸读取 / 事件桥接 / image.fetch 取大图 / 非图片跳过 /
+//       日志脱敏 / 接线层断言。
+// ---------------------------------------------------------------------------
+{
+  // 纯函数：扩展名 → 媒体类型
+  check("present 文件：png/jpg/jpeg/gif/webp 认得出类型", mediaTypeOfPath("a/b/c.PNG") === "image/png"
+    && mediaTypeOfPath("x.jpg") === "image/jpeg"
+    && mediaTypeOfPath("x.JPEG") === "image/jpeg"
+    && mediaTypeOfPath("x.gif") === "image/gif"
+    && mediaTypeOfPath("x.webp") === "image/webp", mediaTypeOfPath("x.png"));
+  check("present 文件：非图片/无扩展名返回空串", mediaTypeOfPath("notes.md") === ""
+    && mediaTypeOfPath("archive.zip") === ""
+    && mediaTypeOfPath("noext") === ""
+    && mediaTypeOfPath("") === ""
+    && mediaTypeOfPath(undefined) === "", "非图片应为空");
+
+  // 假 sharp 要能报尺寸（imageMetaOf 走 metadata()）
+  const fakeSharp2 = (input) => {
+    const chain = {
+      _edge: 0,
+      _q: 0,
+      rotate() { return chain; },
+      resize(opts) {
+        chain._edge = Math.min(opts?.width ?? 0, opts?.height ?? 0) || 0;
+        return chain;
+      },
+      jpeg(opts) {
+        chain._q = opts?.quality ?? 0;
+        return chain;
+      },
+      async metadata() {
+        return { width: 640, height: 480 };
+      },
+      async toBuffer() {
+        const edge = chain._edge || 0;
+        const size = Math.max(1, Math.round((edge * (chain._q || 70)) / 100) * 64);
+        return { data: Buffer.alloc(size, 9), info: { width: edge, height: Math.max(1, Math.round(edge * 0.75)) } };
+      },
+    };
+    return chain;
+  };
+  setSharpResolver(() => fakeSharp2);
+  const meta = await imageMetaOf(Buffer.from("fake"));
+  check("present 文件：能读出图片尺寸", meta.width === 640 && meta.height === 480, JSON.stringify(meta));
+
+  // 端到端：deliverables/presented 事件 → assistant.image
+  const dir = mkdtempSync(join(tmpdir(), "dshrc-delivered-"));
+  const pngPath = join(dir, "shot.png");
+  const mdPath = join(dir, "notes.md");
+  writeFileSync(pngPath, Buffer.from("fake-png-bytes"));
+  writeFileSync(mdPath, "# 不是图片");
+
+  const ctx2 = makeCtx({});
+  const relay2 = makeRelay();
+  const bridge2 = new HostBridge({
+    ctx: ctx2,
+    relay: relay2,
+    push: { configured: false, notify: async () => ({ ok: true }) },
+    config: CFG,
+    log,
+  });
+  bridge2.attach();
+
+  ctx2.emit("session/event", { id: "sess-deliv" }, {
+    type: "deliverables/presented",
+    seq: 90,
+    time: 2000,
+    data: { turn: 7, callId: "call-1", files: [{ path: pngPath, name: "shot.png" }] },
+  });
+  // 异步（读文件 + 压缩）→ 让出事件循环
+  await new Promise((r) => setTimeout(r, 150));
+  const imgEvents = relay2.sent.filter((m) => m?.payload?.topic === "assistant.image");
+  check("present 图片：广播了 assistant.image 事件", imgEvents.length === 1, `events=${imgEvents.length}`);
+  const bridged = imgEvents[0]?.payload?.data?.image;
+  check("present 图片：imageId 有 d 前缀（与宿主附件 id 命名空间隔离）",
+    typeof bridged?.imageId === "string" && bridged.imageId.startsWith("d") && bridged.imageId.length === 17,
+    String(bridged?.imageId));
+  check("present 图片：带 mediaType/尺寸/字节数", bridged?.mediaType === "image/png"
+    && bridged?.width === 640 && bridged?.height === 480 && bridged?.bytes > 0,
+    JSON.stringify({ mt: bridged?.mediaType, w: bridged?.width, h: bridged?.height, b: bridged?.bytes }));
+  check("present 图片：内联缩略图（手机端立刻能显示）",
+    typeof bridged?.thumb === "string" && bridged.thumb.startsWith("data:image/jpeg;base64,"),
+    String(bridged?.thumb).slice(0, 40));
+
+  // 非图片文件跳过
+  ctx2.emit("session/event", { id: "sess-deliv" }, {
+    type: "deliverables/presented",
+    seq: 91,
+    time: 2100,
+    data: { turn: 8, callId: "call-2", files: [{ path: mdPath, name: "notes.md" }] },
+  });
+  await new Promise((r) => setTimeout(r, 150));
+  const imgEvents2 = relay2.sent.filter((m) => m?.payload?.topic === "assistant.image");
+  check("present 非图片文件：跳过（不误报成图片）", imgEvents2.length === 1, `events=${imgEvents2.length}`);
+
+  // image.fetch 能取回这张图的大图
+  const fetchId = "req-fetch-deliv";
+  await bridge2.dispatch({
+    id: fetchId,
+    type: "image.fetch",
+    ts: Date.now(),
+    payload: { imageId: bridged?.imageId ?? "", maxEdge: 800 },
+  });
+  const fetched = lastResult(relay2.sent, fetchId);
+  const fv = fetched?.value;
+  check("present 图片：image.fetch 能取到大图", fetched?.value !== undefined && fetched?.error === undefined
+    && typeof fv?.data === "string" && fv.data.startsWith("data:image/jpeg;base64,")
+    && fv?.imageId === bridged?.imageId,
+    JSON.stringify({ hasValue: fetched?.value !== undefined, code: fetched?.error?.code }));
+
+  // 未知 imageId → 明确错误，不崩
+  const missId = "req-fetch-miss";
+  await bridge2.dispatch({
+    id: missId,
+    type: "image.fetch",
+    ts: Date.now(),
+    payload: { imageId: "d0000000000000000" },
+  });
+  const missed = lastResult(relay2.sent, missId);
+  check("present 图片：未知 imageId 回明确错误", missed?.value === undefined && missed?.error?.code === "image-not-found",
+    JSON.stringify(missed?.error?.code));
+
+  // 接线层：事件闸必须认 deliverables/presented（源码断言）
+  const src = readFileSync(new URL("../lib/host-bridge.mjs", import.meta.url), "utf8");
+  check("present 图片：事件闸认 deliverables/presented（源码断言）",
+    src.includes('type === "deliverables/presented"'), "事件闸缺分支");
+  check("present 图片：日志不含文件路径（脱敏）",
+    !logs.some((l) => l.includes(pngPath)), "日志里出现了文件路径");
+  rmSync(dir, { recursive: true, force: true });
 }
 
 setSharpResolver(null);

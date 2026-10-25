@@ -25,6 +25,47 @@ export const IMAGE_MEDIA_TYPES = Object.freeze(["image/png", "image/jpeg", "imag
 /** 缩略图长边上限（契约 §5.10：长边 ≤ 480、JPEG q75）。 */
 export const THUMB_MAX_EDGE = 480;
 
+/**
+ * 按文件扩展名猜媒体类型（**不读文件**，纯字符串判断）。
+ *
+ * 用途：宿主 `present` 工具投递的文件（deliverables/presented 事件）只有路径，
+ * 没有附件元数据；插件要把它当图片转发给手机端，就得自己认类型。
+ * 非图片（.md/.zip/…）返回 '' —— 留给别的通道（文件卡片）处理。
+ * @param {string} path 文件路径
+ * @returns {string} 媒体类型或 ''
+ */
+export function mediaTypeOfPath(path) {
+  if (typeof path !== "string") return "";
+  const m = /\.(png|jpe?g|gif|webp)$/i.exec(path.trim());
+  if (!m) return "";
+  const ext = m[1].toLowerCase();
+  if (ext === "png") return "image/png";
+  if (ext === "jpg" || ext === "jpeg") return "image/jpeg";
+  if (ext === "gif") return "image/gif";
+  if (ext === "webp") return "image/webp";
+  return "";
+}
+
+/**
+ * 读图片原始尺寸（sharp 不可用 → {width:0,height:0}，**绝不抛**）。
+ *
+ * 宿主附件自带 width/height，但 present 出来的文件没有 → 插件自己量。
+ * @param {Buffer|Uint8Array|ArrayBuffer} buffer 原始字节
+ * @returns {Promise<{width:number,height:number}>}
+ */
+export async function imageMetaOf(buffer) {
+  const input = toBytes(buffer);
+  if (input === null || input.length === 0) return { width: 0, height: 0 };
+  const sharp = loadSharp();
+  if (!sharp) return { width: 0, height: 0 };
+  try {
+    const meta = await sharp(input, { animated: false }).metadata();
+    return { width: Number(meta?.width) || 0, height: Number(meta?.height) || 0 };
+  } catch {
+    return { width: 0, height: 0 };
+  }
+}
+
 /** 缩略图 base64 字节上限（契约 §5.10：必须压缩到 ≤ 96KB base64）。 */
 export const THUMB_MAX_BASE64 = 96 * 1024;
 

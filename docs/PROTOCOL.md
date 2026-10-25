@@ -3,7 +3,8 @@
 > 状态：v1 契约（2026-10-20 由 Lead 冻结；**v1.0.6 于 2026-10-23 增补：会话时间线（工具步骤）
 > 与新建会话的「模式/权限」选择；v1.0.7 于 2026-10-24 增补：Workspace 真实归档同步
 > 与新建会话的模型选择；v1.0.8 于 2026-10-24 增补：模型思考强度目录与会话中切换模型；
-> v1.0.9 于 2026-10-25 增补：会话消息里的图片（§5.10，缩略图内联 + 大图按需拉取）**）。
+> v1.0.9 于 2026-10-25 增补：会话消息里的图片（§5.10，缩略图内联 + 大图按需拉取）；
+> v1.1.0 于 2026-10-25 增补：§5.10.1 图片的第二来源——present 投递的文件（deliverables/presented）**）。
 > 三个实现（DSH 插件 / 中继服务器 / HarmonyOS App）
 > 都必须以本文档为准；任何协议改动必须先改本文档并通知 Lead。
 
@@ -147,7 +148,7 @@ dshrc://pair?r=<encodeURIComponent(relayUrl)>&c=<channel>&s=<secret>[&t=<encodeU
 | `session.activity` | `{sessionId, updatedAt}` | 事件 `api-session/activity` |
 | `assistant.delta` | `{sessionId, text}` | 事件 `agent/assistant-stream`（文本增量；**按 sessionId 合并节流 ≤8 条/秒**） |
 | `assistant.reasoningDelta` | `{sessionId, text}` | **v1.0.7** `agent/assistant-stream` 的 `reasoning-delta` 思考增量；与文本分流，客户端合并进「思考过程」块 |
-| `assistant.image` | `{sessionId, image:ImageRef}` | **v1.0.9** 会话消息里的图片（§5.10）：源为 Host 会话事件的 `content` 块 `type:"image"`（附件引用） |
+| `assistant.image` | `{sessionId, image:ImageRef}` | **v1.0.9** 会话消息里的图片（§5.10）：源为 Host 会话事件的 `content` 块 `type:"image"`（附件引用）；**v1.1.0** 增补第二来源：present 投递的图片文件（§5.10.1，imageId 以 `d` 开头） |
 | `tool.call` | `{sessionId, callId, name, arguments, ts}` | **v1.0.6** Host 会话事件 `tool/call`（模型发起一次工具调用） |
 | `tool.result` | `{sessionId, callId, status:"ok"\|"error", resultText, errorText?, ts}` | **v1.0.6** Host 会话事件 `tool/result`（工具调用结束；`resultText` 为结果文本，失败时 `errorText` 为原因） |
 | `system.message` | `{sessionId, kind:"system"\|"developer", text, ts}` | **v1.0.6** Host 会话事件 `system/message` / `developer/message`（系统提示注入等非对话内容） |
@@ -353,6 +354,22 @@ Host `sessionController.list` 本身仍不回归档标记，插件必须用
   - `image.fetch` 失败**不得**影响会话其余功能（图片可选，不阻塞消息流）。
 - 客户端渲染口径：缩略图按 `width/height` 等比显示（最大宽度撑满气泡、最大高度 ≤ 320vp），
   点击进大图浏览（全屏、支持双指缩放/拖动、关闭按钮）。
+
+#### 5.10.1 图片的另一个来源：present 投递的文件（v1.1.0 增补）
+
+宿主的 `present` 工具把交付物记成**会话事件** `deliverables/presented`
+（`{turn, callId, files:[{path, name?, description?}]}`），**不是**图片附件块。
+故插件除「`content` 块 `type:"image"`」外，还要桥接这一路，否则**桌面能看到的图
+手机端永远看不到**（用户实测反馈）。
+
+- 插件按**扩展名**识别图片（`.png/.jpg/.jpeg/.gif/.webp`；其余文件跳过），
+  读字节、量尺寸、压缩略图后，按 §5.10 **同一套** `assistant.image` 事件 + `image.fetch`
+  通道发给客户端——**wire 形状不变**，只是图片来源多了一种。
+- `imageId` 命名空间与宿主附件 id 隔离：**`d` + sha1(path+turn) 前 16 位**
+  （宿主 attachmentId 是随机 uuid，不会撞）。同一文件同一 turn 重复 present →
+  同一 imageId → 客户端幂等，不重复挂。
+- 非图片交付物（.md/.zip/…）**不**走这条通道（文件卡片是另一条通道，未定义）。
+- 本条是**直播**桥接（事件流），历史消息里的交付物不补图。
 
 ## 6. Push Kit（华为推送）旁路
 

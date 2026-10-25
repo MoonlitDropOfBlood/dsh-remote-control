@@ -443,6 +443,19 @@ export class SessionStore {
       this.refreshSessions();
       this.reportPush();
       this.loadCapabilities();
+      // v1.1.2 断线恢复（权威拉取，不依赖中继缓存）：中继的离线缓存只覆盖
+      // 「手机掉线但中继活着」的短窗——而中继跑在插件下，DSH 重启/插件重载会把它
+      // 一起带走，缓存清零；超过 256 条也会 FIFO 丢旧。宿主会话日志才是唯一事实源：
+      // 重连时把**正在看的活动会话**重拉一遍（历史 + 排队快照 + 子代理目录），
+      // 错过的消息/步骤/图片/交付物/队列变动全部补齐，中继缓存退化为流畅性优化。
+      if (this.activeId.length > 0) {
+        this.loadHistory(this.activeId, false);
+        this.loadQueue(this.activeId);
+        const row: SessionRow | undefined = this.findRow(this.activeId);
+        if (row !== undefined && row.parentSessionId.length === 0) {
+          this.loadSubagents(this.activeId);
+        }
+      }
     }
     if (s === 'stopped' || s === 'idle') {
       // 断开/切换远程：清掉当前会话的投影，避免展示上一台主机的时间线

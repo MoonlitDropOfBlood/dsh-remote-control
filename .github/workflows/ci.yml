@@ -36,6 +36,11 @@ jobs:
         with:
           node-version: 22
       - run: npm ci
+      # verify-relay-supervisor 会 spawn **真中继** ../relay/server.js —— 它的 ws
+      # 依赖也必须装上（本地仓库 relay/node_modules 常驻所以从没暴露过）。
+      - name: 安装中继依赖（真中继用例需要）
+        run: npm ci
+        working-directory: relay
       # verify-settings 需要 DSH 内部 peers——npm 上公开但 `@*` 不匹配预发布版本，
       # 且 --no-save 在有 peerDependencies 的包里有怪癖 → 暂存目录安装后**软链**
       # （与本地开发同款：plugin/AGENTS.md「本地依赖联接」；Linux 软链按真实路径解析，

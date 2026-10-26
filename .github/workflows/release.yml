@@ -14,6 +14,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write # npm Trusted Publishing（OIDC）用的；用 NPM_TOKEN 时无副作用
 
 jobs:
   release:
@@ -25,8 +26,15 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
-          registry-url: https://registry.npmjs.org
+          node-version: 24
+      # npm Trusted Publishing（OIDC）要求 npm ≥ 11.5.1；node 24 自带的 npm 可能偏旧，
+      # 显式升到最新。**不设 registry-url**：setup-node 会写一条 _authToken=${NODE_AUTH_TOKEN}
+      # 的 .npmrc，空令牌会盖掉 OIDC 流程；npm 默认注册表本来就是 npmjs.org。
+      - name: 准备 npm（OIDC 需要 ≥ 11.5.1）
+        run: |
+          npm install -g npm@latest
+          npm --version
+          npm config set registry https://registry.npmjs.org/
 
       - name: 从标签取版本
         id: ver
@@ -50,8 +58,6 @@ jobs:
             && node scripts/verify-crypto.mjs && cd ..
 
       - name: 发布 relay（已发布则跳过）
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         working-directory: relay
         run: |
           v="${{ steps.ver.outputs.version }}"
@@ -63,8 +69,6 @@ jobs:
           fi
 
       - name: 发布 plugin（已发布则跳过）
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         working-directory: plugin
         run: |
           v="${{ steps.ver.outputs.version }}"
@@ -95,8 +99,6 @@ jobs:
           "
 
       - name: 发布市场索引包（索引走 npm 生态 CDN，unpkg/jsDelivr 都能取）
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         working-directory: market
         run: |
           v="${{ steps.ver.outputs.version }}"

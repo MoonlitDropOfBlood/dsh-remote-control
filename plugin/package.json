@@ -71,5 +71,8 @@
   "bugs": {
     "url": "https://github.com/MoonlitDropOfBlood/dsh-remote-control/issues"
   },
-  "keywords": []
+  "keywords": [],
+  "publishConfig": {
+    "access": "public"
+  }
 }

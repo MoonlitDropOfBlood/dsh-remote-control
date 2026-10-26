@@ -28,5 +28,8 @@
   "homepage": "https://github.com/MoonlitDropOfBlood/dsh-remote-control/tree/main/market#readme",
   "bugs": {
     "url": "https://github.com/MoonlitDropOfBlood/dsh-remote-control/issues"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

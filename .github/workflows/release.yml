@@ -73,6 +73,25 @@ jobs:
         run: |
           npm ci
           npm test
+      - name: 诊断（失败时把门禁日志推到 ci-debug 分支）
+        if: failure()
+        run: |
+          set +e
+          git config user.name "ci-debug"
+          git config user.email "ci@localhost"
+          {
+            echo "=== node: $(node -v)  npm path: $(command -v npm)"
+            echo "=== npm --version:"; npm --version 2>&1
+            echo "=== pwd: $(pwd)"; ls -la
+            echo "=== relay 目录:"; ls -la relay 2>&1 | head -20
+            cd relay || exit 0
+            echo "=== npm ci:"; npm ci 2>&1 | tail -30
+            echo "=== npm test:"; npm test 2>&1 | tail -30
+          } > ci-gate.log 2>&1
+          git add -f ci-gate.log
+          git -c user.name="ci-debug" -c user.email="ci@localhost" commit -m "ci debug: gate log" >/dev/null 2>&1
+          git push origin HEAD:ci-debug 2>&1 | tail -3
+
       - name: 门禁 plugin（安装）
         working-directory: plugin
         run: npm ci

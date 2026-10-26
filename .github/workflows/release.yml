@@ -116,9 +116,32 @@ jobs:
           cp market/index.json "release-artifacts/market-index-${{ steps.ver.outputs.version }}.json"
           ls -la release-artifacts/
 
+      - name: 从 CHANGELOG.md 抽取本版本段落
+        run: |
+          v="${{ steps.ver.outputs.version }}"
+          awk -v ver="$v" '
+            BEGIN { p = 0 }
+            /^## \[/ {
+              if (index($0, "[" ver "]")) { p = 1; next }
+              else if (p) { exit }
+            }
+            p { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "CHANGELOG.md 里没有 [${v}] 段落——发版必须先补 changelog"; exit 1
+          fi
+          prev=$(git describe --abbrev=0 --tags "v${v}^" 2>/dev/null || true)
+          if [ -n "$prev" ]; then
+            printf '\n\n**Full changelog**: https://github.com/MoonlitDropOfBlood/dsh-remote-control/compare/%s...v%s\n' "$prev" "$v" >> release-notes.md
+          else
+            printf '\n\n**Tags**: https://github.com/MoonlitDropOfBlood/dsh-remote-control/tags\n' >> release-notes.md
+          fi
+          head -5 release-notes.md
+
       - name: GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          body_path: release-notes.md
           generate_release_notes: true
           files: |
             release-artifacts/*.tgz

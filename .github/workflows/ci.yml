@@ -36,7 +36,18 @@ jobs:
         with:
           node-version: 22
       - run: npm ci
-      - run: npm i --no-save --legacy-peer-deps "@deepseek-ai/cordis@^4.0.1" "@deepseek-ai/dsh-typert-protocol@*"
+      # verify-settings 需要 DSH 内部 peers——npm 上公开但 `@*` 不匹配预发布版本，
+      # 且 --no-save 在有 peerDependencies 的包里有怪癖 → 暂存目录安装后**软链**
+      # （与本地开发同款：plugin/AGENTS.md「本地依赖联接」；Linux 软链按真实路径解析，
+      # peers 自己的依赖留在暂存目录里也找得到）。
+      - name: 联接 DSH peers
+        run: |
+          mkdir -p /tmp/peers && cd /tmp/peers
+          npm init -y >/dev/null 2>&1
+          npm i --silent --no-audit --no-fund "@deepseek-ai/cordis@^4.0.1" "@deepseek-ai/dsh-typert-protocol@0.1.0-rc.6"
+          mkdir -p "$GITHUB_WORKSPACE/plugin/node_modules/@deepseek-ai"
+          ln -s /tmp/peers/node_modules/@deepseek-ai/cordis "$GITHUB_WORKSPACE/plugin/node_modules/@deepseek-ai/cordis"
+          ln -s /tmp/peers/node_modules/@deepseek-ai/dsh-typert-protocol "$GITHUB_WORKSPACE/plugin/node_modules/@deepseek-ai/dsh-typert-protocol"
       - name: 语法检查
         run: node --check index.js client.js typert.host.js lib/*.mjs scripts/*.mjs
       - name: KAT（契约 §7）

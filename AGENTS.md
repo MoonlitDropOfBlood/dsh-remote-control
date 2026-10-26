@@ -38,11 +38,12 @@ cd relay && npm install && node server.js            # 中继（默认 8787；�
 
 - **两个 npm 包**：`@duke-dsh-plugins/dsh-remote-control`（插件，含 vendor 中继副本）+
   `@duke-dsh-plugins/dsh-remote-control-relay`（中继，独立部署用）。**版本必须同 bump**。
-- **发版 = 打标签**：同时 bump `relay/package.json` 与 `plugin/package.json` 的版本 →
+- **发版 = 打标签**：同时 bump `relay/package.json` 与 `plugin/package.json` 的版本 +
+  **`CHANGELOG.md` 补一段 `## [版本]`**（缺失时 release workflow 直接失败）→
   `git tag v<版本> && git push origin main --tags`。`.github/workflows/release.yml` 接管：
-  门禁 → npm 发布（已发布自动跳过，重推标签安全）→ `market/generate-index.mjs` 重生成
-  插件市场索引 → 官方校验器验证 → 提交回 main → GitHub Release（自动 notes + 两个包的
-  tgz + 索引文件）。
+  门禁 → npm 发布（已发布自动跳过，重推标签安全）→ changelog 段落成为 Release 正文 →
+  `market/generate-index.mjs` 重生成插件市场索引 → 官方校验器验证 → 提交回 main →
+  GitHub Release（正文 + 自动 notes + 两个包的 tgz + 索引文件）。
 - **前置 secret（一次性）**：仓库 Settings → Secrets → Actions 配 `NPM_TOKEN`
   （npmjs.com Access Tokens，Automation 类型）。
 - **插件市场索引**：`market/index.json`（format 1），用户在 DSH「设置 → 插件市场」加

@@ -11,18 +11,23 @@ GitHub Release 的正文——**bump 版本时必须同步补一段 `## [版本]
 
 ### 插件市场
 
-- **市场索引包**：`@duke-dsh-plugins/dsh-remote-control-market`（format 1 索引），
+- **收录到 awesome-dsh-plugin**（社区目录）：提 PR 新增
+  `data/plugins/MoonlitDropOfBlood__dsh-remote-control--plugin.yml`；合并后随每日 CI
+  刷新进 npm 包 `dsh-plugin-catalog`，DSH 0.2.1+ 的 Discover 直接能搜到。
+  清单在 `plugin/package.json`（子包），条目要指向子目录、用 `owner/repo#plugin` 命名，
+  文件名带 `--plugin` 后缀；上游 schema 只认 url/name/category/description/tarball。
+- **自带索引**（自托管通道）：插件包里带一份 format 1 索引 `market/index.json`，
   用户在 DSH「设置 → 插件市场」加
-  `https://unpkg.com/@duke-dsh-plugins/dsh-remote-control-market@latest/index.json`
-  即可安装 DSH Pocket。**走 unpkg 而非 GitHub raw**：实测国内网络下
+  `https://unpkg.com/@duke-dsh-plugins/dsh-remote-control@latest/market/index.json`
+  即可安装。**走 unpkg 而非 GitHub raw**：实测国内网络下
   `raw.githubusercontent.com` 与 `cdn.jsdelivr.net` 的连接被重置，只有 unpkg 可达。
-- 索引内容自动生成（版本与发布时间取自 npm registry），发版时自动更新并重新发布。
+- 索引内容自动生成（版本与发布时间取自 npm registry），发版时自动重生成并随包发布。
 
 ### 发布自动化
 
 - **GitHub Actions**：主分支/PR 跑全门禁（relay 测试 + plugin 全部 verify + 索引格式
-  校验）；推 `v*` 标签自动完成 门禁 → npm 发布（三个包，已发布自动跳过）→
-  市场索引重生成与发布 → GitHub Release（changelog 正文 + 三个包的 tgz + 索引文件）。
+  校验）；推 `v*` 标签自动完成 门禁 → npm 发布（两个包，已发布自动跳过）→
+  市场索引重生成并随插件包发布 → GitHub Release（changelog 正文 + 两个包的 tgz + 索引文件）。
 - **CI 修掉两处只在 Linux 出现的坑**：verify 门禁的 DSH peers 改为暂存目录安装 +
   软链（`@*` 不匹配预发布版本）；真中继用例需要 `relay/` 的依赖；
   停止通道的桩中继补上 SIGTERM handler（POSIX 上 stop() 会「命令 + 信号」都发，

@@ -20,7 +20,6 @@ on:
 
 permissions:
   contents: write
-  issues: write # 仅用于门禁失败时把日志贴成 issue（可匿名读）
   id-token: write # npm Trusted Publishing（OIDC）用的；用 NPM_TOKEN 时无副作用
 
 jobs:
@@ -83,30 +82,6 @@ jobs:
         run: |
           npm ci
           npm test
-      - name: 诊断（失败时把门禁日志推到 ci-debug 分支）
-        if: failure()
-        run: |
-          set +e
-          git config user.name "ci-debug"
-          git config user.email "ci@localhost"
-          {
-            echo "=== node: $(node -v)  npm path: $(command -v npm)"
-            echo "=== npm --version:"; npm --version 2>&1
-            echo "=== pwd: $(pwd)"; ls -la
-            echo "=== relay 目录:"; ls -la relay 2>&1 | head -20
-            cd relay || exit 0
-            echo "=== npm ci:"; npm ci 2>&1 | tail -30
-            echo "=== npm test:"; npm test 2>&1 | tail -30
-          } > ci-gate.log 2>&1
-          git add -f ci-gate.log
-          git -c user.name="ci-debug" -c user.email="ci@localhost" commit -m "ci debug: gate log" >/dev/null 2>&1
-          git push origin HEAD:ci-debug 2>&1 | tail -3
-          # 分支推送不可靠时，用 issue 兜底（issue 正文可匿名读取）
-          if ! git ls-remote --exit-code origin refs/heads/ci-debug >/dev/null 2>&1; then
-            body=$(node -e "console.log(JSON.stringify(require('fs').readFileSync('ci-gate.log','utf8')))")
-            curl -sS -X POST -H "Authorization: Bearer $GITHUB_TOKEN"               -H "Accept: application/vnd.github+json"               "https://api.github.com/repos/${{ github.repository }}/issues"               -d "{\"title\":\"[ci-debug] release gate log\",\"body\":$body}" || true
-          fi
-
       - name: 门禁 plugin（安装）
         working-directory: plugin
         run: npm ci

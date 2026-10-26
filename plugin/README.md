@@ -70,3 +70,19 @@ scripts/smoke-link.mjs  链路冒烟
 scripts/verify-qr.mjs   QR 正确性自检（jsqr 独立解码 + 矩阵级 RS 自检；devDependencies）
 scripts/verify-pairing.mjs  /remote-pairing 命令逻辑自检（mock ctx；devDependencies）
 ```
+
+## 安装（npm 分发，v1.1.3 起）
+
+```bash
+# DSH 插件管理器（推荐）：会解析 peerDependencies 并做兼容性 gate
+plugin_manager install @duke-dsh-plugins/dsh-remote-control
+
+# 或直接 link 安装（本地开发）
+plugin_manager install_bundle /path/to/this/repo/plugin
+```
+
+装好后到 DSH「设置 → DSH Pocket」分区填中继地址、扫码配对。中继进程会由插件
+自动托管（`relayUrl` 指向本机时）；VPS 部署请另装
+[`@duke-dsh-plugins/dsh-remote-control-relay`](../relay/README.md)。
+协议契约见 [`docs/PROTOCOL.md`](../docs/PROTOCOL.md)（v1.1.3：端到端加密 +
+会话纪元抗重放 + 可选中继 TLS）。

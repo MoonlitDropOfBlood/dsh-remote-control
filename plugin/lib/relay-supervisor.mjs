@@ -45,7 +45,8 @@ const STOP_GRACE_MS = 3000;
  *  2. <plugin>/../relay/server.js —— 仓库布局（link 安装/开发时是活源码，优先）
  *  3. <plugin>/vendor/relay/server.js —— **打包进插件的中继副本**（bundle 安装时唯一可用的）
  *     （由 scripts/vendor-relay.mjs 从 relay/server.js 生成，门禁校验同步）
- *  4. <plugin>/node_modules/dsh-remote-control-relay/server.js —— 将来若发布成 npm 包
+ *  4. <plugin>/node_modules/@duke-dsh-plugins/dsh-remote-control-relay/server.js —— npm 包形态
+ *     （v1.1.3 起中继发布为 scoped npm 包；scoped 包装在 node_modules/@duke-dsh-plugins/ 下）
  */
 export function resolveRelayEntry(pluginDir = PLUGIN_DIR, env = process.env) {
   const candidates = [];
@@ -54,7 +55,7 @@ export function resolveRelayEntry(pluginDir = PLUGIN_DIR, env = process.env) {
   }
   candidates.push(resolve(pluginDir, "..", "relay", "server.js"));
   candidates.push(resolve(pluginDir, "vendor", "relay", "server.js"));
-  candidates.push(resolve(pluginDir, "node_modules", "dsh-remote-control-relay", "server.js"));
+  candidates.push(resolve(pluginDir, "node_modules", "@duke-dsh-plugins", "dsh-remote-control-relay", "server.js"));
   for (const c of candidates) {
     if (existsSync(c)) return c;
   }

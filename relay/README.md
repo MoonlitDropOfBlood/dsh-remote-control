@@ -1,4 +1,4 @@
-# dsh-remote-control-relay
+# @duke-dsh-plugins/dsh-remote-control-relay
 
 dsh-remote-control 的**公网 WebSocket 中继服务器**（哑管道）。
 实现协议契约 §4「传输层：中继帧协议」的全部语义，负责把两个出站 WebSocket 客户端
@@ -246,7 +246,7 @@ docker run -d --name dsh-relay -p 8787:8787 -e RELAY_TOKEN=$(openssl rand -hex 1
 
 ```
 dsh-remote-control-relay/
-├── package.json          # name: dsh-remote-control-relay, type: module, dep: ws
+├── package.json          # name: @duke-dsh-plugins/dsh-remote-control-relay, dep: ws
 ├── server.js             # 中继实现（单文件可跑：node server.js）
 ├── Dockerfile            # node:22-alpine，非 root 运行
 ├── README.md
@@ -258,3 +258,13 @@ dsh-remote-control-relay/
     ├── relay.test.mjs    # 10 项 node:test 测试
     └── ipv6.test.mjs     # 6 项双栈测试（IPv4/IPv6 同端口共存、IPv6 loopback、跨族转发、回落）
 ```
+
+## npm 安装（v1.1.3 起）
+
+```bash
+npm install -g @duke-dsh-plugins/dsh-remote-control-relay
+dsh-remote-control-relay            # = node server.js（PORT 默认 8787）
+# 或作为依赖引入：require/import 后自起 createRelay()（见 server.js 导出）
+```
+
+环境变量与部署方式见上文（`RELAY_TOKEN` / `RELAY_TLS_CERT` / `RELAY_TLS_KEY`）。

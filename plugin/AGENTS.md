@@ -346,7 +346,7 @@ present 出来的图当图片记**：
 - **入口解析（bundle 安装也要能用）**：`resolveRelayEntry()` 按 `DSHRC_RELAY_ENTRY` →
   `<plugin>/../relay/server.js`（仓库布局，link 安装时是活源码）→
   `<plugin>/vendor/relay/server.js`（**打包进插件的中继副本**）→
-  `<plugin>/node_modules/dsh-remote-control-relay/server.js` 顺序找。
+  `<plugin>/node_modules/@duke-dsh-plugins/dsh-remote-control-relay/server.js`（scoped 包，v1.1.3 起中继发布为 npm 包）顺序找。
   **bundle 安装时包里没有 relay/** → 靠 vendor 副本兜底：插件包 `files` 含 `vendor`，
   依赖里加了 `ws`（中继唯一的依赖），`scripts/vendor-relay.mjs` 从 `relay/server.js`
   生成副本（**shebang 必须留在第一行**，插在中间直接语法错），门禁校验副本与源文件同步。

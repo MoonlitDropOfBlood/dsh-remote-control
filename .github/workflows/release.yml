@@ -47,7 +47,7 @@ jobs:
           pp=$(node -p "require('./plugin/package.json').version")
           [ "$rp" = "$v" ] || { echo "relay/package.json 是 $rp，标签是 $v——先同步 bump 再打标签"; exit 1; }
           [ "$pp" = "$v" ] || { echo "plugin/package.json 是 $pp，标签是 $v——先同步 bump 再打标签"; exit 1; }
-          # market/package.json 的版本由本 workflow 自动改写（不用手 bump）
+          # 只发布两个包：插件（含市场索引副本）+ 中继。app 走 AGC，不发 npm。
 
       - name: 门禁（relay 测试 + plugin 语法/KAT/crypto）
         run: |
@@ -56,6 +56,11 @@ jobs:
             && node --check index.js client.js typert.host.js lib/*.mjs scripts/*.mjs \
             && node -e "import('./lib/protocol.mjs').then(m=>m.assertKat()).then(()=>console.log('KAT OK'))" \
             && node scripts/verify-crypto.mjs && cd ..
+
+      - name: 生成市场索引（拷进插件包，让 unpkg 能取到）
+        run: |
+          node market/generate-index.mjs
+          node market/sync-into-plugin.mjs
 
       - name: 发布 relay（已发布则跳过）
         working-directory: relay
@@ -79,9 +84,6 @@ jobs:
             echo "plugin@$v 发布完成"
           fi
 
-      - name: 重生成市场索引（此刻 registry 已有新版本的发布时间）
-        run: node market/generate-index.mjs
-
       - name: 官方校验器验证索引
         run: |
           mkdir -p /tmp/idxval && cd /tmp/idxval
@@ -98,41 +100,20 @@ jobs:
             console.log('market index valid');
           "
 
-      - name: 发布市场索引包（索引走 npm 生态 CDN，unpkg/jsDelivr 都能取）
-        working-directory: market
-        run: |
-          v="${{ steps.ver.outputs.version }}"
-          # 索引包的版本**按标签自动改写**（手动发版只需 bump relay/plugin 的版本）
-          node -e "
-            const fs = require('fs');
-            const p = JSON.parse(fs.readFileSync('package.json', 'utf8'));
-            p.version = '$v';
-            fs.writeFileSync('package.json', JSON.stringify(p, null, 2) + '\n');
-          "
-          if npm view "@duke-dsh-plugins/dsh-remote-control-market@$v" version >/dev/null 2>&1; then
-            echo "market@$v 已在 npm 上，跳过发布"
-          else
-            npm publish --access public
-            echo "market@$v 发布完成"
-          fi
-
       - name: 索引提交回 main
         run: |
           git config user.name "dsh-remote-control"
           git config user.email "dev@localhost"
+          # 发版前生成的那份索引就是权威版本（npm 包里也是这一份）——
+          # **不要在这里重新生成**，否则仓库副本与 npm 副本的时间戳会不一致。
+          cp market/index.json /tmp/market-index.json
           git checkout main
           git pull --ff-only origin main
-          node market/generate-index.mjs
-          node -e "
-            const fs = require('fs');
-            const p = JSON.parse(fs.readFileSync('market/package.json', 'utf8'));
-            p.version = '${{ steps.ver.outputs.version }}';
-            fs.writeFileSync('market/package.json', JSON.stringify(p, null, 2) + '\n');
-          "
-          if git diff --quiet market/index.json market/package.json; then
+          cp /tmp/market-index.json market/index.json
+          if git diff --quiet market/index.json; then
             echo "索引无变化"
           else
-            git add market/index.json market/package.json
+            git add market/index.json
             git commit -m "Update market index for v${{ steps.ver.outputs.version }}"
             git push origin main
           fi
@@ -142,7 +123,6 @@ jobs:
           mkdir -p release-artifacts
           (cd relay && npm pack --pack-destination ../release-artifacts)
           (cd plugin && npm pack --pack-destination ../release-artifacts)
-          (cd market && npm pack --pack-destination ../release-artifacts)
           cp market/index.json "release-artifacts/market-index-${{ steps.ver.outputs.version }}.json"
           ls -la release-artifacts/
 

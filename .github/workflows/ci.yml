@@ -94,8 +94,8 @@ jobs:
             const parsed = m.parseMarketIndex(doc, 'https://raw.githubusercontent.com/MoonlitDropOfBlood/dsh-remote-control/main/market/index.json');
             console.log('market index valid:', parsed.plugins.map(p => p.name + '@' + p.versions[0].version).join(', '));
           "
-      - name: 索引 npm 包内容预检
-        working-directory: market
+      - name: 索引副本同步进插件包（unpkg 取的就是它）
         run: |
-          npm pack --dry-run
-          test -f index.json
+          node market/sync-into-plugin.mjs
+          node market/sync-into-plugin.mjs --check
+          test -f plugin/market/index.json

@@ -21,7 +21,8 @@
     "vendor",
     "cordis.patch.yml",
     "icon.svg",
-    "locale"
+    "locale",
+    "market/index.json"
   ],
   "license": "MIT",
   "dsh": {

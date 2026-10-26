@@ -1,0 +1,26 @@
+# 提交到 awesome-dsh-plugin 的收录条目（PR 用）。
+#
+# 提交方式（对方仓库 contributing.md 的规定）：
+#   在 https://github.com/awesome-dsh-plugin/awesome-dsh-plugin 提一个 PR，
+#   只新增这一个文件：data/plugins/<owner>__<repo>.yml
+#   → https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/create/main/data/plugins/MoonlitDropOfBlood__dsh-remote-control.yml
+#   把下面的内容粘进去 → "Propose changes" → 提 PR。
+#
+# 收录后：数据每日 CI 刷新 → awesome-dsh-plugin.com → dsh-market 的目录 →
+#   npm 包 dsh-plugin-catalog（DSH 0.2.1+ Discover 的索引源）。
+# 我们自己的 npm 包是**安装来源**（dsh plugin add @duke-dsh-plugins/dsh-remote-control）。
+#
+# 硬要求自检：
+#   ✅ package.json 声明了 dsh.bundle（{patch: ./cordis.patch.yml}）+ cordis.patch.yml 在仓库根
+#   ✅ 仓库有真实可用的代码（不是占位/纯 README）
+#   ✅ 仓库创建于 2026-10-21（满 1 天）
+#   ✅ 仓库已打 dsh-plugin topic（另有 dsh / dsh-plugins）
+#   ✅ 描述只说功能、不带营销词
+#   ✅ category 取值合法：remote（远程与移动端）
+url: https://github.com/MoonlitDropOfBlood/dsh-remote-control
+name: MoonlitDropOfBlood/dsh-remote-control
+category: remote
+description:
+  en: Remote-control DeepSeek Harness from a HarmonyOS phone over an end-to-end encrypted relay: list and switch sessions, send prompts, stream replies and tool steps, answer approval requests, view images, and switch models.
+  zh: 通过端到端加密中继用 HarmonyOS 手机遥控 DeepSeek Harness：浏览与切换会话、发送提示词、流式接收回复与工具步骤、应答审批请求、查看图片、切换模型。
+icon: https://raw.githubusercontent.com/MoonlitDropOfBlood/dsh-remote-control/main/plugin/assets/icon-180.png

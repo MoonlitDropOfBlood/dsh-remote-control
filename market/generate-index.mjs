@@ -78,12 +78,20 @@ function semverDesc(a, b) {
 const doc = await registryDoc(PLUGIN_PKG);
 // 版本集合：registry 已发布版本 ∪ 本地 package.json 版本（CI 在 publish 后跑，两者一致）。
 // 过滤：`0.0.0-stage` 是 npm 的暂存伪版本（实测会出现在 versions 里），非 SemVer 一律不进索引。
+// --only-published：**只列 registry 上已存在的版本**——市场索引包的「首包」场景要用
+// （Trusted Publisher 只能给已存在的包配，市场包得先手工发一版；那一版不能把还没
+// 发布的插件版本列进索引，否则市场会给出装不上的版本）。
 const SEMVER_RE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+const onlyPublished = process.argv.includes("--only-published");
+const published = new Set(Object.keys(doc?.versions ?? {}));
 const versionSet = new Set(
-  [...Object.keys(doc?.versions ?? []), pluginPkg.version].filter(
+  [...published, ...(onlyPublished ? [] : [pluginPkg.version])].filter(
     (v) => SEMVER_RE.test(v) && v !== "0.0.0-stage",
   ),
 );
+if (onlyPublished && versionSet.size === 0) {
+  throw new Error("--only-published：registry 上没有可索引的版本（拉不到注册表文档？）");
+}
 const versions = [...versionSet].sort(semverDesc).map((v) => ({
   version: v,
   publishTimestamp: publishTimestamp(doc, v),

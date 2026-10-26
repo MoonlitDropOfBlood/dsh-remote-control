@@ -57,15 +57,20 @@ jobs:
         run: node --check index.js client.js typert.host.js lib/*.mjs scripts/*.mjs
       - name: KAT（契约 §7）
         run: node -e "import('./lib/protocol.mjs').then(m=>m.assertKat()).then(()=>console.log('KAT OK'))"
-      - name: verify 门禁（crypto/steps/images/relay-supervisor/pairing/qr/settings）
-        run: |
-          node scripts/verify-crypto.mjs
-          node scripts/verify-steps.mjs
-          node scripts/verify-images.mjs
-          node scripts/verify-relay-supervisor.mjs
-          node scripts/verify-pairing.mjs
-          node scripts/verify-qr.mjs
-          node scripts/verify-settings.mjs
+      - name: verify-crypto
+        run: node scripts/verify-crypto.mjs
+      - name: verify-steps
+        run: node scripts/verify-steps.mjs
+      - name: verify-images
+        run: node scripts/verify-images.mjs
+      - name: verify-relay-supervisor
+        run: node scripts/verify-relay-supervisor.mjs
+      - name: verify-pairing
+        run: node scripts/verify-pairing.mjs
+      - name: verify-qr
+        run: node scripts/verify-qr.mjs
+      - name: verify-settings
+        run: node scripts/verify-settings.mjs
       - name: vendor 中继副本同步检查
         run: node scripts/vendor-relay.mjs --check
 

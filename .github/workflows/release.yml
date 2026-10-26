@@ -11,6 +11,12 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # 手动重发（补发 / 上次失败重试）：填版本号即可，不必移动标签
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "要发布的版本（如 1.1.4）"
+        required: true
 
 permissions:
   contents: write
@@ -20,10 +26,17 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: 检出（标签触发）
+        if: github.event_name == 'push'
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0 # 提交索引回 main 需要完整历史
-
+      - name: 检出（手动触发：按输入的版本取标签）
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: refs/tags/v${{ inputs.version }}
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -36,10 +49,16 @@ jobs:
           npm --version
           npm config set registry https://registry.npmjs.org/
 
-      - name: 从标签取版本
+      - name: 决定版本
         id: ver
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            v="${{ inputs.version }}"
+          else
+            v="${GITHUB_REF_NAME#v}"
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "发布版本：$v"
       - name: 版本一致性（package.json 必须与标签同步 bump）
         run: |
           v="${{ steps.ver.outputs.version }}"
@@ -49,14 +68,23 @@ jobs:
           [ "$pp" = "$v" ] || { echo "plugin/package.json 是 $pp，标签是 $v——先同步 bump 再打标签"; exit 1; }
           # 只发布两个包：插件（含市场索引副本）+ 中继。app 走 AGC，不发 npm。
 
-      - name: 门禁（relay 测试 + plugin 语法/KAT/crypto）
+      - name: 门禁 relay（安装 + 测试）
+        working-directory: relay
         run: |
-          cd relay && npm ci && npm test && cd ..
-          cd plugin && npm ci \
-            && node --check index.js client.js typert.host.js lib/*.mjs scripts/*.mjs \
-            && node -e "import('./lib/protocol.mjs').then(m=>m.assertKat()).then(()=>console.log('KAT OK'))" \
-            && node scripts/verify-crypto.mjs && cd ..
-
+          npm ci
+          npm test
+      - name: 门禁 plugin（安装）
+        working-directory: plugin
+        run: npm ci
+      - name: 门禁 plugin（语法检查）
+        working-directory: plugin
+        run: node --check index.js client.js typert.host.js lib/*.mjs scripts/*.mjs
+      - name: 门禁 plugin（KAT）
+        working-directory: plugin
+        run: node -e "import('./lib/protocol.mjs').then(m=>m.assertKat()).then(()=>console.log('KAT OK'))"
+      - name: 门禁 plugin（verify-crypto）
+        working-directory: plugin
+        run: node scripts/verify-crypto.mjs
       - name: 生成市场索引（拷进插件包，让 unpkg 能取到）
         run: |
           node market/generate-index.mjs

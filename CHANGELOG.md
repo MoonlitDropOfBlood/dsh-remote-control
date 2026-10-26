@@ -5,6 +5,31 @@ GitHub Release 的正文——**bump 版本时必须同步补一段 `## [版本]
 
 ## [Unreleased]
 
+## [1.1.4] - 2026-10-27
+
+发布工具链与插件市场接入（无协议变更，wire 行为与 1.1.3 完全一致）。
+
+### 插件市场
+
+- **市场索引包**：`@duke-dsh-plugins/dsh-remote-control-market`（format 1 索引），
+  用户在 DSH「设置 → 插件市场」加
+  `https://unpkg.com/@duke-dsh-plugins/dsh-remote-control-market@latest/index.json`
+  即可安装 DSH Pocket。**走 unpkg 而非 GitHub raw**：实测国内网络下
+  `raw.githubusercontent.com` 与 `cdn.jsdelivr.net` 的连接被重置，只有 unpkg 可达。
+- 索引内容自动生成（版本与发布时间取自 npm registry），发版时自动更新并重新发布。
+
+### 发布自动化
+
+- **GitHub Actions**：主分支/PR 跑全门禁（relay 测试 + plugin 全部 verify + 索引格式
+  校验）；推 `v*` 标签自动完成 门禁 → npm 发布（三个包，已发布自动跳过）→
+  市场索引重生成与发布 → GitHub Release（changelog 正文 + 三个包的 tgz + 索引文件）。
+- **CI 修掉两处只在 Linux 出现的坑**：verify 门禁的 DSH peers 改为暂存目录安装 +
+  软链（`@*` 不匹配预发布版本）；真中继用例需要 `relay/` 的依赖；
+  停止通道的桩中继补上 SIGTERM handler（POSIX 上 stop() 会「命令 + 信号」都发，
+  桩子没 handler 会被信号打死、来不及读 stdin → 误报失败）。
+- **CHANGELOG 驱动 Release 正文**：`CHANGELOG.md` 缺对应版本段落时发版直接失败，
+  避免再出现「Release 里没有 changelog 说明」。
+
 ## [1.1.3] - 2026-10-26
 
 首个 npm 发布（`@duke-dsh-plugins/dsh-remote-control` 插件包 +

@@ -1,6 +1,6 @@
 {
   "name": "@duke-dsh-plugins/dsh-remote-control-market",
-  "version": "1.1.3",
+  "version": "1.1.4",
   "description": "DSH plugin market index for DSH Pocket (remote-control DeepSeek Harness from a phone). Format-1 market index; serve it from a CDN, e.g. https://unpkg.com/@duke-dsh-plugins/dsh-remote-control-market@latest/index.json",
   "type": "module",
   "main": "index.json",

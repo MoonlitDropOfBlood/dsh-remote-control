@@ -1,0 +1,85 @@
+{
+  "format": 1,
+  "title": {
+    "en": "DSH Pocket Market",
+    "zh": "DSH Pocket 插件市场"
+  },
+  "description": {
+    "en": "Plugin index for DSH Pocket: remote-control DeepSeek Harness from a HarmonyOS phone over an end-to-end-encrypted relay.",
+    "zh": "DSH Pocket 的插件索引：通过端到端加密中继，用 HarmonyOS 手机遥控 DeepSeek Harness。"
+  },
+  "metadata": {
+    "categories": {
+      "remote-control": {
+        "title": {
+          "en": "Remote Control",
+          "zh": "远程控制"
+        }
+      }
+    },
+    "labels": {
+      "phone": {
+        "title": {
+          "en": "Phone",
+          "zh": "手机"
+        }
+      },
+      "e2e-encrypted": {
+        "title": {
+          "en": "End-to-end encrypted",
+          "zh": "端到端加密"
+        }
+      }
+    },
+    "sortKeys": {}
+  },
+  "plugins": [
+    {
+      "name": "@duke-dsh-plugins/dsh-remote-control",
+      "title": {
+        "en": "DSH Pocket",
+        "zh": "DSH Pocket 手机遥控"
+      },
+      "description": {
+        "en": "Control DeepSeek Harness from your phone: sessions, prompts, streamed replies, approvals, images and model switching over an E2E-encrypted relay. Fail-open by design. The relay can also be installed standalone (@duke-dsh-plugins/dsh-remote-control-relay) for VPS deployment.",
+        "zh": "在手机上遥控 DeepSeek Harness：会话、发送提示词、流式回复、审批应答、图片与模型切换，全程端到端加密。审批缺省放行（fail-open）。中继可独立安装（@duke-dsh-plugins/dsh-remote-control-relay）部署到 VPS。"
+      },
+      "icon": "https://raw.githubusercontent.com/MoonlitDropOfBlood/dsh-remote-control/main/plugin/icon.svg",
+      "author": "dukebywwh",
+      "homepage": "https://github.com/MoonlitDropOfBlood/dsh-remote-control#readme",
+      "repository": {
+        "url": "https://github.com/MoonlitDropOfBlood/dsh-remote-control",
+        "directory": "plugin"
+      },
+      "metadata": {
+        "category": "remote-control",
+        "keywords": [
+          "dsh",
+          "remote-control",
+          "harmonyos",
+          "phone",
+          "relay",
+          "e2e",
+          "approval"
+        ],
+        "labels": [
+          "phone",
+          "e2e-encrypted"
+        ],
+        "sortKeys": {}
+      },
+      "versions": [
+        {
+          "version": "1.1.3",
+          "publishTimestamp": 1792976274,
+          "source": {
+            "type": "npm"
+          },
+          "engines": {
+            "dsh": "^0.1.5-rc.3 || ^0.2.0-rc.1 || ^0.2.1-rc.0"
+          }
+        }
+      ]
+    }
+  ]
+}

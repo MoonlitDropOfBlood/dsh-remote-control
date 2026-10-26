@@ -1,0 +1,75 @@
+# CI：主分支/PR 的门禁。发布流程见 release.yml。
+# verify-settings 需要 DSH 内部 peers（cordis / dsh-typert-protocol，npm 上公开），
+# 临时 --no-save 装上再跑；本地开发仍然优先用 DSH 部署目录的联接（见 plugin/AGENTS.md）。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  relay:
+    name: relay（npm test + smoke）
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: relay
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm test
+      - run: npm run smoke
+
+  plugin:
+    name: plugin（语法 + KAT + 全部 verify 门禁）
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: plugin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm i --no-save --legacy-peer-deps "@deepseek-ai/cordis@^4.0.1" "@deepseek-ai/dsh-typert-protocol@*"
+      - name: 语法检查
+        run: node --check index.js client.js typert.host.js lib/*.mjs scripts/*.mjs
+      - name: KAT（契约 §7）
+        run: node -e "import('./lib/protocol.mjs').then(m=>m.assertKat()).then(()=>console.log('KAT OK'))"
+      - name: verify 门禁（crypto/steps/images/relay-supervisor/pairing/qr/settings）
+        run: |
+          node scripts/verify-crypto.mjs
+          node scripts/verify-steps.mjs
+          node scripts/verify-images.mjs
+          node scripts/verify-relay-supervisor.mjs
+          node scripts/verify-pairing.mjs
+          node scripts/verify-qr.mjs
+          node scripts/verify-settings.mjs
+      - name: vendor 中继副本同步检查
+        run: node scripts/vendor-relay.mjs --check
+
+  market:
+    name: market（索引格式校验）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: 用官方校验器验证 index.json
+        run: |
+          mkdir -p /tmp/idxval && cd /tmp/idxval
+          npm init -y >/dev/null 2>&1
+          npm i --silent --no-audit --no-fund @deepseek-ai/dsh-plugin-market-index >/dev/null
+          node --input-type=module -e "
+            const { readFileSync } = await import('node:fs');
+            const m = await import('file:///tmp/idxval/node_modules/@deepseek-ai/dsh-plugin-market-index/lib/index.js');
+            const doc = JSON.parse(readFileSync('${{ github.workspace }}/market/index.json', 'utf8'));
+            const parsed = m.parseMarketIndex(doc, 'https://raw.githubusercontent.com/MoonlitDropOfBlood/dsh-remote-control/main/market/index.json');
+            console.log('market index valid:', parsed.plugins.map(p => p.name + '@' + p.versions[0].version).join(', '));
+          "

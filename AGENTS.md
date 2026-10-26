@@ -34,6 +34,22 @@ cd relay && npm install && node server.js            # 中继（默认 8787；�
 # 配对：DSH「设置 → DSH Pocket」分区展示二维码 → 手机 App 扫码（v1.1.x 起；旧的 /remote-pairing 命令已删除）
 ```
 
+## 发布（npm / 插件市场 / GitHub Release，2026-10-26 起全自动）
+
+- **两个 npm 包**：`@duke-dsh-plugins/dsh-remote-control`（插件，含 vendor 中继副本）+
+  `@duke-dsh-plugins/dsh-remote-control-relay`（中继，独立部署用）。**版本必须同 bump**。
+- **发版 = 打标签**：同时 bump `relay/package.json` 与 `plugin/package.json` 的版本 →
+  `git tag v<版本> && git push origin main --tags`。`.github/workflows/release.yml` 接管：
+  门禁 → npm 发布（已发布自动跳过，重推标签安全）→ `market/generate-index.mjs` 重生成
+  插件市场索引 → 官方校验器验证 → 提交回 main → GitHub Release（自动 notes + 两个包的
+  tgz + 索引文件）。
+- **前置 secret（一次性）**：仓库 Settings → Secrets → Actions 配 `NPM_TOKEN`
+  （npmjs.com Access Tokens，Automation 类型）。
+- **插件市场索引**：`market/index.json`（format 1），用户在 DSH「设置 → 插件市场」加
+  raw URL（见 `market/README.md`）。索引只列插件包；中继包不是 bundle，不进索引。
+- CI（`.github/workflows/ci.yml`）：relay 测试+smoke；plugin 全部 verify 门禁
+  （verify-settings 的 peers 从 npm 临时装）；市场索引格式校验。
+
 ## 全局约定
 
 1. **协议以 docs/PROTOCOL.md 为准**（**v1.1.3**：v1.0.9 会话消息里的图片（§5.10「缩略图内联 +

@@ -1,0 +1,125 @@
+# 发布流程：推 v* 标签 → 门禁 → npm 发布（两个包）→ 重生成市场索引 → 提交回 main → GitHub Release。
+#
+# 前置（一次性）：仓库 Settings → Secrets → Actions 加 NPM_TOKEN
+# （npmjs.com → Access Tokens → 新建 Automation 类型）。
+#
+# 发版步骤：同时 bump relay/plugin 的 package.json 版本 → 提交 →
+#   git tag v<版本> && git push origin main --tags
+# workflow 会完成其余全部动作。已发布的版本自动跳过（重推标签安全）。
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 提交索引回 main 需要完整历史
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: 从标签取版本
+        id: ver
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: 版本一致性（package.json 必须与标签同步 bump）
+        run: |
+          v="${{ steps.ver.outputs.version }}"
+          rp=$(node -p "require('./relay/package.json').version")
+          pp=$(node -p "require('./plugin/package.json').version")
+          [ "$rp" = "$v" ] || { echo "relay/package.json 是 $rp，标签是 $v——先同步 bump 再打标签"; exit 1; }
+          [ "$pp" = "$v" ] || { echo "plugin/package.json 是 $pp，标签是 $v——先同步 bump 再打标签"; exit 1; }
+
+      - name: 门禁（relay 测试 + plugin 语法/KAT/crypto）
+        run: |
+          cd relay && npm ci && npm test && cd ..
+          cd plugin && npm ci \
+            && node --check index.js client.js typert.host.js lib/*.mjs scripts/*.mjs \
+            && node -e "import('./lib/protocol.mjs').then(m=>m.assertKat()).then(()=>console.log('KAT OK'))" \
+            && node scripts/verify-crypto.mjs && cd ..
+
+      - name: 发布 relay（已发布则跳过）
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        working-directory: relay
+        run: |
+          v="${{ steps.ver.outputs.version }}"
+          if npm view "@duke-dsh-plugins/dsh-remote-control-relay@$v" version >/dev/null 2>&1; then
+            echo "relay@$v 已在 npm 上，跳过发布"
+          else
+            npm publish --access public
+            echo "relay@$v 发布完成"
+          fi
+
+      - name: 发布 plugin（已发布则跳过）
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        working-directory: plugin
+        run: |
+          v="${{ steps.ver.outputs.version }}"
+          if npm view "@duke-dsh-plugins/dsh-remote-control@$v" version >/dev/null 2>&1; then
+            echo "plugin@$v 已在 npm 上，跳过发布"
+          else
+            npm publish --access public
+            echo "plugin@$v 发布完成"
+          fi
+
+      - name: 重生成市场索引（此刻 registry 已有新版本的发布时间）
+        run: node market/generate-index.mjs
+
+      - name: 官方校验器验证索引
+        run: |
+          mkdir -p /tmp/idxval && cd /tmp/idxval
+          npm init -y >/dev/null 2>&1
+          npm i --silent --no-audit --no-fund @deepseek-ai/dsh-plugin-market-index >/dev/null
+          node --input-type=module -e "
+            const { readFileSync } = await import('node:fs');
+            const m = await import('file:///tmp/idxval/node_modules/@deepseek-ai/dsh-plugin-market-index/lib/index.js');
+            const doc = JSON.parse(readFileSync('${{ github.workspace }}/market/index.json', 'utf8'));
+            const parsed = m.parseMarketIndex(doc, 'https://example.com/index.json');
+            if (!parsed.plugins.some(p => p.versions.some(v => v.version === '${{ steps.ver.outputs.version }}'))) {
+              throw new Error('索引里没有 ${{ steps.ver.outputs.version }}');
+            }
+            console.log('market index valid');
+          "
+
+      - name: 索引提交回 main
+        run: |
+          git config user.name "dsh-remote-control"
+          git config user.email "dev@localhost"
+          git checkout main
+          git pull --ff-only origin main
+          node market/generate-index.mjs
+          if git diff --quiet market/index.json; then
+            echo "索引无变化"
+          else
+            git add market/index.json
+            git commit -m "Update market index for v${{ steps.ver.outputs.version }}"
+            git push origin main
+          fi
+
+      - name: 打包产物
+        run: |
+          mkdir -p release-artifacts
+          (cd relay && npm pack --pack-destination ../release-artifacts)
+          (cd plugin && npm pack --pack-destination ../release-artifacts)
+          cp market/index.json "release-artifacts/market-index-${{ steps.ver.outputs.version }}.json"
+          ls -la release-artifacts/
+
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            release-artifacts/*.tgz
+            release-artifacts/*.json

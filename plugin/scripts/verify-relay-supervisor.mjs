@@ -810,6 +810,10 @@ function stubEntry() {
 {
   // 盲区③：stop 走 stdin 的 shutdown 命令（Windows 上 SIGTERM 是硬杀，这条是唯一的优雅路径）
   // —— 断言「子进程是被命令停掉的」：桩中继在收到 shutdown 时才打印一行。
+  //
+  // 桩子**必须装 SIGTERM handler**（真中继也有，见 relay/server.js 的 shutdown）：
+  // POSIX 上 stop() 会「命令 + SIGTERM」都发，桩子若按默认行为被信号打死，
+  // 就来不及读 stdin → 断言误报。handler 里延迟退出，给命令留出送达窗口。
   const dir = mkdtempSync(join(tmpdir(), "dshrc-shutdown-"));
   const entry = join(dir, "shut.mjs");
   writeFileSync(
@@ -828,6 +832,8 @@ function stubEntry() {
       "  }",
       "});",
       "process.stdin.resume();",
+      // 扛住 SIGTERM（真中继也这么做），延迟退出以留出命令送达窗口：
+      "process.on('SIGTERM', () => { setTimeout(() => { srv.close(() => process.exit(0)); }, 800); });",
     ].join("\n"),
   );
   const sup = new RelaySupervisor({ entry });

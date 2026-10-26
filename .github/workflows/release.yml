@@ -20,6 +20,7 @@ on:
 
 permissions:
   contents: write
+  issues: write # 仅用于门禁失败时把日志贴成 issue（可匿名读）
   id-token: write # npm Trusted Publishing（OIDC）用的；用 NPM_TOKEN 时无副作用
 
 jobs:
@@ -40,13 +41,22 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-      # npm Trusted Publishing（OIDC）要求 npm ≥ 11.5.1；node 24 自带的 npm 可能偏旧，
-      # 显式升到最新。**不设 registry-url**：setup-node 会写一条 _authToken=${NODE_AUTH_TOKEN}
-      # 的 .npmrc，空令牌会盖掉 OIDC 流程；npm 默认注册表本来就是 npmjs.org。
+      # npm Trusted Publishing（OIDC）要求 npm ≥ 11.5.1。
+      # **固定装 npm@11，不要用 @latest**：npm 12 要求 node ^22.22.2 || ^24.15.0 || >=26，
+      # runner 的 node 版本可能不满足 → `npm ci` 直接秒挂（实测踩过）。
+      # npm 11 支持 node 24 ✓，且满足 OIDC 的 ≥ 11.5.1 ✓。
+      # **不设 registry-url**：setup-node 会写一条 _authToken=${NODE_AUTH_TOKEN} 的 .npmrc，
+      # 空令牌会盖掉 OIDC 流程；npm 默认注册表本来就是 npmjs.org。
       - name: 准备 npm（OIDC 需要 ≥ 11.5.1）
         run: |
-          npm install -g npm@latest
+          npm install -g npm@11
           npm --version
+          node -e "
+            const v = require('child_process').execSync('npm --version').toString().trim();
+            const [a, b] = v.split('.').map(Number);
+            if (a < 11 || (a === 11 && b < 5)) { console.error('npm ' + v + ' < 11.5.1，OIDC 不可用'); process.exit(1); }
+            console.log('npm OK:', v);
+          "
           npm config set registry https://registry.npmjs.org/
 
       - name: 决定版本
@@ -91,6 +101,11 @@ jobs:
           git add -f ci-gate.log
           git -c user.name="ci-debug" -c user.email="ci@localhost" commit -m "ci debug: gate log" >/dev/null 2>&1
           git push origin HEAD:ci-debug 2>&1 | tail -3
+          # 分支推送不可靠时，用 issue 兜底（issue 正文可匿名读取）
+          if ! git ls-remote --exit-code origin refs/heads/ci-debug >/dev/null 2>&1; then
+            body=$(node -e "console.log(JSON.stringify(require('fs').readFileSync('ci-gate.log','utf8')))")
+            curl -sS -X POST -H "Authorization: Bearer $GITHUB_TOKEN"               -H "Accept: application/vnd.github+json"               "https://api.github.com/repos/${{ github.repository }}/issues"               -d "{\"title\":\"[ci-debug] release gate log\",\"body\":$body}" || true
+          fi
 
       - name: 门禁 plugin（安装）
         working-directory: plugin

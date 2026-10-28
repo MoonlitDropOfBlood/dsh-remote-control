@@ -4,7 +4,9 @@
 //
 // v1.0.6：支持 session.capabilities（模式/权限目录）、session.create 的
 // agentPreset / permission、session.history 的 steps，以及 tool.call /
-// tool.result / system.message 事件推送（契约 §5.2 / §5.7 / §5.8）。
+// tool.result 事件推送（契约 §5.2 / §5.7 / §5.8）。
+// v1.1.4：system.message 事件**已移除**（宿主 system/developer 消息是提示词组装
+// 记录，不是对话内容，PC 聊天视图从不展示）。
 // v1.0.7：追加模型目录（capabilities.models / defaultModelId）、真实归档
 // （session.archive / session.unarchive / session.archives 广播 / list 的 archived）、
 // 以及思考过程（assistant.reasoningDelta 事件 + 历史 role:"reasoning" 消息）。
@@ -208,7 +210,7 @@ export function createMockHost(deps) {
   /**
  * 推一条 wire 事件（契约 §5.2 的 topic），并把**宿主形状**的事件记入会话历史。
  * @param {object} session
- * @param {string} topic wire topic（tool.call / tool.result / system.message）
+ * @param {string} topic wire topic（tool.call / tool.result）
  * @param {object} wireData 推给手机的事件 data
  * @param {string} historyType 宿主事件类型（tool/call …）
  * @param {object} historyData 宿主事件 data（历史回放用）
@@ -383,17 +385,12 @@ export function createMockHost(deps) {
         link.send(msg("event", { topic: "session.status", data: { sessionId: s.sessionId, running: true } }));
         // 用户输入进历史
         record(s, "user/message", { source: { kind: "user" }, content: [{ type: "text", text: p.text ?? "" }] });
-        // v1.0.6：系统提示 + 工具调用/结果（§5.2 / §5.7）
+        // v1.0.6：工具调用/结果（§5.2 / §5.7）
+        // v1.1.4：不再发 system.message——宿主 system/developer 消息是提示词组装
+        // 记录，不是对话内容（PC 聊天视图从不展示），协议已移除该 topic。
         const callId = "call-" + Math.random().toString(36).slice(2, 8);
         const now = Date.now();
         const args = JSON.stringify({ command: "echo hello" });
-        emit(
-          s,
-          "system.message",
-          { sessionId: s.sessionId, kind: "system", text: "mock: 系统提示", ts: now },
-          "system/message",
-          { turn: 1, step: 1, message: { content: [{ type: "text", text: "mock: 系统提示" }] } },
-        );
         emit(
           s,
           "tool.call",

@@ -1,15 +1,19 @@
 /*
  * Copyright (c) 2026 dukedsh.
  * 会话详情页（NavDestination，param = SessionDetailParam）。
- *  - 统一时间线：store.timeline 按 kind 分派（消息气泡 / 工作步骤卡 / 系统说明行）→ TimelineView
+ *  - 统一时间线：store.timeline 按 kind 分派（消息气泡 / 工作步骤分组 / 思考块）
+ *    → List 懒加载（v1.1.4 从 Scroll+Column 全量加载迁移：只布局可视区、
+ *    template 分类复用、initialIndex 首帧贴底、悬浮「回到底部」按钮带动画）
  *  - assistant.delta 流式追加到当前气泡（带光标），turn.end 定稿
  *  - 底部输入条 + 发送；running 时显示「取消」；顶部标题栏 + 运行状态徽标
  *  - 本会话的审批 / 提问卡片内嵌在输入条上方（AskCards），resolved 后自动消失
  *  - v1.0.8：输入条上方「模型 / 思考强度」胶囊 → bindSheet 选模型与强度（session.selectModel）
- *  - v1.1.1：agent 运行时输入条上方出现「排队 / 插入当前任务」模式胶囊（session.prompt 的 mode）；
- *    待执行消息列表（宿主 session.queue 事件）在输入区上方展示，只展示不猜测
+ *  - v1.1.4：模型/强度显示与 PC composer 同口径（modelSelection 投影 + 默认强度回退）；
+ *    markdown 代码块/表格复制接入系统剪贴板（此前报「未设置复制监听」）
+ *  - v1.1.1：待执行消息列表（宿主 session.queue 事件）在输入区上方展示，只展示不猜测
  */
 import { MarkdownController } from '@luvi/lv-markdown-in';
+import { pasteboard } from '@kit.BasicServicesKit';
 import { promptAction } from '@kit.ArkUI';
 import { HRouter } from 'hrouter';
 import { dshrcLink } from '../model/link';
@@ -40,7 +44,7 @@ import {
   SP_6
 } from '../model/theme';
 import { ApprovalCardView, QuestionCardView } from './AskCards';
-import { TimelineView } from './TimelineView';
+import { MessageBubble, ReasoningCard, StepGroup, TimelineEntry, groupTimeline } from './TimelineView';
 
 
 /** 子代理目录 chip（契约 §5.6 v1.0.5；点击进入子代理详情）。 */
@@ -132,12 +136,44 @@ export struct SessionDetailPage {
   }
 
   /**
+   * 复制到系统剪贴板（v1.1.4）：markdown 库的复制按钮只回调不落剪贴板——
+   * `setCodeCopyListener` 没设置时点击会报「未设置复制监听」（用户实测）。
+   * 代码块 / 表格 / 跨 Text 选区三类复制入口都接到这里。
+   */
+  private copyToClipboard(text: string): void {
+    if (text.length === 0) {
+      return;
+    }
+    try {
+      const board: pasteboard.SystemPasteboard = pasteboard.getSystemPasteboard();
+      const data: pasteboard.PasteData = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, text);
+      board.setData(data).then((): void => {
+        promptAction.showToast({ message: '已复制', duration: 1200 });
+      }).catch((): void => {
+        promptAction.showToast({ message: '复制失败', duration: 1500 });
+      });
+    } catch (err) {
+      promptAction.showToast({ message: '复制失败', duration: 1500 });
+    }
+  }
+
+  /**
    * 把一套 markdown 主题刷到控制器上。
    * @param ctrl 目标控制器
    * @param dim true = 思考块专用（弱化：小号 + secondary 文字色）
    */
   private applyMarkdownTheme(ctrl: MarkdownController, dim: boolean): void {
     try {
+      ctrl.setCodeCopyListener((text: string): void => {
+        this.copyToClipboard(text);
+      });
+      // 表格复制按钮 + 跨 Text 文本选区复制（同走系统剪贴板）
+      ctrl.setTableCopyClickListener((rawTableMarkdown: string): void => {
+        this.copyToClipboard(rawTableMarkdown);
+      });
+      ctrl.setTextSelectionCopyListener((text: string): void => {
+        this.copyToClipboard(text);
+      });
       const textColor: Resource = dim ? $r('app.color.label_secondary') : $r('app.color.label_primary');
       const titleColor: Resource = dim ? $r('app.color.label_secondary') : $r('app.color.label_primary');
       const bodySize: number = dim ? FS_SMALL : FS_BODY;
@@ -257,6 +293,21 @@ export struct SessionDetailPage {
     }
   }
 
+  /** 时间线分组视图（List 的数据源：一项 = 一个 ListItem）。 */
+  private timelineEntries(): TimelineEntry[] {
+    return groupTimeline(this.store.timeline);
+  }
+
+  /**
+   * List initialIndex（v1.1.4）：首帧直接落在**最后一条**（index 0 是 historyBar
+   * 头部项，故 = entries.length）——避免先渲染历史头部再跳底部的闪动；
+   * initialIndex 只保证「最后一条出现在视口」，贴齐视口底边由 onAppear 的
+   * scrollEdge（List 无动画）一帧完成。
+   */
+  private initialListIndex(): number {
+    return this.timelineEntries().length;
+  }
+
   /**
    * 用户是否「接近底部」（距底部 ≤ NEAR_BOTTOM_VP 即算仍在底部，可继续跟随）。
    * contentSize / currentOffset 单位都是 vp，可直接相减。
@@ -309,6 +360,9 @@ export struct SessionDetailPage {
   /**
    * 贴底：内容变化后布局可能尚未完成，先同步贴一次、再异步补一次（落到真正的新底部）。
    * 用户主动滚动会取消待执行的补贴底（autoScrollPending）。
+   * v1.1.4：容器是 **List**——`scrollEdge` 默认**无动画**（Scroll 组件才有默认动画，
+   * 官方 FAQ faqs-arkui-802），所以进入会话/流式跟随都是一帧直显底部，
+   * 不再有「滑到底」的滚动动画（用户反馈）。
    */
   private scrollToBottom(): void {
     this.autoScrollPending = true;
@@ -329,6 +383,34 @@ export struct SessionDetailPage {
         // 同上
       }
     }, 100);
+  }
+
+  /** 悬浮「回到底部」按钮是否显示（v1.1.4）：有内容且用户已离开底部。 */
+  private showJumpButton(): boolean {
+    return !this.followBottom && this.store.timeline.length > 0;
+  }
+
+  /**
+   * 悬浮按钮：**带动画**滚回底部（v1.1.4）。
+   * List 的 scrollEdge 无动画 → 用 `scrollTo` + `animation`（官方 FAQ faqs-arkui-802
+   * 的推荐写法）。yOffset 取**内容高度 − 视口高度**（真正的底部位置）：传更大的值
+   * 会越界并触发弹簧回弹（官方文档：带动画滚动越界会启动回弹动画）。
+   * 不用 scrollToIndex：它带 smooth 时会把途经的所有 item 都加载布局（长会话卡顿）。
+   */
+  private jumpToBottom(): void {
+    this.autoScrollPending = false; // 取消待执行的补贴底（本方法自己滚）
+    this.followBottom = true;
+    try {
+      const size: SizeResult = this.scroller.contentSize();
+      const maxOffset: number = Math.max(0, size.height - this.viewportVp);
+      this.scroller.scrollTo({
+        xOffset: 0,
+        yOffset: maxOffset,
+        animation: { duration: 280, curve: Curve.EaseOut }
+      });
+    } catch (e) {
+      this.scrollToBottom();
+    }
   }
 
   /**
@@ -429,13 +511,40 @@ export struct SessionDetailPage {
     return '模型';
   }
 
-  /** 胶囊上的思考强度（id）；无 → 空串。 */
+  /**
+   * 胶囊上的思考强度（**显示名**，v1.1.4）；无 → 空串。
+   * 与 PC composer 同口径（dsh-client-ui-model-selection 的 syncInputs）：
+   *  - effort = selection.reasoningEffort ?? 所选模型的默认强度（ModelOption.reasoningEffort）；
+   *  - selection 为 null（空白会话）→ 用目录默认模型的默认强度；
+   *  - id → efforts 里的 name（目录里没有就原样显示 id）。
+   * 旧实现只显示 selection.reasoningEffort 的裸 id——大多数会话没显式选过强度，
+   * 于是强度永远不显示/对不上 PC。
+   */
   private modelEffortText(): string {
     const sel: DshrcModelSelection | null = this.store.sessionModel;
-    if (sel === null || sel.reasoningEffort === undefined) {
+    let option: DshrcModelOption | undefined;
+    let explicitEffort: string = '';
+    if (sel !== null) {
+      option = this.findModelOption(sel.provider, sel.model);
+      explicitEffort = sel.reasoningEffort !== undefined ? sel.reasoningEffort : '';
+    } else {
+      option = this.defaultModelOption();
+    }
+    let effortId: string = explicitEffort;
+    if (effortId.length === 0 && option !== undefined && option.reasoningEffort !== undefined) {
+      effortId = option.reasoningEffort;
+    }
+    if (effortId.length === 0) {
       return '';
     }
-    return sel.reasoningEffort;
+    const efforts: DshrcEffortOption[] = option !== undefined && option.efforts !== undefined
+      ? option.efforts : [];
+    for (let i: number = 0; i < efforts.length; i++) {
+      if (efforts[i].id === effortId) {
+        return efforts[i].name;
+      }
+    }
+    return effortId;
   }
 
   /** 面板中所选模型的合法思考强度集合（无 → 空数组 = 该模型不支持强度）。 */
@@ -517,22 +626,32 @@ export struct SessionDetailPage {
     return efforts[idx - 1].name;
   }
 
-  /** 打开面板：初值 = 当前会话模型（未知 → 目录默认）；强度取当前值（不属于所选模型则「默认」）。 */
+  /** 打开面板：初值 = 当前会话模型（未知 → 目录默认）；强度取**有效值**（与 PC 选择器
+   *  同口径：显式强度 → 所选模型默认强度 → 「默认」）。 */
   private openModelSheet(): void {
     const cur: DshrcModelOption | undefined = this.currentModelOption();
+    const def: DshrcModelOption | undefined = this.defaultModelOption();
+    const base: DshrcModelOption | undefined = cur !== undefined ? cur : def;
     if (cur !== undefined) {
       this.sheetModelId = cur.id;
     } else {
-      const def: DshrcModelOption | undefined = this.defaultModelOption();
       this.sheetModelId = def !== undefined ? def.id : '';
     }
     let effortId: string = '';
     const sel: DshrcModelSelection | null = this.store.sessionModel;
-    const efforts: DshrcEffortOption[] = this.sheetModelEfforts();
-    if (sel !== null && sel.reasoningEffort !== undefined) {
+    const efforts: DshrcEffortOption[] = base !== undefined && base.efforts !== undefined
+      ? base.efforts : [];
+    // 有效强度 = 显式 reasoningEffort ?? 面板所选模型的默认强度（PC 同口径）
+    let want: string = '';
+    if (sel !== null && sel.reasoningEffort !== undefined && sel.reasoningEffort.length > 0) {
+      want = sel.reasoningEffort;
+    } else if (base !== undefined && base.reasoningEffort !== undefined) {
+      want = base.reasoningEffort;
+    }
+    if (want.length > 0) {
       for (let i: number = 0; i < efforts.length; i++) {
-        if (efforts[i].id === sel.reasoningEffort) {
-          effortId = sel.reasoningEffort;
+        if (efforts[i].id === want) {
+          effortId = want;
           break;
         }
       }
@@ -970,55 +1089,146 @@ export struct SessionDetailPage {
         this.subagentBar()
       }
 
-      // 下拉刷新（V2 !! 双向绑定）：重拉最新一页历史；Scroll 的贴底/跟随逻辑不受影响
-      //（Refresh 只在内容顶到顶时接管下拉手势，向上滚动照常）。
-      Refresh({ refreshing: this.refreshing!! }) {
-        Scroll(this.scroller) {
-          Column() {
-            this.historyBar()
-            if (this.store.timeline.length === 0) {
-              if (!this.store.historyLoading) {
+      // 下拉刷新 + 时间线 + 悬浮「回到底部」按钮（v1.1.4）。
+      // 时间线容器从 Scroll+Column 全量加载迁到 **List 懒加载**：
+      //  - 只布局可视区（长会话不再全量 build 所有气泡/步骤卡/markdown）；
+      //  - Repeat virtualScroll + template 分类复用（message/reasoning/group 三池，
+      //    折叠态存 TimelineItem.expanded 随数据恢复，条目组件不挂 @ReusableV2
+      //    ——Repeat 模板里不允许 @ReusableV2 组件，复用由模板池负责）；
+      //  - initialIndex 首帧落在最后一条 + onAppear 无动画贴底 → 进入会话**直显底部**；
+      //  - maintainVisibleContentPosition：向前加载更早历史时不拽走视口。
+      // Refresh 只在内容顶到顶时接管下拉手势，向上滚动照常。
+      Stack({ alignContent: Alignment.BottomEnd }) {
+        Refresh({ refreshing: this.refreshing!! }) {
+          if (this.store.timeline.length === 0) {
+            // 空态/首屏加载中（List 尚不创建——创建时机决定 initialIndex 贴底）
+            Column() {
+              if (this.store.historyLoading) {
+                Column({ space: SP_2 }) {
+                  LoadingProgress()
+                    .width(24)
+                    .height(24)
+                    .color($r('app.color.label_tertiary'))
+                  Text('正在加载历史消息…')
+                    .fontSize(FS_SMALL)
+                    .fontColor($r('app.color.label_tertiary'))
+                }
+                .justifyContent(FlexAlign.Center)
+              } else {
                 this.emptyState()
               }
-            } else {
-              TimelineView({
-                items: this.store.timeline,
-                mdController: this.mdCtrl,
-                mdReasoningController: this.mdCtrlReasoning
-              })
             }
+            .width('100%')
+            .height('100%')
+            .justifyContent(FlexAlign.Center)
+          } else {
+            List({
+              scroller: this.scroller,
+              initialIndex: this.initialListIndex()
+            }) {
+              // 头部项：加载更早消息 / 加载中（随内容滚动）
+              ListItem() {
+                this.historyBar()
+              }
+              Repeat(this.timelineEntries())
+                // 兜底 builder（官方 FAQ faqs-arkui-606：Repeat 必须有 item builder，
+                // .each() 等价于 template type 为空字符串的 .template()）。
+                // templateId 恒返回非空串，正常不会命中它，但缺了会报
+                // 「__Repeat item builder function unspecified」直接崩（真机实测）。
+                .each((cell: RepeatItem<TimelineEntry>): void => {
+                  ListItem() {
+                    MessageBubble({ item: cell.item.head, mdController: this.mdCtrl })
+                  }
+                })
+                .key((e: TimelineEntry): string => e.key)
+                .virtualScroll()
+                .templateId((e: TimelineEntry): string => {
+                  if (e.isGroup) {
+                    return 'group';
+                  }
+                  return e.head.isReasoning() ? 'reasoning' : 'message';
+                })
+                .template('message', (cell: RepeatItem<TimelineEntry>): void => {
+                  ListItem() {
+                    MessageBubble({ item: cell.item.head, mdController: this.mdCtrl })
+                  }
+                }, { cachedCount: 4 })
+                .template('reasoning', (cell: RepeatItem<TimelineEntry>): void => {
+                  ListItem() {
+                    ReasoningCard({ item: cell.item.head, mdController: this.mdCtrlReasoning })
+                  }
+                }, { cachedCount: 4 })
+                .template('group', (cell: RepeatItem<TimelineEntry>): void => {
+                  ListItem() {
+                    StepGroup({ steps: cell.item.steps })
+                  }
+                }, { cachedCount: 4 })
+            }
+            .width('100%')
+            .height('100%')
+            .cachedCount(4)
+            .scrollBar(BarState.Off)
+            .maintainVisibleContentPosition(true)
+            // 从末尾开始布局（聊天列表语义）：内容不满一屏时底部对齐，
+            // 首帧即最后一条 —— 进入会话**直显底部**，无滚动动画。
+            .stackFromEnd(true)
+            .padding({ left: SP_4, right: SP_4, top: SP_2, bottom: SP_3 })
+            // 首帧贴底（List 的 scrollEdge 无动画）：initialIndex 让视口落在最后一条，
+            // 这里把底边对齐视口底（最后一条较矮时避免「内容悬在视口顶部」）。
+            .onAppear((): void => {
+              try {
+                this.scroller.scrollEdge(Edge.Bottom);
+              } catch (e) {
+                // 布局未完成时由 aboutToAppear 的兜底贴底接管
+              }
+            })
+            // 滚动位置跟踪：用户手指滚动（Scroll 状态）时更新「是否仍在底部」；
+            // List 到达末尾（onReachEnd）与停止滚动（onScrollStop）恢复跟随。
+            // List 的 onDidScroll 回调签名是 (scrollOffset, scrollState)（两参）。
+            .onDidScroll((scrollOffset: number, scrollState: ScrollState): void => {
+              this.handleUserScroll(scrollState);
+            })
+            .onReachEnd((): void => {
+              this.followBottom = true;
+            })
+            .onScrollStop((): void => {
+              this.followBottom = this.nearBottom();
+            })
+            // 视口高度（vp）：用于「接近底部」的距离判定
+            .onAreaChange((oldArea: Area, newArea: Area): void => {
+              const h: Length = newArea.height;
+              this.viewportVp = typeof h === 'number' ? h : 0;
+            })
           }
-          .width('100%')
-          .padding({ left: SP_4, right: SP_4, top: SP_2, bottom: SP_3 })
         }
         .width('100%')
         .height('100%')
-        .scrollBar(BarState.Off)
-        .align(Alignment.Top)
-        // 滚动位置跟踪：用户手指滚动（Scroll 状态）时更新「是否仍在底部」；
-        // 触底（onScrollEdge）与停止滚动（onScrollStop）恢复跟随。
-        .onDidScroll((xOffset: number, yOffset: number, state: ScrollState): void => {
-          this.handleUserScroll(state);
+        .onRefreshing((): void => {
+          this.doPullRefresh();
         })
-        .onScrollEdge((side: Edge): void => {
-          if (side === Edge.Bottom) {
-            this.followBottom = true;
+
+        // 悬浮「回到底部」：仅当用户离开底部时出现（淡入淡出 + 缩放过渡）
+        if (this.showJumpButton()) {
+          Button() {
+            SymbolGlyph($r('sys.symbol.chevron_down'))
+              .fontSize(20)
+              .fontColor([$r('app.color.label_secondary')])
           }
-        })
-        .onScrollStop((): void => {
-          this.followBottom = this.nearBottom();
-        })
-        // 视口高度（vp）：用于「接近底部」的距离判定
-        .onAreaChange((oldArea: Area, newArea: Area): void => {
-          const h: Length = newArea.height;
-          this.viewportVp = typeof h === 'number' ? h : 0;
-        })
+          .type(ButtonType.Normal)
+          .width(44)
+          .height(44)
+          .backgroundColor($r('app.color.bg_layer_1'))
+          .border({ width: HAIRLINE, color: $r('app.color.border_l1') })
+          .borderRadius(RADIUS_PILL)
+          .margin({ right: SP_4, bottom: SP_4 })
+          .transition(TransitionEffect.OPACITY.combine(TransitionEffect.scale({ x: 0.7, y: 0.7 })))
+          .onClick((): void => {
+            this.jumpToBottom();
+          })
+        }
       }
       .width('100%')
       .layoutWeight(1)
-      .onRefreshing((): void => {
-        this.doPullRefresh();
-      })
 
       // 本会话的审批 / 提问卡片（输入条上方；resolved / answered 后消失）
       if (this.store.approvalsFor(this.sessionId).length > 0 ||

@@ -114,7 +114,7 @@ const check = (label, cond, detail) => {
  * A. 自测链路：进程内直连回环（同样的封装与 AAD 绑定）+ mock host。
  *    不依赖中继进程、不占用真实 channel，覆盖：
  *      session.capabilities → session.create(agentPreset/permission)
- *      → session.history(steps) → tool.call/tool.result/system.message 事件到达。
+ *      → session.history(steps) → tool.call/tool.result 事件到达。
  */
 async function v106LoopbackCase() {
   console.log("");
@@ -156,19 +156,19 @@ async function v106LoopbackCase() {
   const deadline = Date.now() + 5000;
   while (Date.now() < deadline) {
     const topics = new Set(seen.map((e) => e.topic));
-    if (topics.has("tool.call") && topics.has("tool.result") && topics.has("system.message")) break;
+    if (topics.has("tool.call") && topics.has("tool.result")) break;
     await new Promise((r) => setTimeout(r, 50));
   }
   const topics = seen.map((e) => e.topic);
   check("tool.call 事件到达", topics.includes("tool.call"), JSON.stringify(topics));
   check("tool.result 事件到达", topics.includes("tool.result"), JSON.stringify(topics));
-  check("system.message 事件到达", topics.includes("system.message"), JSON.stringify(topics));
+  // v1.1.4：system.message 已从协议移除（宿主 system/developer 消息是提示词组装
+  // 记录，不是对话内容，PC 聊天视图从不展示）→ 不应再出现该 topic。
+  check("system.message 事件已移除（v1.1.4）", !topics.includes("system.message"), JSON.stringify(topics));
   const call = seen.find((e) => e.topic === "tool.call")?.data;
   check("tool.call 字段", call?.sessionId === sid && typeof call?.callId === "string" && call?.name === "bash" && typeof call?.arguments === "string" && typeof call?.ts === "number", JSON.stringify(call));
   const res = seen.find((e) => e.topic === "tool.result")?.data;
   check("tool.result 字段", res?.callId === call?.callId && res?.status === "ok" && res?.resultText === "hello", JSON.stringify(res));
-  const sys = seen.find((e) => e.topic === "system.message")?.data;
-  check("system.message 字段", sys?.kind === "system" && typeof sys?.text === "string" && sys.text !== "", JSON.stringify(sys));
 
   // 4. history 带 steps
   const hist = await client.request("session.history", { sessionId: sid }, 5000);

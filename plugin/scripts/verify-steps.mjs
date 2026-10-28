@@ -348,9 +348,10 @@ function eventsOf(sent, topic) {
   check("tool.call 字段", toolCalls[0]?.sessionId === "sess-live" && toolCalls[0]?.callId === "c1" && toolCalls[0]?.name === "read" && toolCalls[0]?.arguments === '{"path":"a"}' && toolCalls[0]?.ts === 2000, JSON.stringify(toolCalls[0]));
   check("tool.result 事件 1 条", toolResults.length === 1, JSON.stringify(toolResults));
   check("tool.result 字段", toolResults[0]?.callId === "c1" && toolResults[0]?.status === "ok" && toolResults[0]?.resultText === "ok" && toolResults[0]?.errorText === "", JSON.stringify(toolResults[0]));
-  check("system.message 2 条（system + developer）", sysMsgs.length === 2, JSON.stringify(sysMsgs));
-  check("system.message kind", sysMsgs[0]?.kind === "system" && sysMsgs[1]?.kind === "developer", JSON.stringify(sysMsgs));
-  check("system.message text", sysMsgs[0]?.text === "系统提示" && sysMsgs[1]?.text === "开发者提示", JSON.stringify(sysMsgs));
+  // v1.1.4：system/message 与 developer/message **不再桥接**（它们是宿主的
+  // 系统提示词节点 / 工具注册表变更——提示词组装记录，不是对话内容，PC 聊天
+  // 视图从不展示；手机端曾把它们显示成「系统消息」大段文本，用户反馈移除）。
+  check("system.message 不再桥接（v1.1.4 移除）", sysMsgs.length === 0, JSON.stringify(sysMsgs));
 
   bridge.dispose();
 }
@@ -374,6 +375,104 @@ function eventsOf(sent, topic) {
   const res = lastResult(relay.sent, "r1");
   check("宿主拒绝 preset → unsupported-agent-preset", res?.error?.code === "unsupported-agent-preset", JSON.stringify(res));
   bridge.dispose();
+}
+
+// ===========================================================================
+// 场景 2b（v1.1.4）：session.create 的 cwd 归组到工作区
+//
+// PC 端「在工作区里新建」走 createInWorkspace → createNamed({workspaceId})，
+// 会话挂到工作区下面；旧实现只传 cwd，宿主不 attach → PC 上显示「未分组」。
+// 现在插件用 workspaceRegistry.resolveByPath(cwd) 反查：命中已注册工作区就
+// 改传 workspaceId（自动归组），未命中/异常保持传 cwd（与 PC 普通目录一致）。
+// ===========================================================================
+{
+  // 1) cwd 命中工作区 → create 收到 workspaceId（不带 cwd）
+  {
+    const relay = makeRelay();
+    const createReqs = [];
+    const sessionController = {
+      async create(req) {
+        createReqs.push(req);
+        return { sessionId: "sess-ws1" };
+      },
+    };
+    const workspaceRegistry = {
+      async resolveByPath(path) {
+        return path === "D:/proj" ? { id: "ws-1", path } : undefined;
+      },
+    };
+    const ctx = makeCtx({ sessionController, workspaceRegistry });
+    const bridge = new HostBridge({ ctx, relay, push: { configured: false, notify: async () => ({ ok: true }) }, config: CFG, log });
+    bridge.attach();
+    await bridge.dispatch({ id: "ws-create1", type: "session.create", ts: Date.now(), payload: { cwd: "D:/proj" } });
+    const res = lastResult(relay.sent, "ws-create1");
+    check("归组：create 成功回 sessionId", res?.value?.sessionId === "sess-ws1", JSON.stringify(res));
+    check("归组：命中工作区 → 传 workspaceId", createReqs[0]?.workspaceId === "ws-1", JSON.stringify(createReqs[0]));
+    check("归组：命中工作区 → 不再传 cwd（互斥）", createReqs[0]?.cwd === undefined, JSON.stringify(createReqs[0]));
+    bridge.dispose();
+  }
+
+  // 2) cwd 未命中任何工作区 → 保持传 cwd（= 未分组，与 PC 普通目录一致）
+  {
+    const relay = makeRelay();
+    const createReqs = [];
+    const sessionController = {
+      async create(req) {
+        createReqs.push(req);
+        return { sessionId: "sess-ws2" };
+      },
+    };
+    const workspaceRegistry = { async resolveByPath() { return undefined; } };
+    const ctx = makeCtx({ sessionController, workspaceRegistry });
+    const bridge = new HostBridge({ ctx, relay, push: { configured: false, notify: async () => ({ ok: true }) }, config: CFG, log });
+    bridge.attach();
+    await bridge.dispatch({ id: "ws-create2", type: "session.create", ts: Date.now(), payload: { cwd: "D:/other" } });
+    check("归组：未命中 → 仍传 cwd", createReqs[0]?.cwd === "D:/other" && createReqs[0]?.workspaceId === undefined, JSON.stringify(createReqs[0]));
+    bridge.dispose();
+  }
+
+  // 3) 没有 workspaceRegistry 服务 → 保持传 cwd，不崩
+  {
+    const relay = makeRelay();
+    const createReqs = [];
+    const sessionController = {
+      async create(req) {
+        createReqs.push(req);
+        return { sessionId: "sess-ws3" };
+      },
+    };
+    const ctx = makeCtx({ sessionController });
+    const bridge = new HostBridge({ ctx, relay, push: { configured: false, notify: async () => ({ ok: true }) }, config: CFG, log });
+    bridge.attach();
+    await bridge.dispatch({ id: "ws-create3", type: "session.create", ts: Date.now(), payload: { cwd: "D:/x" } });
+    const res = lastResult(relay.sent, "ws-create3");
+    check("归组：无 registry 服务仍创建成功", res?.value?.sessionId === "sess-ws3", JSON.stringify(res));
+    check("归组：无 registry → 传 cwd", createReqs[0]?.cwd === "D:/x", JSON.stringify(createReqs[0]));
+    bridge.dispose();
+  }
+
+  // 4) resolveByPath 抛错（目录不存在等）→ 兜底传 cwd，不阻断创建
+  {
+    const relay = makeRelay();
+    const createReqs = [];
+    const sessionController = {
+      async create(req) {
+        createReqs.push(req);
+        return { sessionId: "sess-ws4" };
+      },
+    };
+    const workspaceRegistry = {
+      async resolveByPath() { throw new Error("ENOENT: no such directory"); },
+    };
+    const ctx = makeCtx({ sessionController, workspaceRegistry });
+    const bridge = new HostBridge({ ctx, relay, push: { configured: false, notify: async () => ({ ok: true }) }, config: CFG, log });
+    bridge.attach();
+    await bridge.dispatch({ id: "ws-create4", type: "session.create", ts: Date.now(), payload: { cwd: "D:/gone" } });
+    const res = lastResult(relay.sent, "ws-create4");
+    check("归组：resolveByPath 抛错仍创建成功", res?.value?.sessionId === "sess-ws4", JSON.stringify(res));
+    check("归组：resolveByPath 抛错 → 兜底传 cwd", createReqs[0]?.cwd === "D:/gone", JSON.stringify(createReqs[0]));
+    bridge.dispose();
+  }
 }
 
 // ===========================================================================
@@ -845,6 +944,80 @@ function eventsOf(sent, topic) {
   await bridge.dispatch({ id: "v-model3", type: "session.model", ts: Date.now(), payload: { sessionId: "sess-other" } });
   const m3 = lastResult(relay.sent, "v-model3");
   check("session.model：未追踪的会话回 null", m3?.value?.model === null, JSON.stringify(m3));
+
+  bridge.dispose();
+}
+
+// ===========================================================================
+// 场景 8b（v1.1.4）：session.model 走 **modelSelection 持久投影**
+//
+// 与桌面端 composer 同源（dsh-client-ui-model-selection 的 syncInputs：
+//   selection = projected.next ?? catalog.default，
+// 投影视图形状 {lastUsed, next}，next = pending ?? lastUsed）。
+// 旧实现只认 model/selection 直播事件的内存态 → 从没显式切换过模型的会话
+// 永远回 null，手机端就一直显示目录默认模型（与 PC 对不上，用户实测反馈）。
+// ===========================================================================
+{
+  const relay = makeRelay();
+  const projectionsBySession = new Map();
+  let projectionsThrows = false;
+  const sessionController = {
+    async projections(req) {
+      if (projectionsThrows) {
+        const e = new Error("projection read failed");
+        e.code = "session/projections-unavailable";
+        throw e;
+      }
+      const view = projectionsBySession.get(req.sessionId);
+      if (view === undefined) return null;
+      return { kind: "sequenced", asOfSeq: 1, values: { modelSelection: view } };
+    },
+  };
+  const ctx = makeCtx({ sessionController });
+  const bridge = new HostBridge({ ctx, relay, push: { configured: false, notify: async () => ({ ok: true }) }, config: CFG, log });
+  bridge.attach();
+
+  // 1) pending（用户显式切换过、尚未被请求消费）优先
+  projectionsBySession.set("sess-p", {
+    lastUsed: { provider: "deepseek", model: "deepseek-chat" },
+    next: { provider: "deepseek", model: "deepseek-reasoner", reasoningEffort: "high" },
+  });
+  await bridge.dispatch({ id: "v-p1", type: "session.model", ts: Date.now(), payload: { sessionId: "sess-p" } });
+  const p1 = lastResult(relay.sent, "v-p1");
+  check("session.model：投影 next（pending）优先", p1?.value?.model?.model === "deepseek-reasoner" && p1?.value?.model?.reasoningEffort === "high", JSON.stringify(p1));
+
+  // 2) 没有 pending → 回落 lastUsed（上一个 request/header 实际用的模型）
+  projectionsBySession.set("sess-l", {
+    lastUsed: { provider: "zai", model: "glm-4.6" },
+    next: { provider: "zai", model: "glm-4.6" },
+  });
+  await bridge.dispatch({ id: "v-p2", type: "session.model", ts: Date.now(), payload: { sessionId: "sess-l" } });
+  const p2 = lastResult(relay.sent, "v-p2");
+  check("session.model：投影 next 为空时回 lastUsed", p2?.value?.model?.provider === "zai" && p2?.value?.model?.model === "glm-4.6", JSON.stringify(p2));
+
+  // 3) lastUsed 有 reasoningEffort → 原样带出（PC 显示的是同一个值）
+  projectionsBySession.set("sess-e", {
+    lastUsed: { provider: "deepseek", model: "deepseek-chat", reasoningEffort: "low" },
+    next: null,
+  });
+  await bridge.dispatch({ id: "v-p3", type: "session.model", ts: Date.now(), payload: { sessionId: "sess-e" } });
+  const p3 = lastResult(relay.sent, "v-p3");
+  check("session.model：投影带出 reasoningEffort", p3?.value?.model?.reasoningEffort === "low", JSON.stringify(p3));
+
+  // 4) 空白会话（投影两项都空）→ null（客户端回退目录默认 = PC 的 catalog.default 回退）
+  projectionsBySession.set("sess-empty", { lastUsed: null, next: null });
+  await bridge.dispatch({ id: "v-p4", type: "session.model", ts: Date.now(), payload: { sessionId: "sess-empty" } });
+  const p4 = lastResult(relay.sent, "v-p4");
+  check("session.model：空白会话回 null（不臆造）", p4?.value?.model === null && p4?.error === undefined, JSON.stringify(p4));
+
+  // 5) 投影读取失败 → 退回直播事件内存态，不报错
+  projectionsThrows = true;
+  relay.sent.length = 0;
+  ctx.emit("session/event", { id: "sess-fb" }, { type: "model/selection", seq: 40, time: 5000, data: { provider: "deepseek", model: "deepseek-chat" } });
+  await bridge.dispatch({ id: "v-p5", type: "session.model", ts: Date.now(), payload: { sessionId: "sess-fb" } });
+  const p5 = lastResult(relay.sent, "v-p5");
+  check("session.model：投影读取失败退回内存态", p5?.value?.model?.model === "deepseek-chat" && p5?.error === undefined, JSON.stringify(p5));
+  projectionsThrows = false;
 
   bridge.dispose();
 }

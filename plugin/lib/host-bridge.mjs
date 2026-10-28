@@ -493,33 +493,6 @@ export function mapToolResultEvent(sessionId, event) {
 }
 
 /**
- * 契约 §5.2 `system.message` 事件映射（宿主 session/event 的
- * system/message 与 developer/message；两者共用一个 topic，用 kind 区分）。
- * message 可能是 {content:[blocks]}，也可能是字符串——两种都兜住。
- * @returns {{sessionId:string,kind:"system"|"developer",text:string,ts:number}|null}
- */
-export function mapSystemMessageEvent(sessionId, event, kind) {
-  if (!event || typeof event !== "object") return null;
-  if (event.type !== "system/message" && event.type !== "developer/message") return null;
-  const data = event.data;
-  if (!data || typeof data !== "object") return null;
-  const message = data.message !== undefined ? data.message : data;
-  let text = "";
-  if (typeof message === "string") {
-    text = message;
-  } else if (message && typeof message === "object") {
-    text = contentText(message.content);
-  }
-  if (text.trim() === "") return null;
-  return {
-    sessionId: String(sessionId ?? ""),
-    kind: kind === "developer" ? "developer" : "system",
-    text,
-    ts: eventTime(event),
-  };
-}
-
-/**
  * 契约 §5.7 StepRecord 提取：session.history 的 page.records → steps[]。
  *
  * 规则：
@@ -967,10 +940,14 @@ export class HostBridge {
       }
     });
 
-    // --- v1.0.6（§5.7）：会话事件总闸 → tool.call / tool.result / system.message ---
+    // --- v1.0.6（§5.7）→ v1.1.4：会话事件总闸 → tool.call / tool.result ---
     // 宿主每写入一条会话日志事件就触发（覆盖所有会话，含 subagent）。
     // 按 session.id 寻址即可，**不过滤**子代理；不认识的事件类型直接忽略，
     // 绝不因为形状不认识而抛错（#on 包装器已兜底）。
+    // v1.1.4：**不再桥接 system/message / developer/message**——宿主里它们是
+    // 系统提示词节点与工具注册表变更（提示词组装记录，不是对话内容），
+    // DSH 桌面端的聊天视图从不展示；手机端曾把它们当「系统消息」显示，
+    // 造成时间线里出现大段多余的系统提示文本（用户反馈）。
     this.#on("session/event", (session, event) => {
       const sessionId = String(session?.id ?? "");
       if (sessionId === "") return;
@@ -983,12 +960,6 @@ export class HostBridge {
       if (type === "tool/result") {
         const mapped = mapToolResultEvent(sessionId, event);
         if (mapped !== null) this.#sendEvent("tool.result", mapped);
-        return;
-      }
-      if (type === "system/message" || type === "developer/message") {
-        const kind = type === "developer/message" ? "developer" : "system";
-        const mapped = mapSystemMessageEvent(sessionId, event, kind);
-        if (mapped !== null) this.#sendEvent("system.message", mapped);
         return;
       }
       if (type === "model/selection") {
@@ -1187,6 +1158,36 @@ export class HostBridge {
   /** Workspace 注册表（宿主没装 dsh-workspace → null）。 */
   #workspaceRegistry() {
     return this.#service("workspaceRegistry");
+  }
+
+  /**
+   * v1.1.4：按 cwd 反查它是否属于某个**已注册工作区**的目录。
+   * 命中返回该工作区的 id（供 `session.create` 传 `workspaceId` 归组），
+   * 否则返回 null（调用方退回传 cwd，与 PC 在普通目录新建一样 = 未分组）。
+   *
+   * 用宿主 `workspaceRegistry.resolveByPath`：按 canonical path 匹配，
+   * **不创建**工作区、不改写注册表；目录不存在会 reject。
+   * 任何异常（服务缺失 / 方法不存在 / 路径解析失败）都兜底回 null——
+   * 归组是增强，绝不能因此让 session.create 失败。
+   * @param {string} cwd
+   * @returns {Promise<string|null>}
+   */
+  async #resolveWorkspaceByCwd(cwd) {
+    try {
+      const reg = this.#workspaceRegistry();
+      if (!reg || typeof reg.resolveByPath !== "function") return null;
+      const ws = await reg.resolveByPath(cwd);
+      const id = typeof ws?.id === "string" && ws.id !== "" ? ws.id : null;
+      if (id !== null) {
+        this.#log("info", "session.create cwd matches a workspace; attaching to it", {
+          workspaceId: id,
+        });
+      }
+      return id;
+    } catch (e) {
+      this.#log("warn", "resolveByPath failed; session stays ungrouped", { error: errText(e) });
+      return null;
+    }
   }
 
   /** 事件监听包装：emit 监听必须永不抛出。 */
@@ -1689,7 +1690,7 @@ export class HostBridge {
         case "session.selectModel":
           return await this.#rSessionSelectModel(m);
         case "session.model":
-          return this.#rSessionModel(m);
+          return await this.#rSessionModel(m);
         case "session.queue":
           return this.#rSessionQueue(m);
         case "session.archive":
@@ -2072,7 +2073,20 @@ export class HostBridge {
     try {
       const sc = this.#sc();
       const req = {};
-      if (typeof p.cwd === "string" && p.cwd !== "") req.cwd = p.cwd;
+      if (typeof p.cwd === "string" && p.cwd !== "") {
+        // v1.1.4：cwd 若命中某个**已注册工作区**的目录，改传 `workspaceId`
+        // 让会话自动归到该工作区下面（与 PC 端「在工作区里新建」一致——
+        // PC 走 createInWorkspace → createNamed({workspaceId})）。
+        // 旧实现只传 cwd，宿主不会 attach 到任何工作区 → PC 上显示「未分组」。
+        // 未命中（普通目录）保持传 cwd，与 PC 在任意目录新建一样 = 未分组。
+        // resolveByPath 不创建工作区、不改写注册表；路径不存在会 reject → 兜底回 cwd。
+        const ws = await this.#resolveWorkspaceByCwd(p.cwd);
+        if (ws !== null) {
+          req.workspaceId = ws;
+        } else {
+          req.cwd = p.cwd;
+        }
+      }
       if (agentPreset !== "") req.agentPreset = agentPreset;
       let value;
       try {
@@ -2267,18 +2281,48 @@ export class HostBridge {
     }
   }
 
-  /** 契约 §5.1/§5.8（v1.0.8）session.model：查询会话当前模型/思考强度。
-   *  数据源是 model/selection 会话事件维护的**内存态**——插件重启后无记录 → null
-   *  （**不得臆造**；客户端回退展示目录默认）。 */
-  #rSessionModel(m) {
+  /** 契约 §5.1/§5.8 session.model：查询会话当前模型/思考强度（v1.0.8 引入，
+   *  v1.1.4 数据源升级）。
+   *
+   *  权威数据源 = 宿主 **modelSelection 持久投影**（`sessionController.projections`
+   *  的 `values.modelSelection`，视图形状 `{lastUsed, next}`，`next = pending ?? lastUsed`）。
+   *  这与 DSH 桌面端 composer 显示的是**同一份**（dsh-client-ui-model-selection 的
+   *  syncInputs：`selection = projected.next ?? catalog.default`）：
+   *  - `pending`：用户在会话里显式切换过、还没被请求消费的模型；
+   *  - `lastUsed`：上一个 `request/header` 实际使用的模型（旧实现完全漏掉它——
+   *    从没显式切换过的会话在旧实现里永远回 null，手机端就总显示目录默认，
+   *    与 PC 对不上，用户实测反馈）；
+   *  - 两者都空（从未跑过也没选过的空白会话）→ null，客户端回退目录默认
+   *    （= PC 的 catalog.default 回退，天然一致）。
+   *
+   *  投影不可用（旧宿主没注册）/读取失败 → 退回 `model/selection` 直播事件维护的
+   *  内存态（v1.0.8 行为）；再没有 → null。**不得臆造**。 */
+  async #rSessionModel(m) {
     const p = m.payload ?? {};
     const sessionId = typeof p.sessionId === "string" ? p.sessionId : "";
     if (sessionId === "") {
       this.#reply(m, errorOf(m, "bad-params", "sessionId required"));
       return;
     }
-    const model = this.#modelSelections.get(sessionId) ?? null;
-    this.#reply(m, resultOf(m, { model }));
+    try {
+      const sc = this.#sc();
+      if (typeof sc.projections === "function") {
+        const projections = await sc.projections({ sessionId }, this.#signal(10_000));
+        const view = projections?.values?.modelSelection;
+        if (view !== undefined && view !== null) {
+          const model = mapModelSelection(view.next ?? view.lastUsed ?? null);
+          this.#reply(m, resultOf(m, { model }));
+          return;
+        }
+      }
+    } catch (e) {
+      // 投影缺失/读取失败 → 退回直播事件内存态（不报错，静默降级）
+      this.#log("warn", "modelSelection projection unavailable; falling back to live tracking", {
+        sessionId,
+        error: errText(e),
+      });
+    }
+    this.#reply(m, resultOf(m, { model: this.#modelSelections.get(sessionId) ?? null }));
   }
 
   /** 模式目录（宿主 Agent preset 目录）。服务缺失/抛错 → 空目录。 */

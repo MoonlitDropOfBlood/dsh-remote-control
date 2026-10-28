@@ -47,13 +47,21 @@ node scripts/sync-client-icon.mjs                                      # 改了 
 | 操作 | 加载新代码？ | 依据 |
 |---|---|---|
 | 只改文件（不重载） | ❌ | 实测无反应；cordis loader 是裸 `import(url)` → 命中 ESM 缓存 |
-| `set_plugin` 关→开 | ✅ | plugin-manager 的 `setPlugin` → `reload()` → `hmr.reconcileProfile()` |
-| `remove_bundle` + `install_bundle` | ✅ | 同上走 `reload()`；HMR 先 `evict()` 掉 ESM 缓存条目再重新 import |
+| `set_plugin` 关→开（**link 安装**） | ❌ **不换模块！** | 2026-10-28 实测踩坑：toggle 走 `setPluginEnabled` → `reload()`，但 **link 安装的包模块已在 ctx 里**，reload 不 evict 它的 ESM 条目 → **跑的还是旧代码**（改了 3 小时排查：症状是插件行为完全没变） |
+| `set_plugin` 关→开（**bundle 安装**） | ✅ | bundle 走 HMR reconcile，会 evict + 重新 import |
+| `remove_bundle` + `install_bundle` | ✅ | **link 安装的可靠重载路径**：重新 pnpm link + 全新 import，模块必然是新的 |
 | 重启 DSH 桌面端 | ✅ | 进程重启，缓存自然清空 |
 
 > HMR 的 `evict()`：`Map.prototype.delete.call(internal.loadCache, url)` 把 ESM 缓存条目**整条**
 > 删掉（Node 的 `LoadCache` 一个 URL 下有 ESM/CJS 两种 job，只删一种会残留），
 > 下次 `import()` 才重新求值文件。**只改文件不重载 = 永远跑旧代码。**
+
+> **link 安装（开发态）改完代码想生效：`remove_bundle` + `install_bundle`（spec 指向
+> 本仓库 plugin/ 目录）**，别用设置页的开关。验证是否真的换了代码，最快的办法是让新代码
+> 产生一个**可观测副作用**（如写一行日志），再看它出没出现——别靠「我明明改了文件」判断。
+> 也可以用网关 RPC 自己调（不需要 UI）：
+> `POST /api/pluginManager/removeBundle` + `/api/pluginManager/installBundle`
+> （`args: {name}` / `{spec}`，需要 `/connect?token=…` 换来的会话 cookie）。
 
 > **改了 `plugin/icon.svg` 一定要跑 `node scripts/sync-client-icon.mjs`**：client.js 是静态
 > 浏览器包（无打包器），拿不到包内文件，导航图标只能内联 data-uri。
@@ -467,3 +475,48 @@ Remote 方法（返回 `{ok:true,value}` 或 `{ok:false,error:{code,message}}`�
 - **中继 TLS**：中继认 `RELAY_TLS_CERT` / `RELAY_TLS_KEY`（PEM 文件路径）→ 提供 `wss://`；
   配了一半/文件读不到 → **启动即失败**（绝不静默降级成明文）。TLS 是抗重放最彻底的防线
   （服务端身份认证 → 中继无法冒充对端），纪元是纵深防御。
+
+## v1.1.4：手机端体验对齐 PC（2026-10-28，契约 v1.1.4）
+
+用户实测反馈驱动的三处修复（**都是 Host 侧取数口径**，wire 形状除移除 `system.message` 外不变）：
+
+### ① `session.model` 改读宿主的 `modelSelection` 持久投影
+
+- **旧口径（v1.0.8，错的）**：只认 `model/selection` 事件维护的**内存态** `#modelSelections`
+  → 插件重启后内存是空的 → 从没切换过模型的会话永远回 `null`
+  → 手机端回退显示**目录默认模型** → 「手机上一直是显示的默认模型」。
+- **新口径**：读 `sc.projections({sessionId}, signal)` → `values.modelSelection` = wire 视图
+  `{lastUsed, next}`（`next = pending ?? lastUsed`），取 `next ?? lastUsed`。
+  这与 **DSH 桌面端 composer 读的是同一份**
+  （`session.projections.faceOf("modelSelection").getSnapshot()` → `next ?? lastUsed`）。
+- 投影读不到/抛错 → 退回内存态（保留旧行为兜底），两者皆空才回 `null`（**不得臆造**）。
+- 宿主投影定义在 `dsh-api-session-controller` 的 `modelSelectionProjection`：
+  state `{lastUsed, pending}` → wire view `{lastUsed, next}`。
+
+### ② 移除 `system.message` 桥接
+
+- 宿主 `system/message` / `developer/message` 是**系统提示词组装记录 / 工具注册表变更**，
+  **DSH 桌面端聊天视图从不展示**；手机端曾把它们渲染成大段「系统消息」，
+  与 PC 插件会话的轨迹不一致。
+- 改动：`host-bridge.mjs` 删掉 `mapSystemMessageEvent()` 与 `session/event` 总闸里的
+  `system/message`/`developer/message` 分支；`app/model/protocol.ets` 删 `TOPIC_SYSTEM_MESSAGE`
+  与 payload 的 `kind?`；`app/model/sessionstore.ets` 删对应 case 与 `appendSystem()`。
+
+### ③ `session.create` 的工作区归组
+
+- **旧口径**：手机端只传 `cwd` → 宿主 `sc.create` **不会** attach 到任何工作区
+  → PC 端显示「未分组」。PC 在工作区里新建走的是
+  `createInWorkspace → createNamed({workspaceId})`（`dsh-client-ui-workspace`）。
+- **新口径**：插件在 create 前用 `workspaceRegistry.resolveByPath(cwd)` 反查——
+  该目录若已注册为工作区 → 改传 `workspaceId`（宿主用 workspace.path 作 cwd 并
+  `attachSession`，会话自动归组）；未命中（普通目录）→ 保持传 `cwd`
+  （与 PC 在任意目录新建一样 = 未分组）。
+- `resolveByPath` **不创建**工作区、不改注册表；目录不存在会 reject → 兜底回 `cwd`。
+  任何异常都**不得**让 `session.create` 失败（归组是增强，不是必需）。
+- wire 协议不变（客户端仍只传 `cwd`），归组是插件内部行为。
+- **注意**：宿主**没有**「把已有会话挂进工作区」的 API（`insertSessionBefore` 只能重排已有成员），
+  按 cwd 自动归账只在注册表**首次初始化**跑一次 → **历史未分组会话无法自动归组**。
+
+### 回归
+
+`node scripts/verify-steps.mjs` **165 项**（新增场景 8b 投影路径 5 项 + 场景 2b 归组 4 项 + 2 项）。

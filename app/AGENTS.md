@@ -205,3 +205,65 @@ grep -rnE "@State|@Prop|@Link|@ObjectLink|@Observed[^V]|@Provide|@Consume|@Watch
   - **AAD 两模式**：兼容 `dshrc|role|seq`；加固 `dshrc|role|seq|sid`（sid = 发送方自己）。
   - **业务 hello 必须在 welcome 之后发**（否则还不知道对端 pv → AAD 选错）。
   - 自己的 sid 本来就有（`newSid()`），只是过去没进 AAD。
+
+## v1.1.4：会话内模型对齐 PC + 时间线改 List（2026-10-28，契约 v1.1.4）
+
+用户实测反馈驱动的四处改动：
+
+### ① 会话内模型/思考强度：数据源与 PC 同源
+
+- 插件侧 `session.model` 改读宿主 `modelSelection` 持久投影（见 plugin/AGENTS.md v1.1.4 ①）。
+  App 侧**不用改取数口径**（仍 `session.model` + `session.modelChanged` 事件），
+  但**断线恢复必须补拉**：App 从后台切回时若 WS 正在重连，
+  `aboutToAppear` 那次 `session.model` 会落在断链窗口里静默失败
+  （`loadSessionModel` 开头 `getState()!=='online'` 直接 return，**不报错、不重试**）
+  → 链路恢复后模型永远停在 null → **所有会话显示目录默认模型**。
+  故 `onLinkState('online')` 的断线恢复分支**补一次 `loadSessionModel(activeId)`**
+  （与 history/queue/subagents 一起补）。
+- `loadSessionModel` 的静默 early-return 现在**打日志**（`session.model skipped: link <state>`），
+  避免再出现「静默失败、无法定位」。
+- 目录里没有该模型时**不回退默认**：`modelCapsuleText()` 显示 `provider/model` 截断串。
+
+### ② 时间线：`Scroll` → `List`（懒加载 + 可定位 + 直显底部）
+
+- 用户反馈「会话列表是 scroll？不是 list?这个有性能问题吧，而且也不能定位」→
+  详情页时间线由 `Scroll` 改 `List` + `Repeat`（**V2 状态管理，列表必须 Repeat 不用 ForEach**）。
+- **直显底部**（用户反馈「进入会话会有滑动到底的动画」）：`List` 用
+  `initialIndex`（落在最后一条）+ `.stackFromEnd(true)`（内容不满一屏时底部对齐）
+  → 首帧即底部，**无滚动动画**（`Scroll` 的 `scrollEdge(Edge.Bottom)` 会播动画，故弃用）。
+- **懒加载 + 节点复用**：`Repeat` 用 `.templateId()` + 三个 `.template(...)`
+  （message / reasoning / group，各 `cachedCount:4`）+ `.virtualScroll()`，
+  `List` 侧 `.cachedCount(4)` + `.maintainVisibleContentPosition(true)`。
+  - ⚠️ **`Repeat` 的 `.template()` 不能包 `@ReusableV2` 组件**
+    （构建报错「The template attribute of the Repeat component cannot contain any
+    custom component decorated with '@ReusableV2'」）→ `TimelineView.ets` 的
+    `MessageBubble`/`ReasoningCard`/`StepGroup` **一律不加 `@ReusableV2`**，
+    复用由 Repeat 的模板池负责。
+  - ⚠️ **`Repeat` 必须有 item builder**：只写 `.template()` 不写 `.each()` 会崩
+    （真机实测 `__Repeat item builder function unspecified. Usage error`）。
+    按官方 FAQ（`faqs-arkui-606`）用 `.each()` 作兜底 builder，顺序为
+    `.each()` → `.key()` → `.virtualScroll()` → `.templateId()` → `.template()`。
+  - **复用下的状态**：折叠/展开状态放**数据侧**（`TimelineItem.expanded`，`@Trace`），
+    不放组件的 `@Local`——节点被回收复用后 `@Local` 会丢。
+- **悬浮回底按钮**（用户要求「需要动画」）：`Stack{alignContent: BottomEnd}` 包
+  `Refresh`+`List`，右下角 `Button`（`sys.symbol.chevron_down`），
+  点击 `scroller.scrollTo({yOffset: maxOffset, animation:{duration:280, curve: EaseOut}})`；
+  显隐用 `transition(OPACITY.combine(scale(0.7)))`。
+  - ⚠️ **「是否在底部」不能用 `contentSize()/currentOffset()` 算**：List 用
+    `initialIndex` + 懒加载时，未布局部分是**估算值**（官方文档明说会误差）→
+    算出来的「距底部距离」误判成仍在底部 → **按钮永不出现**。
+    改用 `List.onScrollIndex` 维护「最后一条可见项索引」判定。
+- `SystemNote`（系统消息）组件与渲染分支**删除**（插件已不再桥接 system.message）。
+
+### ③ 代码块复制（用户反馈「报没有设置」）
+
+- markdown 库的代码块/表格/文本选中复制回调（`setCodeCopyListener` /
+  `setTableCopyClickListener` / `setTextSelectionCopyListener`）原先**没有接线**
+  → 点复制报「没有设置」。现统一走 `copyToClipboard(text)`：
+  `pasteboard.getSystemPasteboard()` → `createData(MIMETYPE_TEXT_PLAIN, text)` → `setData`。
+  - ⚠️ 类型是 **`pasteboard.SystemPasteboard`**（没有 `pasteboard.Pasteboard` 导出）。
+
+### ④ 会话详情页取参与生命周期
+
+- `HRouter.registerLifecycle` 的 `onShown` **会再次触发** → 回到会话时要补拉
+  历史与模型；`onAppear` 兜底重读参数（真机时序差异）。

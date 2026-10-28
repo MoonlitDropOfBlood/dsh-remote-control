@@ -119,7 +119,8 @@ export const TOPIC_ASSISTANT_REASONING_DELTA: string = 'assistant.reasoningDelta
 export const TOPIC_ASSISTANT_IMAGE: string = 'assistant.image'; // v1.0.9：会话消息里的图片（§5.10）
 export const TOPIC_TOOL_CALL: string = 'tool.call'; // v1.0.6：工具调用开始
 export const TOPIC_TOOL_RESULT: string = 'tool.result'; // v1.0.6：工具调用结束
-export const TOPIC_SYSTEM_MESSAGE: string = 'system.message'; // v1.0.6：系统/开发者消息
+// system.message（v1.0.6 引入）已于 v1.1.4 移除：宿主的 system/developer 消息是
+// 系统提示词组装 / 工具注册表记录，不是对话内容，DSH 桌面端聊天视图从不展示。
 export const TOPIC_TURN_END: string = 'turn.end';
 export const TOPIC_APPROVAL_REQUEST: string = 'approval.request';
 export const TOPIC_APPROVAL_RESOLVED: string = 'approval.resolved';
@@ -252,13 +253,12 @@ export interface DshrcValue {
   oldestSeq?: number;
   // session.history（§5.1 v1.0.6）：工作步骤（工具调用）列表
   steps?: DshrcStepRecord[];
-  // tool.call / tool.result / system.message 事件载荷（§5.2 v1.0.6）
+  // tool.call / tool.result 事件载荷（§5.2 v1.0.6）
   callId?: string;
   name?: string;
   arguments?: string;
   resultText?: string;
   errorText?: string;
-  kind?: string; // system.message: "system" | "developer"
   ts?: number;
   // session.capabilities（§5.1 v1.0.6）：模式与权限目录
   presets?: DshrcModeOption[];

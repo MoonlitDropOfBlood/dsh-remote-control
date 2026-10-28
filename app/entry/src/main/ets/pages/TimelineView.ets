@@ -1,9 +1,22 @@
 /*
  * Copyright (c) 2026 dukedsh.
- * 统一时间线渲染（契约 §5.7 v1.0.6）：详情页消息流按 kind 分派，全部来自 store.timeline。
+ * 统一时间线渲染（契约 §5.7 v1.0.6；v1.1.4 改造）：详情页消息流按 kind 分派，
+ * 全部来自 store.timeline。本文件只提供**条目组件**与分组函数——列表容器
+ * （List + Repeat 懒加载 + 模板复用）在 SessionDetailPage 里（v1.1.4 从
+ * Scroll+Column 全量加载迁移到 List 懒加载：长会话只布局可视区、支持 initialIndex
+ * 首帧贴底与 scrollToIndex 定位）。
  *  - message：用户右对齐品牌蓝气泡；助手左对齐浅面卡片 + @luvi/lv-markdown-in（流式光标 / 错误提示）
  *  - step：连续的工作步骤归为一个「工作步骤 · N」分组，组头可整体折叠/展开
- *  - system：系统 / 开发者说明行（细分隔 + 说明文字；超过 2 行折叠，可点击展开全文）
+ *  - reasoning：思考过程独立折叠块（弱化配色，独立 markdown 控制器）
+ *  （v1.0.6 的 system 说明行已随 v1.1.4 移除——宿主 system/developer 消息是
+ *   提示词组装/工具注册表记录，不是对话内容，PC 聊天视图从不展示。）
+ *
+ * 复用安全（v1.1.4）：折叠/展开状态一律存在
+ * TimelineItem.expanded（数据侧 @Trace），不放在组件 @Local——List 懒加载会
+ * 回收/复用节点，组件内状态在复用时会被重置或串台，挂数据上则随 @Param 绑定恢复。
+ * 注意：这些条目组件**不能**挂 @ReusableV2——Repeat 的 `.template()` 里不允许
+ * 出现 @ReusableV2 组件（模板自带复用池，两者冲突）。复用由 Repeat 的
+ * virtualScroll + template 分类池负责（相同 template type 的节点互相复用）。
  */
 import { Markdown, MarkdownController } from '@luvi/lv-markdown-in';
 import { DshrcImageRef } from '../model/protocol';
@@ -18,14 +31,10 @@ import {
   RADIUS_CTRL,
   SP_1,
   SP_2,
-  SP_3,
   SP_4,
   clockTime
 } from '../model/theme';
 import { StepCard } from './StepCard';
-
-/** 系统说明行：字符数超过该阈值视为可能超过 2 行（折叠 + 可展开）。 */
-const SYSTEM_FOLD_CHARS: number = 80;
 
 /** 缩略图最大高度（vp）——契约 §5.10：等比、最大宽度撑满气泡、最大高度 ≤ 320vp。 */
 const THUMB_MAX_HEIGHT: number = 320;
@@ -41,20 +50,20 @@ interface ImageEntry {
   image: DshrcImageRef;
 }
 
-/** 时间线条目：单条消息 / 系统行，或一组连续的工作步骤。 */
-interface TimelineEntry {
+/** 时间线条目：单条消息/思考块，或一组连续的工作步骤（List 里一项 = 一个 ListItem）。 */
+export interface TimelineEntry {
   /** Repeat 的稳定 key（分组用首步 id 前缀）。 */
   key: string;
   /** 是否工作步骤分组。 */
   isGroup: boolean;
-  /** 单项渲染时=该条目；分组渲染时=组内首个步骤。 */
+  /** 单项渲染时=该条目；分组渲染时=组内首个步骤（组折叠态也挂在它身上）。 */
   head: TimelineItem;
   /** 分组内的工作步骤（非分组为空数组）。 */
   steps: TimelineItem[];
 }
 
 /** 连续的工作步骤归为一个分组；其余条目按单项渲染。 */
-function groupTimeline(items: TimelineItem[]): TimelineEntry[] {
+export function groupTimeline(items: TimelineItem[]): TimelineEntry[] {
   const out: TimelineEntry[] = [];
   let i: number = 0;
   while (i < items.length) {
@@ -192,7 +201,7 @@ struct MessageImages {
 
 /** 对话气泡：用户右对齐品牌蓝 / 助手左对齐浅面卡片（markdown 渲染）。 */
 @ComponentV2
-struct MessageBubble {
+export struct MessageBubble {
   @Require @Param item: TimelineItem;
   /** 共享的 markdown 渲染控制器（DSH 风格配色，页面级创建后下传）。 */
   @Require @Param mdController: MarkdownController;
@@ -313,61 +322,15 @@ struct MessageBubble {
   }
 }
 
-/** 系统 / 开发者说明行：细分隔 + 说明文字；超 2 行折叠，点击展开全文。 */
-@ComponentV2
-struct SystemNote {
-  @Require @Param item: TimelineItem;
-  @Local expanded: boolean = false;
-
-  /** 文本是否可能超过 2 行（超出则折叠 + 提供展开）。 */
-  private longText(): boolean {
-    return this.item.text.length > SYSTEM_FOLD_CHARS;
-  }
-
-  /** 来源标签（system / developer）。 */
-  private roleLabel(): string {
-    return this.item.role === 'developer' ? '开发者' : '系统';
-  }
-
-  build() {
-    Column() {
-      Divider()
-        .color($r('app.color.border_l1'))
-        .margin({ bottom: SP_1 })
-      Row() {
-        Text(this.roleLabel())
-          .fontSize(FS_CAPTION)
-          .fontColor($r('app.color.label_tertiary'))
-          .margin({ right: SP_2 })
-        Text(this.item.text)
-          .fontSize(FS_CAPTION)
-          .fontColor($r('app.color.label_tertiary'))
-          .layoutWeight(1)
-          .maxLines(this.expanded ? 500 : 2)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-          .onClick((): void => {
-            if (this.longText()) {
-              this.expanded = !this.expanded;
-            }
-          })
-      }
-      .width('100%')
-      .alignItems(VerticalAlign.Top)
-    }
-    .width('100%')
-    .margin({ top: SP_1, bottom: SP_1 })
-  }
-}
-
 /**
  * 「工作步骤 · N」分组：组头点击整体折叠/展开。
- * 折叠时组内步骤卡保持挂载（仅不可见），子项各自的展开状态不会丢失。
+ * 折叠态存 steps[0].expanded（数据侧 @Trace，v1.1.4）：List 懒加载复用节点时
+ * 组件 @Local 会丢/串台，挂数据上随 @Param 恢复；折叠时组内步骤卡保持挂载
+ * （仅不可见），子项各自的展开状态不会丢失。
  */
 @ComponentV2
-struct StepGroup {
+export struct StepGroup {
   @Require @Param steps: TimelineItem[];
-  /** 整组默认收起（用户点组头才展开组内步骤）；折叠时子卡保持挂载，展开状态不丢。 */
-  @Local open: boolean = false;
 
   build() {
     Column() {
@@ -377,7 +340,7 @@ struct StepGroup {
           .fontColor($r('app.color.label_secondary'))
         Blank()
         // 固定尺寸符号（不依赖字体行高，收起/展开两态盒子完全一致）
-        SymbolGlyph(this.open ? $r('sys.symbol.chevron_down') : $r('sys.symbol.chevron_right'))
+        SymbolGlyph(this.steps[0].expanded ? $r('sys.symbol.chevron_down') : $r('sys.symbol.chevron_right'))
           .fontSize(16)
           .fontColor([$r('app.color.label_tertiary')])
           .width(18)
@@ -387,7 +350,7 @@ struct StepGroup {
       .padding({ left: SP_1, right: SP_1, top: SP_1, bottom: SP_1 })
       .margin({ bottom: SP_1 })
       .onClick((): void => {
-        this.open = !this.open;
+        this.steps[0].expanded = !this.steps[0].expanded;
       })
 
       Column() {
@@ -398,7 +361,7 @@ struct StepGroup {
           .key((s: TimelineItem): string => s.id)
       }
       .width('100%')
-      .visibility(this.open ? Visibility.Visible : Visibility.None)
+      .visibility(this.steps[0].expanded ? Visibility.Visible : Visibility.None)
     }
     .width('100%')
   }
@@ -411,14 +374,13 @@ struct StepGroup {
  * mdController 传的是**思考专用**控制器（小号 + label_secondary 弱化配色），
  * 与助手气泡的正文主题分开——同色会分不清「思考」和「回答」。
  * 流式刷新：item 为 @Param，item.text 是 model 侧 @Trace 字段，原地增量更新即可自然刷新。
+ * 折叠态存 item.expanded（数据侧 @Trace，v1.1.4 复用安全，见 StepGroup 注释）。
  */
 @ComponentV2
-struct ReasoningCard {
+export struct ReasoningCard {
   @Require @Param item: TimelineItem;
-  /** 共享的 markdown 渲染控制器（与助手气泡同主题，页面级创建后下传）。 */
+  /** 共享的 markdown 渲染控制器（思考专用弱化主题，页面级创建后下传）。 */
   @Require @Param mdController: MarkdownController;
-  /** 默认收起。 */
-  @Local expanded: boolean = false;
 
   build() {
     Column() {
@@ -433,7 +395,7 @@ struct ReasoningCard {
           .fontColor($r('app.color.label_secondary'))
           .margin({ left: SP_2 })
         Blank()
-        SymbolGlyph(this.expanded ? $r('sys.symbol.chevron_down') : $r('sys.symbol.chevron_right'))
+        SymbolGlyph(this.item.expanded ? $r('sys.symbol.chevron_down') : $r('sys.symbol.chevron_right'))
           .fontSize(16)
           .fontColor([$r('app.color.label_tertiary')])
           .width(18)
@@ -443,10 +405,10 @@ struct ReasoningCard {
       .alignItems(VerticalAlign.Center)
       .padding({ left: SP_1, right: SP_1, top: SP_1, bottom: SP_1 })
       .onClick((): void => {
-        this.expanded = !this.expanded;
+        this.item.expanded = !this.item.expanded;
       })
 
-      if (this.expanded) {
+      if (this.item.expanded) {
         Column() {
           Markdown({ text: this.item.text, controller: this.mdController })
             .width('100%')
@@ -457,40 +419,5 @@ struct ReasoningCard {
     }
     .width('100%')
     .margin({ bottom: SP_1 })
-  }
-}
-
-/** 统一时间线：按 kind 分派渲染（消息 / 工作步骤分组 / 思考过程 / 系统说明行）。 */
-@ComponentV2
-export struct TimelineView {
-  @Require @Param items: TimelineItem[];
-  @Require @Param mdController: MarkdownController;
-  /** 思考块专用 markdown 控制器（弱化配色：小号 + secondary 文字色）。 */
-  @Require @Param mdReasoningController: MarkdownController;
-
-  /** 分组视图（连续的工作步骤 → 一组）。 */
-  private timelineEntries(): TimelineEntry[] {
-    return groupTimeline(this.items);
-  }
-
-  build() {
-    Column() {
-      Repeat(this.timelineEntries())
-        .each((cell: RepeatItem<TimelineEntry>): void => {
-          if (cell.item.isGroup) {
-            StepGroup({ steps: cell.item.steps })
-          } else if (cell.item.head.kind === 'system') {
-            SystemNote({ item: cell.item.head })
-          } else if (cell.item.head.kind === 'reasoning') {
-            // 思考过程：独立折叠块（展开正文走 markdown，**用弱化主题的独立控制器**：
-            // 与助手气泡同色会分不清「思考」和「回答」），不进消息气泡、也不并入工作步骤分组
-            ReasoningCard({ item: cell.item.head, mdController: this.mdReasoningController })
-          } else {
-            MessageBubble({ item: cell.item.head, mdController: this.mdController })
-          }
-        })
-        .key((e: TimelineEntry): string => e.key)
-    }
-    .width('100%')
   }
 }

@@ -59,7 +59,6 @@ import {
   TOPIC_SESSION_QUEUE,
   TOPIC_SESSION_REMOVED,
   TOPIC_SESSION_STATUS,
-  TOPIC_SYSTEM_MESSAGE,
   TOPIC_TOOL_CALL,
   TOPIC_TOOL_RESULT,
   TOPIC_TURN_END
@@ -184,8 +183,10 @@ export class SubagentRow {
   }
 }
 
-/** 时间线项（契约 §5.7 v1.0.6）：一条消息、一个工作步骤或一条系统消息。
- *  kind: "message"（对话气泡，role=user/assistant） | "step"（工具调用） | "system"（系统/开发者消息）。
+/** 时间线项（契约 §5.7 v1.0.6）：一条消息、一个工作步骤或一个思考块。
+ *  kind: "message"（对话气泡，role=user/assistant） | "step"（工具调用） | "reasoning"（思考过程）。
+ *  （v1.0.6 的 "system" 已随 v1.1.4 移除——宿主 system/developer 消息是提示词组装记录，
+ *   不是对话内容，桌面端聊天从不展示。）
  *  seq：host 日志持久序号（session.history 的合并排序键）；-1=本地/直播项（永远排在最后）。 */
 @ObservedV2
 export class TimelineItem {
@@ -207,6 +208,12 @@ export class TimelineItem {
   @Trace step: number = 0;
   /** v1.0.9：消息内图片（契约 §5.10）——空数组 = 该消息没有图片。 */
   @Trace images: DshrcImageRef[] = [];
+  /**
+   * 折叠态（步骤分组 / 思考块共用）：状态**放在数据里**而不是组件 @Local——
+   * 时间线是 List 懒加载 + 节点复用，组件内状态在复用时会串台/丢失；
+   * 挂在 item 上随 @Param 绑定，复用/重建后展开状态天然恢复。
+   */
+  @Trace expanded: boolean = false;
 
   constructor(id: string, kind: string, ts: number) {
     this.id = id;
@@ -451,6 +458,10 @@ export class SessionStore {
       if (this.activeId.length > 0) {
         this.loadHistory(this.activeId, false);
         this.loadQueue(this.activeId);
+        // v1.1.4 修复：模型也要补拉。此前只补历史/排队/子代理——App 从后台切回时
+        // 若 WS 正在重连，aboutToAppear 里那次 session.model 恰好落在断链窗口
+        // 静默失败，链路恢复后**永不重试** → 手机端一直显示目录默认模型。
+        this.loadSessionModel(this.activeId);
         const row: SessionRow | undefined = this.findRow(this.activeId);
         if (row !== undefined && row.parentSessionId.length === 0) {
           this.loadSubagents(this.activeId);
@@ -796,9 +807,15 @@ export class SessionStore {
    */
   loadSessionModel(sid: string): void {
     if (sid.length === 0 || this.link.getState() !== 'online') {
+      // v1.1.4 诊断：这个静默 return 曾让「断链窗口里发的 model 查询」永远不补发，
+      // 手机端全部会话显示目录默认模型（用户实测「所有会话同一个模型」）。
+      logDshrc(TAG, 'info', 'session.model skipped: ' +
+        (sid.length === 0 ? 'sid empty' : 'link ' + this.link.getState()));
       return;
     }
+    logDshrc(TAG, 'info', 'session.model querying: ' + sid.slice(0, 20));
     this.link.sessionModel(sid).then((sel: DshrcModelSelection | null): void => {
+      logDshrc(TAG, 'info', 'session.model got: ' + (sel === null ? 'null' : sel.provider + '/' + sel.model));
       if (sid !== this.activeId) {
         return; // 已切走：只进缓存，不动投影
       }
@@ -1285,21 +1302,6 @@ export class SessionStore {
     this.notifyActive(sid);
   }
 
-  /**
-   * system.message 事件：追加一条系统/开发者消息（说明行，不占气泡）。 */
-  private appendSystem(sid: string, kind: string, text: string, ts: number): void {
-    if (sid.length === 0 || text.length === 0) {
-      return;
-    }
-    const items: TimelineItem[] = this.cacheOf(sid);
-    this.chatSeq = this.chatSeq + 1;
-    const si: TimelineItem = new TimelineItem('y' + this.chatSeq.toString(), 'system', ts);
-    si.role = kind;
-    si.text = text;
-    items.push(si);
-    this.notifyActive(sid);
-  }
-
   // ---- 图片（契约 §5.10 v1.0.9）----
 
   /**
@@ -1734,14 +1736,6 @@ export class SessionStore {
           st === 'error' ? 'error' : 'ok',
           data.resultText !== undefined ? data.resultText : '',
           data.errorText !== undefined ? data.errorText : '',
-          data.ts !== undefined ? data.ts : Date.now());
-        break;
-      }
-      case TOPIC_SYSTEM_MESSAGE: {
-        // 契约 §5.7 v1.0.6：系统/开发者消息
-        const sidS: string = data.sessionId !== undefined ? data.sessionId : '';
-        const kind: string = data.kind !== undefined ? data.kind : 'system';
-        this.appendSystem(sidS, kind, data.text !== undefined ? data.text : '',
           data.ts !== undefined ? data.ts : Date.now());
         break;
       }

@@ -5,6 +5,44 @@ GitHub Release 的正文——**bump 版本时必须同步补一段 `## [版本]
 
 ## [Unreleased]
 
+## [1.1.5] - 2026-10-28
+
+手机端体验对齐 PC 端（**协议修订 v1.1.4**）。用户实测反馈驱动：会话内模型和思考强度
+对不上、会话列表多出系统消息、进入会话有滑动到底的动画、会话内缺回到底的悬浮按钮、
+代码块复制报「没有设置」。
+
+### 插件（Host 侧）
+
+- **`session.model` 改读宿主的 `modelSelection` 持久投影**（契约 v1.1.4 ①）：
+  旧实现只认 `model/selection` 事件维护的内存态，插件重启后内存为空 → 从没切换过模型的
+  会话永远回 `null` → 手机端回退显示**目录默认模型**（用户实测「手机上一直是显示的默认模型」）。
+  现在读 `sessionController.projections()` 的 `values.modelSelection`（wire 视图
+  `{lastUsed, next}`，取 `next ?? lastUsed`）——与 **DSH 桌面端 composer 读的是同一份**。
+  投影不可用时退回内存态，两者皆空才回 `null`。
+- **移除 `system.message` 事件桥接**（契约 v1.1.4 ②）：宿主 `system/message` /
+  `developer/message` 是系统提示词组装记录与工具注册表变更，**桌面端聊天视图从不展示**；
+  手机端曾把它们渲染成大段「系统消息」，与 PC 轨迹不一致。
+- **`session.create` 工作区归组**（契约 v1.1.4 ③）：手机端原先只传 `cwd`，宿主不会把会话
+  attach 到任何工作区 → PC 端显示「未分组」。现在插件用
+  `workspaceRegistry.resolveByPath(cwd)` 反查，命中已注册工作区就改传 `workspaceId`
+  （会话自动归组），未命中保持传 `cwd`。**归组失败绝不阻断创建**。
+
+### App（HarmonyOS）
+
+- **会话内模型/思考强度与 PC 同源**：断线恢复时补拉 `session.model`
+  （此前 App 从后台切回若恰逢 WS 重连，该次查询静默失败且永不重试 → 所有会话显示默认模型）；
+  静默失败路径现在写日志，便于定位。
+- **会话时间线由 `Scroll` 改 `List` + `Repeat`**：懒加载、节点复用、可定位；
+  用 `initialIndex` + `stackFromEnd` **直显底部**（消除进入会话的滑动到底动画）。
+- **新增悬浮回底按钮**：滚离底部时出现，点击带动画回到底部。
+- **代码块/表格/文本选中复制接线**（此前报「没有设置」）：统一走系统剪贴板。
+
+### 文档
+
+- 契约升到 **v1.1.4**；`AGENTS.md`（根 / plugin / app）同步 v1.1.4 章节。
+- 修正 `plugin/AGENTS.md` 的重载表：**link 安装时 `set_plugin` 开关不会换模块**
+  （实测踩坑，症状是插件行为完全没变），可靠路径是 `remove_bundle` + `install_bundle`。
+
 ## [1.1.4] - 2026-10-27
 
 发布工具链与插件市场接入（无协议变更，wire 行为与 1.1.3 完全一致）。

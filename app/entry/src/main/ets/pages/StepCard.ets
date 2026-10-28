@@ -8,7 +8,8 @@
  *    等宽字体、FS_SMALL/label_secondary，错误用 state_error），相对折叠行左缩进 SP_4、右留 SP_2
  *  - 超长参数 / 输出用内层 Scroll 限制高度并内部滚动；到边后联动外层页面滚动
  *    （nestedScroll SELF_FIRST；SELF_ONLY 会让展开区「滚不动页面」，用户反馈）
- *  - 展开状态存在本组件 @Local（V2）里，不写进 store
+ *  - 展开状态存在 item.expanded（数据侧 @Trace，v1.1.4）：时间线是 List 懒加载 +
+ *    节点复用，组件 @Local 在复用时会丢/串台；挂数据上随 @Param 绑定恢复
  */
 import { display } from '@kit.ArkUI';
 import { TimelineItem } from '../model/sessionstore';
@@ -65,8 +66,6 @@ function stepOutputMaxVp(): number {
 @ComponentV2
 export struct StepCard {
   @Require @Param item: TimelineItem;
-  /** 展开状态（组件内 V2 状态，不入 store）。 */
-  @Local expanded: boolean = false;
 
   /** 状态色：running→品牌蓝 / ok→成功绿 / error→错误红。 */
   private statusColor(): ResourceColor {
@@ -278,7 +277,7 @@ export struct StepCard {
           .fontColor($r('app.color.label_tertiary'))
           .margin({ left: SP_2 })
         // 固定尺寸符号（不依赖字体行高，收起/展开两态盒子完全一致）
-        SymbolGlyph(this.expanded ? $r('sys.symbol.chevron_down') : $r('sys.symbol.chevron_right'))
+        SymbolGlyph(this.item.expanded ? $r('sys.symbol.chevron_down') : $r('sys.symbol.chevron_right'))
           .fontSize(16)
           .fontColor([$r('app.color.label_tertiary')])
           .width(18)
@@ -290,10 +289,10 @@ export struct StepCard {
       .alignItems(VerticalAlign.Center)
       .padding({ left: SP_2, right: SP_2 })
       .onClick((): void => {
-        this.expanded = !this.expanded;
+        this.item.expanded = !this.item.expanded;
       })
 
-      if (this.expanded) {
+      if (this.item.expanded) {
         // 展开区：相对折叠行左缩进 SP_4、右留 SP_2，块间 SP_2 间距（不贴边）
         Column() {
           if (this.item.argsText.length > 0) {

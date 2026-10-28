@@ -1,6 +1,6 @@
 {
   "name": "@duke-dsh-plugins/dsh-remote-control-relay",
-  "version": "1.1.4",
+  "version": "1.1.5",
   "description": "Public WebSocket relay (dumb pipe) for dsh-remote-control. Implements contract section 4 transport frames only; never parses frame.data ciphertext. Optional native TLS (RELAY_TLS_CERT/RELAY_TLS_KEY) and hello-token gating (RELAY_TOKEN).",
   "type": "module",
   "main": "server.js",

@@ -16,6 +16,22 @@
 > 接收方**持久化**对端最高纪元（纪元回退 = 拒绝连接）+ **钉扎**对端 sid（跨会话重放直接丢弃）；
 > 双方 pv≥2 时业务帧 AAD 升级为 `dshrc|role|seq|sid`（v1.1.2 及以前是 `dshrc|role|seq`）。
 > 另：中继支持原生 TLS（`RELAY_TLS_CERT`/`RELAY_TLS_KEY` → 直接提供 `wss://`）。
+> **v1.1.4 于 2026-10-28 修订（手机端体验对齐 PC）**：
+> ① `session.model` 的**数据源改为宿主的 `modelSelection` 持久投影**
+> （`sessionController.projections` 的 `values.modelSelection`，视图 `{lastUsed, next}`，
+> `next = pending ?? lastUsed`）——与 DSH 桌面端 composer 显示的是**同一份**
+> （`selection = projected.next ?? catalog.default`）。旧实现只认 `model/selection`
+> 直播事件的内存态 → 从没显式切换过模型的会话永远回 `null`，手机端就一直显示
+> 目录默认模型（与 PC 对不上）。投影不可用时退回内存态；两者皆空才回 `null`。
+> ② **移除 `system.message` 事件**（§5.2）——宿主 `system/message` / `developer/message`
+> 是**系统提示词组装记录 / 工具注册表变更**，不是对话内容，DSH 桌面端聊天视图
+> 从不展示；手机端曾把它们显示成大段「系统消息」，与 PC 轨迹不一致。
+> ③ **`session.create` 的工作区归组**：手机端只传 `cwd`，插件先用
+> `workspaceRegistry.resolveByPath(cwd)` 反查——该目录若已注册为工作区，改传
+> `workspaceId`（宿主 `sc.create` 会用 workspace.path 作 cwd 并 `attachSession`，
+> 会话自动挂到工作区下面，与 PC 端「在工作区里新建」一致）；未命中/异常保持传
+> `cwd`（与 PC 在普通目录新建一样 = 未分组）。wire 协议不变（仍只收 `cwd`），
+> 归组是插件内部行为，**失败绝不阻断创建**。
 > 三个实现（DSH 插件 / 中继服务器 / HarmonyOS App）
 > 都必须以本文档为准；任何协议改动必须先改本文档并通知 Lead。
 
@@ -188,7 +204,7 @@ dshrc://pair?r=<encodeURIComponent(relayUrl)>&c=<channel>&s=<secret>[&t=<encodeU
 | `session.archive` | `{sessionId, stopActivity?:bool}` | `{sessionId, archived:true}` | **v1.0.7** 写入 Workspace 真实归档集合；`stopActivity=true` 时按 Host 语义停止运行活动，缺省为 false |
 | `session.unarchive` | `{sessionId}` | `{sessionId, archived:false}` | **v1.0.7** 从 Workspace 归档集合恢复；幂等 |
 | `session.selectModel` | `{sessionId, model:ModelSelection}` | `{model:ModelSelection}` | **v1.0.8** 对**已存在会话**切换模型/思考强度；插件调 `sessionController.selectModel({sessionId,…})`。Host 拒绝时回 `error`（原文带出），成功回归一化后的 selection，并视为一次 `model/selection`（同样触发 `session.modelChanged`） |
-| `session.model` | `{sessionId}` | `{model:ModelSelection\|null}` | **v1.0.8** 查询会话当前模型/思考强度。插件从 `model/selection` 会话事件维护内存态；插件重启后无记录时回 `null`（客户端回退展示目录默认），**不得臆造** |
+| `session.model` | `{sessionId}` | `{model:ModelSelection\|null}` | **v1.0.8** 查询会话当前模型/思考强度。**v1.1.4 改数据源**：优先读宿主 `modelSelection` **持久投影**（`sessionController.projections` 的 `values.modelSelection`，视图 `{lastUsed, next}`，`next = pending ?? lastUsed`）——与桌面端 composer 同源（`selection = projected.next ?? catalog.default`）；投影不可用才退回 `model/selection` 直播事件维护的内存态；两者皆空回 `null`（客户端回退展示目录默认，与 PC 的 `catalog.default` 回退一致），**不得臆造** |
 | `session.prompt` | `{sessionId, text}` | `{accepted:bool, mode:'queue'\|'steer'}` | 立即返回；实际回复走事件流。**v1.1.2 起投递行为由宿主设置决定**：客户端**不传** mode（传了也**忽略**）。插件读宿主「繁忙时的发送行为」（`ui-conversation.busyEnter`：排队发送/插话发送），agent 忙时按设置投递、空闲时总是 queue；宿主拒绝插话时插件**自动退回 queue**（消息不丢）。回包的 `mode` 是**实际**使用的投递行为 |
 | `session.queue` | `{sessionId}` | `{sessionId, items:[{itemId, text, target:'next-turn'\|'next-step'}]}` | **v1.1.2** 拉取该会话**当前**待执行消息的全量快照。与 §5.2 的 `session.queue` 事件同形状：事件只在**变化时**推，客户端断线重连后必须拉一次才能补上断线期间变过的队列 |
 | `session.cancel` | `{sessionId}` | `{cancelled:bool}` | 取消当前运行的 turn |
@@ -215,7 +231,7 @@ dshrc://pair?r=<encodeURIComponent(relayUrl)>&c=<channel>&s=<secret>[&t=<encodeU
 | `assistant.image` | `{sessionId, image:ImageRef}` | **v1.0.9** 会话消息里的图片（§5.10）：源为 Host 会话事件的 `content` 块 `type:"image"`（附件引用）；**v1.1.0** 增补第二来源：present 投递的图片文件（§5.10.1，imageId 以 `d` 开头，`source:"deliverable"`） |
 | `tool.call` | `{sessionId, callId, name, arguments, ts}` | **v1.0.6** Host 会话事件 `tool/call`（模型发起一次工具调用） |
 | `tool.result` | `{sessionId, callId, status:"ok"\|"error", resultText, errorText?, ts}` | **v1.0.6** Host 会话事件 `tool/result`（工具调用结束；`resultText` 为结果文本，失败时 `errorText` 为原因） |
-| `system.message` | `{sessionId, kind:"system"\|"developer", text, ts}` | **v1.0.6** Host 会话事件 `system/message` / `developer/message`（系统提示注入等非对话内容） |
+| ~~`system.message`~~ | ~~`{sessionId, kind:"system"\|"developer", text, ts}`~~ | **v1.1.4 移除**（v1.0.6 引入）。宿主 `system/message` / `developer/message` 是**系统提示词组装记录 / 工具注册表变更**，不是对话内容——DSH 桌面端聊天视图从不展示，手机端也不应展示（曾显示成大段「系统消息」，与 PC 轨迹不一致）。插件**不再桥接**该事件；客户端遇到旧插件发来的该 topic 直接忽略 |
 | `turn.end` | `{sessionId, status:"idle"\|"error", error?}` | 事件 `agent/status`(idle) / `agent/error` |
 | `approval.request` | `{askId, sessionId, toolName, reason, argsPreview, timeoutMs}` | 瀑布 `approval/request` |
 | `approval.resolved` | `{askId, decision, source:"phone"\|"timeout"\|"desktop"}` | 瀑布收束时回推（手机 UI 消除卡片用） |
@@ -594,7 +610,16 @@ AAD     = ""   ← 注意：本 KAT 用空 AAD，便于对齐；AAD 绑定逻辑
   - `system/message` → `data = { turn, step, message: SystemMessage }`
   - `developer/message` → `data = { turn, step, message: DeveloperMessage }`
   - `assistant/message` / `user/message` → 对话（既有 §5.2 口径）
-  插件按 `event.type` 分派到 `tool.call` / `tool.result` / `system.message` 三个新事件即可。
+  插件按 `event.type` 分派到 `tool.call` / `tool.result` 两个新事件即可；
+  **`system/message` / `developer/message` 不再桥接**（v1.1.4：它们是提示词组装记录 /
+  工具注册表变更，不是对话内容，PC 聊天视图从不展示）。
+- **模型选择的权威来源（v1.1.4）**：`sessionController.projections({sessionId}, signal)`
+  → `{ kind, asOfSeq, values }`，其中 `values.modelSelection` 是 **modelSelection 投影**的视图：
+  `{ lastUsed: ModelSelection|null, next: ModelSelection|null }`，`next = pending ?? lastUsed`。
+  - `pending` = 用户在会话里显式切换过、还没被请求消费的模型；
+  - `lastUsed` = 上一个 `request/header` 实际使用的模型。
+  DSH 桌面端 composer 显示的正是 `projected.next ?? catalog.default`
+  （`dsh-client-ui-model-selection` 的 `syncInputs`）→ 手机端读同一份即可与 PC 对齐。
 - **模式目录（Agent preset）**：`ctx.get('agentPresets')` → `AgentPresetRegistry`：
   - `list(): Promise<AgentPreset[]>`，`AgentPreset = { id, name?, description?, order?, broken? }`
   - `defaultId: string` —— 默认模式 id

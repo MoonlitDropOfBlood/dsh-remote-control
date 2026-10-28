@@ -32,6 +32,13 @@
 > 会话自动挂到工作区下面，与 PC 端「在工作区里新建」一致）；未命中/异常保持传
 > `cwd`（与 PC 在普通目录新建一样 = 未分组）。wire 协议不变（仍只收 `cwd`），
 > 归组是插件内部行为，**失败绝不阻断创建**。
+> **v1.1.6 于 2026-10-28 修订（直播保序 + 默认目录）**：
+> ① `session.create` 的 `cwd` 缺省/空串不再落到 DSH 后端 `process.cwd()`——插件解析为
+> Host 用户主目录下的 `~/.dsh/remote`，创建前递归建目录（失败回错，不静默回退）；
+> 解析后的路径仍按 v1.1.4 ③ 的规则归组，**不自动注册工作区**；显式 `cwd` 行为不变。
+> ② **直播事件保序（§5.2 末注）**：正文/思考增量共用一条按 session 保序的合并队列；
+> `turn.end` 在全部待发增量之后发出；`tool.call` / `tool.result` / `assistant.image`
+> 不越过未冲刷的文本/思考增量（客户端按到达顺序渲染，依赖该保证）。
 > 三个实现（DSH 插件 / 中继服务器 / HarmonyOS App）
 > 都必须以本文档为准；任何协议改动必须先改本文档并通知 Lead。
 
@@ -199,7 +206,7 @@ dshrc://pair?r=<encodeURIComponent(relayUrl)>&c=<channel>&s=<secret>[&t=<encodeU
 | `session.subagents` | `{sessionId}` | `{subagents:[SubagentInfo]}` | **v1.0.5** 父会话的直接子代理目录（父会话 `subagentCatalog` 投影 + 运行态）。SubagentInfo 见 §5.6 |
 | `session.subagentPrompt` | `{parentSessionId, childSessionId, text}` | `{accepted:bool}` | **v1.0.5** 向 **continuable** 子代理发消息（delivery:'queue'）；one-shot 子代理返回 `unsupported` 错误。回复走同一事件流（sessionId=child） |
 | `session.subagentCancel` | `{parentSessionId, childSessionId}` | `{accepted:bool}` | **v1.0.5** 取消 continuable 子代理当前 turn（interruptByParent；accepted=信号已受理，非已停止） |
-| `session.create` | `{title?, cwd?, agentPreset?, permission?, model?}` | `{sessionId, agentPreset?, model?, modelError?}` | cwd 缺省用主机默认工作目录。**v1.0.6**：`agentPreset` / `permission` = 模式与权限（§5.8）。**v1.0.7**：`model:{provider,model,reasoningEffort?}` = 模型选择；Host 在创建后、首条 prompt 前 `selectModel`。会话已创建但模型设置失败时仍回成功并带 `modelError`，客户端不得重复创建 |
+| `session.create` | `{title?, cwd?, agentPreset?, permission?, model?}` | `{sessionId, agentPreset?, model?, modelError?}` | cwd 缺省或为空串时，插件解析为 Host 用户主目录下的 `~/.dsh/remote` 并在创建前递归确保目录存在；不再使用 DSH 后端 `process.cwd()`。该路径随后仍按 §5.1 的工作区反查规则归组，未注册则允许未分组；目录创建失败回错，不静默回退。显式 cwd 行为不变。**v1.0.6**：`agentPreset` / `permission` = 模式与权限（§5.8）。**v1.0.7**：`model:{provider,model,reasoningEffort?}` = 模型选择；Host 在创建后、首条 prompt 前 `selectModel`。会话已创建但模型设置失败时仍回成功并带 `modelError`，客户端不得重复创建 |
 | `session.capabilities` | `{}` | `{presets:[ModeOption], permissions:[PermissionOption], defaultPreset?, defaultPermission?, models:[ModelOption], defaultModelId?, archiveSupported:bool, busyEnter:'queue'\|'steer'}` | **v1.0.6** 模式与权限目录。**v1.0.7** 增加模型目录与真实归档能力标记（§5.8/§5.9）。**v1.0.8** `ModelOption.efforts` 暴露该模型可选思考强度（§5.8）；宿主未提供对应能力时 models 为空 / archiveSupported=false，客户端隐藏对应选择区，不得报错。**v1.1.2** 增补 `busyEnter`：宿主「繁忙时的发送行为」——**只读**（客户端不得提供切换），宿主读不到时按 'queue' |
 | `session.archive` | `{sessionId, stopActivity?:bool}` | `{sessionId, archived:true}` | **v1.0.7** 写入 Workspace 真实归档集合；`stopActivity=true` 时按 Host 语义停止运行活动，缺省为 false |
 | `session.unarchive` | `{sessionId}` | `{sessionId, archived:false}` | **v1.0.7** 从 Workspace 归档集合恢复；幂等 |
@@ -226,19 +233,25 @@ dshrc://pair?r=<encodeURIComponent(relayUrl)>&c=<channel>&s=<secret>[&t=<encodeU
 | `session.modelChanged` | `{sessionId, model:ModelSelection}` | **v1.0.8** 会话模型/思考强度变化：源为 Host 会话事件 `model/selection`（桌面端切换、手机端 `session.selectModel` 都会触发）；客户端更新会话当前模型显示 |
 | `session.activity` | `{sessionId, updatedAt}` | 事件 `api-session/activity` |
 | `session.queue` | `{sessionId, items:[{itemId, text, target:'next-turn'\|'next-step'}]}` | **v1.1.1** 该会话**待执行**的用户消息（排队中 / 已插入当前 turn 但尚未消费）。源为 Host 会话事件 `agent/inbox/spliced`（入队）与 `user/message`（被消费时出队）。客户端据此显示「排队中」列表——**只做展示，不做猜测**；items 为空数组 = 没有待执行消息 |
-| `assistant.delta` | `{sessionId, text}` | 事件 `agent/assistant-stream`（文本增量；**按 sessionId 合并节流 ≤8 条/秒**） |
+| `assistant.delta` | `{sessionId, text}` | 事件 `agent/assistant-stream`（文本增量；**按 sessionId 合并节流 ≤8 条/秒**）。**v1.1.6**：与思考增量共用保序队列（见本表末注） |
 | `assistant.reasoningDelta` | `{sessionId, text}` | **v1.0.7** `agent/assistant-stream` 的 `reasoning-delta` 思考增量；与文本分流，客户端合并进「思考过程」块 |
 | `assistant.image` | `{sessionId, image:ImageRef}` | **v1.0.9** 会话消息里的图片（§5.10）：源为 Host 会话事件的 `content` 块 `type:"image"`（附件引用）；**v1.1.0** 增补第二来源：present 投递的图片文件（§5.10.1，imageId 以 `d` 开头，`source:"deliverable"`） |
 | `tool.call` | `{sessionId, callId, name, arguments, ts}` | **v1.0.6** Host 会话事件 `tool/call`（模型发起一次工具调用） |
 | `tool.result` | `{sessionId, callId, status:"ok"\|"error", resultText, errorText?, ts}` | **v1.0.6** Host 会话事件 `tool/result`（工具调用结束；`resultText` 为结果文本，失败时 `errorText` 为原因） |
 | ~~`system.message`~~ | ~~`{sessionId, kind:"system"\|"developer", text, ts}`~~ | **v1.1.4 移除**（v1.0.6 引入）。宿主 `system/message` / `developer/message` 是**系统提示词组装记录 / 工具注册表变更**，不是对话内容——DSH 桌面端聊天视图从不展示，手机端也不应展示（曾显示成大段「系统消息」，与 PC 轨迹不一致）。插件**不再桥接**该事件；客户端遇到旧插件发来的该 topic 直接忽略 |
-| `turn.end` | `{sessionId, status:"idle"\|"error", error?}` | 事件 `agent/status`(idle) / `agent/error` |
+| `turn.end` | `{sessionId, status:"idle"\|"error", error?}` | 事件 `agent/status`(idle) / `agent/error`。**v1.1.6**：保证在该 session 全部待发增量冲刷完之后发出 |
 | `approval.request` | `{askId, sessionId, toolName, reason, argsPreview, timeoutMs}` | 瀑布 `approval/request` |
 | `approval.resolved` | `{askId, decision, source:"phone"\|"timeout"\|"desktop"}` | 瀑布收束时回推（手机 UI 消除卡片用） |
 | `question.request` | `{askId, sessionId, questions:[Question], timeoutMs, multiSelect?}` | 瀑布 `user-questions/request` |
 | `question.resolved` | `{askId, source:"phone"\|"timeout"\|"desktop"}` | 同上 |
 | `push.state` | `{enabled, reason?}` | 推送通道状态变化 |
 | `error` | `{message}` | 兜底 |
+
+> **v1.1.6 直播保序**：`assistant.delta` 与 `assistant.reasoningDelta` 共用一条按 session
+> 保序的合并队列——同一节流窗口只合并**相邻同类**块，跨类型顺序与宿主产生顺序一致；
+> `agent/status`(idle) / `agent/error` / assistant 流结束先冲刷**全部**待发增量再发
+> `turn.end`；`tool.call` / `tool.result` / `assistant.image` 发送前同样先冲刷该 session
+> 的待发增量——即时事件不得越过未上屏的文本/思考（客户端按到达顺序渲染，依赖此保证）。
 
 ### 5.3 SessionSummary
 

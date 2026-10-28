@@ -17,10 +17,18 @@
 //      selectModel；selectModel 失败仍回 sessionId + modelError（**不回 error**）；
 //   9. v1.0.7 思考：reasoning-delta → assistant.reasoningDelta；历史 reasoning 块
 //      独立成 role:"reasoning" 的 ChatMessage，排在正文之前。
+//  10. v1.1.x 流式顺序：正文/思考进**同一条保序队列**——reasoning→text→idle 的
+//      **跨 topic 全局顺序**必须与原始 chunk 顺序一致；相邻同类块合并、异类不合并；
+//      idle/error 先统一冲刷再发 turn.end；dispose 后不再出站。
 //
 // 用法：node scripts/verify-steps.mjs（在 plugin/ 目录下）
+import { mkdtemp, mkdir as fsMkdir, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   HostBridge,
+  defaultSessionCwd,
+  resolveSessionCwd,
   mapHistorySteps,
   mapPermissionOptions,
   modelCatalogToWire,
@@ -119,6 +127,24 @@ function lastResult(sent, id) {
     }
   }
   return null;
+}
+
+// ---- 桥接工厂：测试隔离 ---------------------------------------------------
+// session.create 的 cwd 缺省时会解析成 <home>/.dsh/remote 并建目录。
+// 这里**统一注入假 home + 记录式 mkdir**：既有场景一律不写真实用户 home，
+// 也不会在磁盘上留东西；需要真建目录的场景自己覆盖 homeDir / mkdir。
+const FAKE_HOME = join(tmpdir(), "dsh-remote-control-verify-home");
+function makeBridge(ctx, relay, extra = {}) {
+  return new HostBridge({
+    ctx,
+    relay,
+    push: { configured: false, notify: async () => ({ ok: true }) },
+    config: CFG,
+    log,
+    homeDir: FAKE_HOME,
+    mkdir: async () => {},
+    ...extra,
+  });
 }
 
 /** 取某 topic 的事件负载。 */
@@ -248,7 +274,7 @@ function eventsOf(sent, topic) {
   };
 
   const ctx = makeCtx({ sessionController, agentPresets, permissionPresets });
-  const bridge = new HostBridge({ ctx, relay, push: { configured: false, notify: async () => ({ ok: true }) }, config: CFG, log });
+  const bridge = makeBridge(ctx, relay);
   bridge.attach();
 
   // --- 1. session.capabilities ---
@@ -369,7 +395,7 @@ function eventsOf(sent, topic) {
     },
   };
   const ctx = makeCtx({ sessionController });
-  const bridge = new HostBridge({ ctx, relay, push: { configured: false, notify: async () => ({ ok: true }) }, config: CFG, log });
+  const bridge = makeBridge(ctx, relay);
   bridge.attach();
   await bridge.dispatch({ id: "r1", type: "session.create", ts: Date.now(), payload: { agentPreset: "nope" } });
   const res = lastResult(relay.sent, "r1");
@@ -402,7 +428,7 @@ function eventsOf(sent, topic) {
       },
     };
     const ctx = makeCtx({ sessionController, workspaceRegistry });
-    const bridge = new HostBridge({ ctx, relay, push: { configured: false, notify: async () => ({ ok: true }) }, config: CFG, log });
+    const bridge = makeBridge(ctx, relay);
     bridge.attach();
     await bridge.dispatch({ id: "ws-create1", type: "session.create", ts: Date.now(), payload: { cwd: "D:/proj" } });
     const res = lastResult(relay.sent, "ws-create1");
@@ -424,7 +450,7 @@ function eventsOf(sent, topic) {
     };
     const workspaceRegistry = { async resolveByPath() { return undefined; } };
     const ctx = makeCtx({ sessionController, workspaceRegistry });
-    const bridge = new HostBridge({ ctx, relay, push: { configured: false, notify: async () => ({ ok: true }) }, config: CFG, log });
+    const bridge = makeBridge(ctx, relay);
     bridge.attach();
     await bridge.dispatch({ id: "ws-create2", type: "session.create", ts: Date.now(), payload: { cwd: "D:/other" } });
     check("归组：未命中 → 仍传 cwd", createReqs[0]?.cwd === "D:/other" && createReqs[0]?.workspaceId === undefined, JSON.stringify(createReqs[0]));
@@ -442,7 +468,7 @@ function eventsOf(sent, topic) {
       },
     };
     const ctx = makeCtx({ sessionController });
-    const bridge = new HostBridge({ ctx, relay, push: { configured: false, notify: async () => ({ ok: true }) }, config: CFG, log });
+    const bridge = makeBridge(ctx, relay);
     bridge.attach();
     await bridge.dispatch({ id: "ws-create3", type: "session.create", ts: Date.now(), payload: { cwd: "D:/x" } });
     const res = lastResult(relay.sent, "ws-create3");
@@ -465,13 +491,218 @@ function eventsOf(sent, topic) {
       async resolveByPath() { throw new Error("ENOENT: no such directory"); },
     };
     const ctx = makeCtx({ sessionController, workspaceRegistry });
-    const bridge = new HostBridge({ ctx, relay, push: { configured: false, notify: async () => ({ ok: true }) }, config: CFG, log });
+    const bridge = makeBridge(ctx, relay);
     bridge.attach();
     await bridge.dispatch({ id: "ws-create4", type: "session.create", ts: Date.now(), payload: { cwd: "D:/gone" } });
     const res = lastResult(relay.sent, "ws-create4");
     check("归组：resolveByPath 抛错仍创建成功", res?.value?.sessionId === "sess-ws4", JSON.stringify(res));
     check("归组：resolveByPath 抛错 → 兜底传 cwd", createReqs[0]?.cwd === "D:/gone", JSON.stringify(createReqs[0]));
     bridge.dispose();
+  }
+}
+
+// ===========================================================================
+// 场景 2c（v1.1.4）：session.create 的**默认工作目录**（<home>/.dsh/remote）
+//
+// cwd 缺省 / undefined / 空串 / trim 后空串 → 解析为 <home>/.dsh/remote，
+// 创建前递归建目录；**建目录失败直接回错**（不静默回退 process.cwd()）。
+// 解析出的路径同样走 workspaceRegistry.resolveByPath 归组（已注册 → workspaceId，
+// 未注册 → 传该 cwd；**不自动注册工作区**）。显式 cwd 行为不变（不自动建目录）。
+// 全部用**临时目录 + 注入**隔离：不写真实用户 home、不留后台 job、跑完清理。
+// ===========================================================================
+{
+  // --- 纯路径解析（导出 helper，无需任何 I/O）---
+  {
+    const home = join(tmpdir(), "dsh-verify-home");
+    const expected = join(home, ".dsh", "remote");
+    check("默认目录：<home>/.dsh/remote", defaultSessionCwd(home) === expected, defaultSessionCwd(home));
+    check(
+      "解析：缺省 → 默认目录",
+      resolveSessionCwd(undefined, home).isDefault === true &&
+        resolveSessionCwd(undefined, home).cwd === expected,
+      JSON.stringify(resolveSessionCwd(undefined, home)),
+    );
+    check(
+      "解析：undefined → 默认目录",
+      resolveSessionCwd(undefined, home).isDefault === true &&
+        resolveSessionCwd(undefined, home).cwd === expected,
+      JSON.stringify(resolveSessionCwd(undefined, home)),
+    );
+    check(
+      "解析：空串 → 默认目录",
+      resolveSessionCwd("", home).isDefault === true && resolveSessionCwd("", home).cwd === expected,
+      JSON.stringify(resolveSessionCwd("", home)),
+    );
+    check(
+      "解析：trim 后空串 → 默认目录",
+      resolveSessionCwd("   \t ", home).isDefault === true &&
+        resolveSessionCwd("   \t ", home).cwd === expected,
+      JSON.stringify(resolveSessionCwd("   \t ", home)),
+    );
+    check(
+      "解析：显式 cwd 原样保留（非默认）",
+      resolveSessionCwd("D:/proj", home).isDefault === false &&
+        resolveSessionCwd("D:/proj", home).cwd === "D:/proj",
+      JSON.stringify(resolveSessionCwd("D:/proj", home)),
+    );
+    check(
+      "解析：显式 cwd 仍 trim（保持原行为）",
+      resolveSessionCwd(" D:/proj ", home).cwd === "D:/proj",
+      JSON.stringify(resolveSessionCwd(" D:/proj ", home)),
+    );
+    check(
+      "解析：非字符串 → 默认目录",
+      resolveSessionCwd(42, home).isDefault === true,
+      JSON.stringify(resolveSessionCwd(42, home)),
+    );
+  }
+
+  // --- 端到端：默认目录 / 归组 / 显式 cwd / mkdir 失败（临时 home 隔离）---
+  const tempHome = await mkdtemp(join(tmpdir(), "dsh-verify-home-"));
+  const defaultDir = join(tempHome, ".dsh", "remote");
+  try {
+    // 1) 缺省 cwd → 用默认目录，目录**已创建**，不再回退 process.cwd()
+    {
+      const relay = makeRelay();
+      const createReqs = [];
+      const sessionController = {
+        async create(req) {
+          createReqs.push(req);
+          return { sessionId: "sess-def" };
+        },
+      };
+      const ctx = makeCtx({ sessionController });
+      // 注入真 mkdir（只作用于临时 home）
+      const bridge = makeBridge(ctx, relay, {
+        homeDir: tempHome,
+        mkdir: (p) => fsMkdir(p, { recursive: true }),
+      });
+      bridge.attach();
+      await bridge.dispatch({ id: "def-create", type: "session.create", ts: Date.now(), payload: {} });
+      const res = lastResult(relay.sent, "def-create");
+      check("缺省 cwd：创建成功回 sessionId", res?.value?.sessionId === "sess-def", JSON.stringify(res));
+      check("缺省 cwd：传给宿主的是默认目录", createReqs[0]?.cwd === defaultDir, JSON.stringify(createReqs[0]));
+      check("缺省 cwd：不回退 process.cwd()", createReqs[0]?.cwd !== process.cwd(), String(createReqs[0]?.cwd));
+      const st = await stat(defaultDir).catch(() => null);
+      check("缺省 cwd：默认目录已创建", st?.isDirectory() === true, defaultDir);
+      bridge.dispose();
+    }
+
+    // 2) 空串 / trim 后空串 → 同样用默认目录
+    {
+      const relay = makeRelay();
+      const createReqs = [];
+      const sessionController = {
+        async create(req) {
+          createReqs.push(req);
+          return { sessionId: "sess-empty" };
+        },
+      };
+      const ctx = makeCtx({ sessionController });
+      const bridge = makeBridge(ctx, relay, {
+        homeDir: tempHome,
+        mkdir: (p) => fsMkdir(p, { recursive: true }),
+      });
+      bridge.attach();
+      await bridge.dispatch({ id: "empty-create", type: "session.create", ts: Date.now(), payload: { cwd: "" } });
+      await bridge.dispatch({ id: "blank-create", type: "session.create", ts: Date.now(), payload: { cwd: "  " } });
+      check("空串 cwd：用默认目录", createReqs[0]?.cwd === defaultDir, JSON.stringify(createReqs[0]));
+      check("trim 后空串 cwd：用默认目录", createReqs[1]?.cwd === defaultDir, JSON.stringify(createReqs[1]));
+      bridge.dispose();
+    }
+
+    // 3) 默认目录**已注册为工作区** → 传 workspaceId（且不自动注册工作区）
+    {
+      const relay = makeRelay();
+      const createReqs = [];
+      const registryCalls = [];
+      const sessionController = {
+        async create(req) {
+          createReqs.push(req);
+          return { sessionId: "sess-wsdef" };
+        },
+      };
+      const workspaceRegistry = {
+        async resolveByPath(p) {
+          registryCalls.push("resolveByPath:" + p);
+          return p === defaultDir ? { id: "ws-default", path: p } : undefined;
+        },
+        async registerWorkspace() {
+          registryCalls.push("registerWorkspace");
+          return { id: "ws-new" };
+        },
+      };
+      const ctx = makeCtx({ sessionController, workspaceRegistry });
+      const bridge = makeBridge(ctx, relay, {
+        homeDir: tempHome,
+        mkdir: (p) => fsMkdir(p, { recursive: true }),
+      });
+      bridge.attach();
+      await bridge.dispatch({ id: "wsdef-create", type: "session.create", ts: Date.now(), payload: {} });
+      const res = lastResult(relay.sent, "wsdef-create");
+      check("默认目录已注册：创建成功", res?.value?.sessionId === "sess-wsdef", JSON.stringify(res));
+      check("默认目录已注册：传 workspaceId", createReqs[0]?.workspaceId === "ws-default", JSON.stringify(createReqs[0]));
+      check("默认目录已注册：不传 cwd（互斥）", createReqs[0]?.cwd === undefined, JSON.stringify(createReqs[0]));
+      check(
+        "默认目录已注册：**不自动注册工作区**",
+        registryCalls.every((c) => c.startsWith("resolveByPath:")),
+        JSON.stringify(registryCalls),
+      );
+      bridge.dispose();
+    }
+
+    // 4) 显式 cwd：不自动建目录，行为不变（照旧传 cwd / 照旧归组）
+    {
+      const relay = makeRelay();
+      const createReqs = [];
+      const mkdirCalls = [];
+      const sessionController = {
+        async create(req) {
+          createReqs.push(req);
+          return { sessionId: "sess-explicit" };
+        },
+      };
+      const ctx = makeCtx({ sessionController });
+      const bridge = makeBridge(ctx, relay, {
+        homeDir: tempHome,
+        mkdir: async (p) => {
+          mkdirCalls.push(p);
+        },
+      });
+      bridge.attach();
+      await bridge.dispatch({ id: "exp-create", type: "session.create", ts: Date.now(), payload: { cwd: "D:/proj" } });
+      check("显式 cwd：创建成功", lastResult(relay.sent, "exp-create")?.value?.sessionId === "sess-explicit", JSON.stringify(lastResult(relay.sent, "exp-create")));
+      check("显式 cwd：原样传给宿主", createReqs[0]?.cwd === "D:/proj", JSON.stringify(createReqs[0]));
+      check("显式 cwd：不自动建目录", mkdirCalls.length === 0, JSON.stringify(mkdirCalls));
+      bridge.dispose();
+    }
+
+    // 5) 建目录失败 → **不调用 sc.create**，回 error（不静默回退 process.cwd()）
+    {
+      const relay = makeRelay();
+      const createReqs = [];
+      const sessionController = {
+        async create(req) {
+          createReqs.push(req);
+          return { sessionId: "sess-never" };
+        },
+      };
+      const ctx = makeCtx({ sessionController });
+      const bridge = makeBridge(ctx, relay, {
+        homeDir: tempHome,
+        mkdir: async () => {
+          throw new Error("EACCES: permission denied, mkdir");
+        },
+      });
+      bridge.attach();
+      await bridge.dispatch({ id: "fail-create", type: "session.create", ts: Date.now(), payload: {} });
+      const res = lastResult(relay.sent, "fail-create");
+      check("建目录失败：回 error", res?.error?.code === "session-create-failed" && typeof res?.error?.message === "string", JSON.stringify(res));
+      check("建目录失败：不调用 sc.create", createReqs.length === 0, JSON.stringify(createReqs));
+      bridge.dispose();
+    }
+  } finally {
+    await rm(tempHome, { recursive: true, force: true });
   }
 }
 
@@ -491,7 +722,7 @@ function eventsOf(sent, topic) {
     },
   };
   const ctx = makeCtx({ sessionController });
-  const bridge = new HostBridge({ ctx, relay, push: { configured: false, notify: async () => ({ ok: true }) }, config: CFG, log });
+  const bridge = makeBridge(ctx, relay);
   bridge.attach();
 
   await bridge.dispatch({ id: "c1", type: "session.capabilities", ts: Date.now(), payload: {} });
@@ -562,7 +793,7 @@ function eventsOf(sent, topic) {
     },
   };
   const ctx = makeCtx({ sessionController, workspaceRegistry });
-  const bridge = new HostBridge({ ctx, relay, push: { configured: false, notify: async () => ({ ok: true }) }, config: CFG, log });
+  const bridge = makeBridge(ctx, relay);
   bridge.attach();
 
   // list：archived 来自注册表（**首屏即带**：归档早于插件启动、没有任何
@@ -626,7 +857,7 @@ function eventsOf(sent, topic) {
   const relay = makeRelay();
   const sessionController = { async list() { return { items: [{ sessionId: "s1" }] }; } };
   const ctx = makeCtx({ sessionController });
-  const bridge = new HostBridge({ ctx, relay, push: { configured: false, notify: async () => ({ ok: true }) }, config: CFG, log });
+  const bridge = makeBridge(ctx, relay);
   bridge.attach();
 
   await bridge.dispatch({ id: "n-caps", type: "session.capabilities", ts: Date.now(), payload: {} });
@@ -683,7 +914,7 @@ function eventsOf(sent, topic) {
     },
   };
   const ctx = makeCtx({ sessionController });
-  const bridge = new HostBridge({ ctx, relay, push: { configured: false, notify: async () => ({ ok: true }) }, config: CFG, log });
+  const bridge = makeBridge(ctx, relay);
   bridge.attach();
 
   // capabilities：models 拍平
@@ -764,7 +995,7 @@ function eventsOf(sent, topic) {
     },
   };
   const ctx = makeCtx({ sessionController });
-  const bridge = new HostBridge({ ctx, relay, push: { configured: false, notify: async () => ({ ok: true }) }, config: CFG, log });
+  const bridge = makeBridge(ctx, relay);
   bridge.attach();
 
   // history：reasoning 独立成条，排在正文之前
@@ -797,6 +1028,187 @@ function eventsOf(sent, topic) {
   check("live：思考不进 assistant.delta", !eventsOf(relay.sent, "assistant.delta").some((d) => (d.text ?? "").includes("思考中")), JSON.stringify(textEvents));
 
   bridge.dispose();
+}
+
+// ===========================================================================
+// 场景 7b（v1.1.x）：流式增量的**跨类型全局顺序**
+//
+// 缺陷：正文与思考原先各有一个 125ms 缓冲，idle/error 固定「先正文后思考」冲刷
+// → 宿主给 reasoning→text 时，wire 变成 text→reasoning，手机端按到达顺序渲染，
+// 与冷启动历史「思考在前」对不上（用户看到正文跑到思考前面）。
+// 修法：每个 session 一条统一保序队列（只合并相邻同类块），idle/error 先统一冲刷。
+// ===========================================================================
+{
+  const relay = makeRelay();
+  const ctx = makeCtx({});
+  const bridge = makeBridge(ctx, relay);
+  bridge.attach();
+
+  const SID = "sess-order";
+  /** 出站事件的**全局**顺序（topic 序列，跨类型混排）。 */
+  const topicOrder = () => relay.sent.filter((m) => m.type === "event").map((m) => m.payload?.topic);
+  /** 出站**流式**事件按顺序的文本负载（不含 turn.end 等非流式事件）。 */
+  const textOrder = () =>
+    relay.sent
+      .filter(
+        (m) =>
+          m.type === "event" &&
+          (m.payload?.topic === "assistant.delta" ||
+            m.payload?.topic === "assistant.reasoningDelta"),
+      )
+      .map((m) => m.payload?.data?.text);
+  /** 推一个流式 chunk。 */
+  const push = (kind, text) =>
+    ctx.emit("agent/assistant-stream", {
+      agent: { session: { id: SID } },
+      frame: { type: "chunk", chunk: { type: kind, text } },
+    });
+
+  // --- ① 定时器冲刷（不等 idle）：跨类型顺序必须与原始 chunk 顺序一致 ---
+  relay.sent.length = 0;
+  push("reasoning-delta", "R1");
+  push("text-delta", "T1");
+  push("reasoning-delta", "R2");
+  push("text-delta", "T2");
+  push("text-delta", "T3"); // 与 T2 相邻同类 → 合并成一块
+  push("reasoning-delta", "R3");
+  await new Promise((r) => setTimeout(r, 300));
+  check(
+    "流式顺序（定时器冲刷）：topic 序列按原始 chunk 顺序",
+    JSON.stringify(topicOrder()) ===
+      JSON.stringify([
+        "assistant.reasoningDelta",
+        "assistant.delta",
+        "assistant.reasoningDelta",
+        "assistant.delta",
+        "assistant.reasoningDelta",
+      ]),
+    JSON.stringify(topicOrder()),
+  );
+  check(
+    "流式顺序（定时器冲刷）：文本序列按原始 chunk 顺序",
+    JSON.stringify(textOrder()) === JSON.stringify(["R1", "T1", "R2", "T2T3", "R3"]),
+    JSON.stringify(textOrder()),
+  );
+  check(
+    "流式顺序（定时器冲刷）：相邻同类块合并、异类不合并",
+    topicOrder().length === 5 &&
+      relay.sent
+        .filter((m) => m.type === "event")
+        .every((m) => m.payload?.data?.text !== "T2" && m.payload?.data?.text !== "T3"),
+    JSON.stringify(textOrder()),
+  );
+
+  // --- ② idle：先统一冲刷（保序），再发 turn.end ---
+  relay.sent.length = 0;
+  push("reasoning-delta", "R1");
+  push("text-delta", "T1");
+  ctx.emit("agent/status", { agent: { session: { id: SID } }, status: "idle" });
+  const idleOrder = topicOrder();
+  check(
+    "流式顺序（idle 冲刷）：reasoning 在 text 之前（跨 topic 全局顺序）",
+    idleOrder[0] === "assistant.reasoningDelta" && idleOrder[1] === "assistant.delta",
+    JSON.stringify(idleOrder),
+  );
+  check(
+    "流式顺序（idle 冲刷）：turn.end 是最后一条",
+    idleOrder.length === 3 && idleOrder[idleOrder.length - 1] === "turn.end",
+    JSON.stringify(idleOrder),
+  );
+  check(
+    "流式顺序（idle 冲刷）：turn.end 之前已冲刷完正文与思考",
+    JSON.stringify(textOrder()) === JSON.stringify(["R1", "T1"]),
+    JSON.stringify(textOrder()),
+  );
+
+  // --- ③ error：同 idle 口径（先统一冲刷保序，再 turn.end） ---
+  relay.sent.length = 0;
+  push("reasoning-delta", "R1");
+  push("text-delta", "T1");
+  ctx.emit("agent/error", { agent: { session: { id: SID } }, error: { message: "boom" } });
+  const errOrder = topicOrder();
+  check(
+    "流式顺序（error 冲刷）：reasoning 在 text 之前且 turn.end 最后",
+    errOrder[0] === "assistant.reasoningDelta" &&
+      errOrder[1] === "assistant.delta" &&
+      errOrder[errOrder.length - 1] === "turn.end",
+    JSON.stringify(errOrder),
+  );
+  const errEnd = eventsOf(relay.sent, "turn.end")[0];
+  check("流式顺序（error 冲刷）：turn.end 带 status=error", errEnd?.status === "error", JSON.stringify(errEnd));
+
+  // --- ④ 内存上限：正文 + 思考**合计**有界（统一队列，不是各 64KiB） ---
+  relay.sent.length = 0;
+  const bigR = "r".repeat(40_000);
+  const bigT = "t".repeat(40_000);
+  push("reasoning-delta", bigR);
+  push("text-delta", bigT);
+  ctx.emit("agent/status", { agent: { session: { id: SID } }, status: "idle" });
+  const bigTexts = textOrder();
+  check(
+    "流式缓冲：正文+思考合计 ≤64KiB（统一上限，不各自一份）",
+    bigTexts.join("").length <= 65_536,
+    String(bigTexts.join("").length),
+  );
+  check(
+    "流式缓冲：超限时丢最旧的、保留最新的（且顺序不变）",
+    bigTexts.length === 2 &&
+      bigTexts[0]?.length === 25_536 &&
+      bigTexts[0]?.startsWith("r") &&
+      bigTexts[1] === bigT,
+    JSON.stringify(bigTexts.map((t) => t.length)),
+  );
+
+  // --- ⑤ assistant 流 end：后续事件不得越过仍在缓冲里的正文 ---
+  relay.sent.length = 0;
+  push("text-delta", "T-before-end");
+  ctx.emit("agent/assistant-stream", {
+    agent: { session: { id: SID } },
+    frame: { type: "end", attemptId: "attempt-order", turn: 1, step: 1, index: 0, outcome: { seq: 30, messageId: "m-order" } },
+  });
+  check(
+    "流式顺序（assistant end）：立即冲刷待发正文",
+    JSON.stringify(topicOrder()) === JSON.stringify(["assistant.delta"]),
+    JSON.stringify(topicOrder()),
+  );
+
+  // --- ⑥ 即时工具事件：先冲刷之前的文本，再发 tool.call ---
+  relay.sent.length = 0;
+  push("text-delta", "T-before-tool");
+  ctx.emit("session/event", { id: SID }, {
+    type: "tool/call",
+    seq: 31,
+    time: 4000,
+    data: { turn: 1, step: 2, callId: "call-order", name: "read", arguments: "{}" },
+  });
+  const toolOrder = topicOrder();
+  check(
+    "流式顺序（tool.call）：正文先于工具事件，不越过缓冲",
+    toolOrder.length === 2 && toolOrder[0] === "assistant.delta" && toolOrder[1] === "tool.call",
+    JSON.stringify(toolOrder),
+  );
+
+  // --- ⑦ dispose：定时器与队列都清掉，之后不得再出站 ---
+  relay.sent.length = 0;
+  push("reasoning-delta", "RX");
+  push("text-delta", "TX");
+  bridge.dispose();
+  await new Promise((r) => setTimeout(r, 300));
+  check(
+    "dispose：待发块不再冲刷（无出站）",
+    relay.sent.filter((m) => m.type === "event").length === 0,
+    JSON.stringify(relay.sent),
+  );
+  // dispose 后再来的 chunk 也不得产生任何出站
+  push("reasoning-delta", "RY");
+  push("text-delta", "TY");
+  ctx.emit("agent/status", { agent: { session: { id: SID } }, status: "idle" });
+  await new Promise((r) => setTimeout(r, 50));
+  check(
+    "dispose：之后不再产生任何出站",
+    relay.sent.filter((m) => m.type === "event").length === 0,
+    JSON.stringify(relay.sent),
+  );
 }
 
 // ===========================================================================
@@ -873,7 +1285,7 @@ function eventsOf(sent, topic) {
     },
   };
   const ctx = makeCtx({ sessionController });
-  const bridge = new HostBridge({ ctx, relay, push: { configured: false, notify: async () => ({ ok: true }) }, config: CFG, log });
+  const bridge = makeBridge(ctx, relay);
   bridge.attach();
 
   // capabilities：efforts 目录
@@ -974,7 +1386,7 @@ function eventsOf(sent, topic) {
     },
   };
   const ctx = makeCtx({ sessionController });
-  const bridge = new HostBridge({ ctx, relay, push: { configured: false, notify: async () => ({ ok: true }) }, config: CFG, log });
+  const bridge = makeBridge(ctx, relay);
   bridge.attach();
 
   // 1) pending（用户显式切换过、尚未被请求消费）优先
@@ -1242,13 +1654,7 @@ function eventsOf(sent, topic) {
       async list() { return { items: [] }; },
     },
   });
-  const imgBridge = new HostBridge({
-    ctx: imgCtx,
-    relay: imgRelay,
-    push: { configured: false, notify: async () => ({ ok: true }) },
-    config: CFG,
-    log,
-  });
+  const imgBridge = makeBridge(imgCtx, imgRelay);
   imgBridge.attach();
 
   // 缩略图走假 sharp（可控体积）

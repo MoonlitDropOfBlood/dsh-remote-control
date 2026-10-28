@@ -216,6 +216,12 @@ export interface DshrcValue {
   title?: string;
   cwd?: string;
   accepted?: boolean;
+  /**
+   * session.prompt 回包的**实际**投递行为（契约 §5.1 v1.1.2）：'queue' | 'steer'。
+   * 主机拒绝插话时插件自动退回 queue（消息不丢），此时回包标 queue。
+   * 旧插件不回该字段 → undefined（调用方按 'queue' 保守兜底）。
+   */
+  mode?: DshrcPromptMode;
   cancelled?: boolean;
   applied?: boolean;
   registered?: boolean;
@@ -438,6 +444,18 @@ export interface DshrcCreateResult {
   agentPreset: string;
   model?: DshrcModelSelection;
   modelError?: string;
+}
+
+/**
+ * session.prompt 响应 value（契约 §5.1 v1.1.2）：{accepted: bool, mode:'queue'|'steer'}。
+ *  - accepted：主机是否接受这条提示词；
+ *  - mode：**实际**使用的投递行为（'queue' = 排到当前 turn 之后；'steer' = 插话进当前 turn）。
+ *    主机拒绝插话时插件自动退回 queue（消息不丢），回包标 queue。
+ *    旧插件不回 mode → 按 'queue' 保守兜底（繁忙时不把消息乐观插进主时间线）。
+ */
+export interface DshrcPromptResult {
+  accepted: boolean;
+  mode: DshrcPromptMode;
 }
 
 /** result.error（契约 §5）。 */

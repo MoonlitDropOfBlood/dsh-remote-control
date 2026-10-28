@@ -125,7 +125,8 @@ grep -rnE "@State|@Prop|@Link|@ObjectLink|@Observed[^V]|@Provide|@Consume|@Watch
   保留 cwd/model。
 - 新建页**不填标题**：首屏输入首条任务，工作目录/模型+强度（ModelFieldCard 一卡两行）/模式/权限都用
   Select；强度档位 = 所选模型 `efforts`（首项「默认」= 不提交 reasoningEffort），换模型重置为该模型
-  默认档；目录候选 = 「默认目录」+ 现有会话 cwd 去重。create 成功但 prompt 失败也要进详情提示重试。
+  默认档；目录候选 = 「默认目录」（Host `~/.dsh/remote`，空 cwd 由插件解析并建目录）
+  + 现有会话 cwd 去重。create 成功但 prompt 失败也要进详情提示重试。
 
 ### 会话中切换模型 / 思考强度（契约 §5.8 v1.0.8）
 - 入口在**详情页输入框旁的模型胶囊**（对齐各家 Harness 习惯；one-shot 只读会话随输入条一起隐藏），

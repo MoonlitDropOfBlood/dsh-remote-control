@@ -457,7 +457,7 @@ export struct NewSessionPage {
           this.taskCard()
           SelectFieldCard({
             label: '工作目录',
-            hint: '会话在主机上的工作位置，留空用主机默认目录',
+            hint: '会话在主机上的工作位置，默认使用 ~/.dsh/remote',
             items: this.dirItems(),
             selectedId: this.selectedCwd,
             onSelect: (id: string): void => {

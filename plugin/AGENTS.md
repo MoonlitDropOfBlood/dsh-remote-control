@@ -513,7 +513,10 @@ Remote 方法（返回 `{ok:true,value}` 或 `{ok:false,error:{code,message}}`�
   （与 PC 在任意目录新建一样 = 未分组）。
 - `resolveByPath` **不创建**工作区、不改注册表；目录不存在会 reject → 兜底回 `cwd`。
   任何异常都**不得**让 `session.create` 失败（归组是增强，不是必需）。
-- wire 协议不变（客户端仍只传 `cwd`），归组是插件内部行为。
+- wire 形状不变（客户端仍只传 `cwd`），归组是插件内部行为。
+- **默认目录**：`cwd` 缺省/空串不再交给宿主回退到 `process.cwd()`；插件先解析为
+  Host 用户主目录下的 `~/.dsh/remote` 并 recursive mkdir，再对解析后的路径走上述
+  `resolveByPath` 归组。目录创建失败直接回错，不静默回退；不自动注册工作区。
 - **注意**：宿主**没有**「把已有会话挂进工作区」的 API（`insertSessionBefore` 只能重排已有成员），
   按 cwd 自动归账只在注册表**首次初始化**跑一次 → **历史未分组会话无法自动归组**。
 

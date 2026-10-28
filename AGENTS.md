@@ -24,7 +24,7 @@
 | [relay/](relay/AGENTS.md) | Node.js | 中继服务器：hello 校验、转发、离线缓存、限速、心跳 | `npm test`（16 用例） |
 | [app/](app/AGENTS.md) | ArkTS | HarmonyOS 手机 App（DevEco 工程） | `devecocli build` + linter-cli 0 ERROR |
 | [e2e/](e2e/AGENTS.md) | Node.js | 协议参考实现 + mock 两端 + 自动化联调 | `node auto-test.mjs` |
-| [docs/PROTOCOL.md](docs/PROTOCOL.md) | — | **线协议契约 v1.1.4（唯一事实源，三方共同合同）** | 改协议必须先改它 |
+| [docs/PROTOCOL.md](docs/PROTOCOL.md) | — | **线协议契约 v1.1.6（唯一事实源，三方共同合同）** | 改协议必须先改它 |
 
 ## 快速开始
 
@@ -73,7 +73,10 @@ cd relay && npm install && node server.js            # 中继（默认 8787；�
    （§5.10.2）+ 排队事件 session.queue（§5.1/§5.2）→ **v1.1.3 抗重放的会话纪元**
    （§3.4.1 hello 证明 v2 + AAD 绑定 sid + 纪元单调性；§3.4.2 中继原生 TLS）
    → **v1.1.4 手机端体验对齐 PC**：`session.model` 改读宿主 `modelSelection` 持久投影
-   （与 PC composer 同源）+ 移除 `system.message` 桥接 + `session.create` 工作区归组）。
+   （与 PC composer 同源）+ 移除 `system.message` 桥接 + `session.create` 工作区归组
+   → **v1.1.6 直播保序 + 默认目录**：正文/思考增量共用保序队列、`turn.end` 永远最后、
+   工具/图片事件不越过未冲刷文本（§5.2 末注）；`session.create` 空 `cwd` 默认
+   `~/.dsh/remote`（解析 + 建目录 + 按 v1.1.4 ③ 归组））。
    改任何一端的 wire 行为必须先改契约，三方同步。
 2. **KAT 是硬验收**：契约 §7 测试向量（key/iv/ct/tag/hmac）在 plugin 与 app 各有一份自测，
    连接建立前执行，失败禁连。加密链路每一环（HKDF/AES/HMAC）都必须进 KAT。

@@ -17,7 +17,13 @@ import { pasteboard } from '@kit.BasicServicesKit';
 import { promptAction } from '@kit.ArkUI';
 import { HRouter } from 'hrouter';
 import { dshrcLink } from '../model/link';
-import { DshrcEffortOption, DshrcModelOption, DshrcModelSelection, DshrcQueueItem } from '../model/protocol';
+import {
+  DshrcEffortOption,
+  DshrcModelOption,
+  DshrcModelSelection,
+  DshrcPromptResult,
+  DshrcQueueItem
+} from '../model/protocol';
 import { SessionDetailParam, goBack, openSessionDetail } from '../model/routes';
 import {
   ApprovalCard,
@@ -883,7 +889,21 @@ export struct SessionDetailPage {
     .padding({ left: SP_3, right: SP_3, top: SP_2 })
   }
 
-  /** 发送提示词（乐观上屏；根会话走 session.prompt，subagent 走 session.subagentPrompt §5.1 v1.0.5）。 */
+  /**
+   * 发送提示词（根会话走 session.prompt，subagent 走 session.subagentPrompt §5.1 v1.0.5）。
+   *
+   * 上屏策略（消息顺序修复「繁忙排队时用户消息被插进当前回复中间」）：
+   *  - **空闲**（agent 没在跑）：即时乐观上屏（与原行为一致）。
+   *  - **繁忙 + 实际 queue**（宿主按 DSH 设置排队；消息**还没**进宿主时间线）：
+   *    **不**乐观插进主时间线——插进去会落在当前回复中间，且后续 assistant.delta
+   *    只看最后一项 → 另起一个 assistant 气泡。排队消息由宿主 session.queue 展示，
+   *    被消费后由历史权威展示。
+   *  - **繁忙 + 实际 steer**（插话进当前 turn，宿主已接受）：accepted 之后乐观上屏。
+   *  - subagent：没有 queue/steer 之分（契约 §5.1 v1.0.5）→ 与现状一致，即时乐观上屏。
+   *
+   * 异步回包期间用户可能切走会话：上屏一律按**发送时的 sid** 写缓存
+   * （store.notifyActive 只投影活动会话，不会写串到别的会话）。
+   */
   private send(): void {
     const text: string = this.draft.trim();
     if (text.length === 0 || this.sessionId.length === 0) {
@@ -893,32 +913,61 @@ export struct SessionDetailPage {
       promptAction.showToast({ message: '未连接，请先在配对页连接中继', duration: 2500 });
       return;
     }
-    const row: SessionRow | undefined = this.store.rowOf(this.sessionId);
+    // 捕获原会话 id：主机回包是异步的，期间用户可能已经切到别的会话
+    const sid: string = this.sessionId;
+    const row: SessionRow | undefined = this.store.rowOf(sid);
     const parent: string = row !== undefined ? row.parentSessionId : '';
     // v1.1.2：**不传 mode** —— 投递行为由宿主设置决定（插件按 DSH 的
     // 「繁忙时的发送行为」解析；插话被拒时插件自动退回排队）。
-    // 手机端只负责把文本发出去。
-    const running: boolean = this.agentRunning();
-    this.store.pushLocalUser(this.sessionId, text);
+    // 手机端只负责把文本发出去；回包里的 mode 是**实际**使用的投递行为。
+    const running: boolean = this.store.runningOf(sid);
     this.draft = '';
-    const sent: Promise<boolean> = parent.length > 0 ?
-      dshrcLink.subagentPrompt(parent, this.sessionId, text) :
-      dshrcLink.sessionPrompt(this.sessionId, text);
-    sent.then((accepted: boolean): void => {
-      if (!accepted) {
+    if (parent.length > 0) {
+      // subagent：即时乐观上屏（与现状一致）
+      this.store.pushLocalUser(sid, text);
+      dshrcLink.subagentPrompt(parent, sid, text).then((accepted: boolean): void => {
+        if (!accepted) {
+          promptAction.showToast({ message: '主机未接受该提示词', duration: 2500 });
+          return;
+        }
+        promptAction.showToast({ message: '已发送', duration: 1500 });
+      }).catch((e: Error): void => {
+        promptAction.showToast({ message: '发送失败：' + e.message, duration: 3000 });
+      });
+      this.followBottom = true;
+      this.scrollToBottom();
+      return;
+    }
+    if (!running) {
+      // 空闲：即时乐观上屏（与原行为一致）
+      this.store.pushLocalUser(sid, text);
+      dshrcLink.sessionPromptResult(sid, text).then((res: DshrcPromptResult): void => {
+        if (!res.accepted) {
+          promptAction.showToast({ message: '主机未接受该提示词', duration: 2500 });
+          return;
+        }
+        promptAction.showToast({ message: '已发送', duration: 1500 });
+      }).catch((e: Error): void => {
+        promptAction.showToast({ message: '发送失败：' + e.message, duration: 3000 });
+      });
+      this.followBottom = true;
+      this.scrollToBottom();
+      return;
+    }
+    // 繁忙：等主机回包（accepted + 实际 mode）再决定是否乐观上屏
+    dshrcLink.sessionPromptResult(sid, text).then((res: DshrcPromptResult): void => {
+      if (!res.accepted) {
         promptAction.showToast({ message: '主机未接受该提示词', duration: 2500 });
         return;
       }
-      if (parent.length > 0) {
-        return; // subagent 没有 queue/steer 之分（契约 §5.1 v1.0.5）
+      if (res.mode === 'steer') {
+        // 繁忙插话也不乐观插入主时间线：宿主可能还在输出当前 turn，本地插入会把
+        // 同一条流式回复切成两个气泡。next-step 被消费后由 queue 快照触发权威历史补拉。
+        promptAction.showToast({ message: '已插话发送', duration: 1500 });
+        return;
       }
-      if (running) {
-        // 明确告诉用户「发出去了」，别让人以为没发出去；
-        // 到底排队还是插话由宿主设置决定（手机端只是跟随）。
-        promptAction.showToast({ message: '已发送', duration: 1500 });
-      } else {
-        promptAction.showToast({ message: '已发送', duration: 1500 });
-      }
+      // 繁忙 queue / steer 一律等宿主消费后上屏，不在当前回复中间猜一个位置。
+      promptAction.showToast({ message: '已排队发送', duration: 1500 });
     }).catch((e: Error): void => {
       promptAction.showToast({ message: '发送失败：' + e.message, duration: 3000 });
     });

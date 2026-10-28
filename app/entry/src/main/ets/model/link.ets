@@ -39,6 +39,7 @@ import {
   DshrcCreateResult,
   DshrcModelSelection,
   DshrcPromptMode,
+  DshrcPromptResult,
   DshrcQueueItem,
   DshrcSubagentInfo,
   DshrcRelayFrame,
@@ -1227,14 +1228,30 @@ export class DshrcLink {
   }
 
   /**
-   * session.prompt（§5.1 v1.1.2）：发送提示词；value.accepted。
-   *  **不带 mode**——投递行为（排队/插话）由宿主设置决定，手机端只跟随
+   * session.prompt（§5.1 v1.1.2）：发送提示词，返回**结构化**回包。
+   *  value = {accepted: bool, mode:'queue'|'steer'}——mode 是**实际**使用的投递行为
+   *  （主机拒绝插话时插件自动退回 queue，消息不丢）。
+   *  请求**不带 mode**：投递行为由宿主设置决定，手机端只跟随
    *  （用户在 DSH 设置里改「繁忙时的发送行为」，手机端随之变化）。
+   *  旧插件不回 mode → 按 'queue' 保守兜底（繁忙时不把消息乐观插进主时间线）。
+   */
+  sessionPromptResult(sessionId: string, text: string): Promise<DshrcPromptResult> {
+    const p: DshrcPayload = { sessionId: sessionId, text: text };
+    return this.request(MSG_SESSION_PROMPT, p).then((v: DshrcValue): DshrcPromptResult => {
+      const raw: DshrcPromptMode | undefined = v.mode;
+      const mode: DshrcPromptMode = raw === 'steer' ? 'steer' : 'queue';
+      const res: DshrcPromptResult = { accepted: v.accepted === true, mode: mode };
+      return res;
+    });
+  }
+
+  /**
+   * session.prompt 的兼容入口：只要 accepted（新建会话页用）。
+   * 需要知道**实际**投递行为（queue/steer）请用 sessionPromptResult。
    */
   sessionPrompt(sessionId: string, text: string): Promise<boolean> {
-    const p: DshrcPayload = { sessionId: sessionId, text: text };
-    return this.request(MSG_SESSION_PROMPT, p).then((v: DshrcValue): boolean => {
-      return v.accepted === true;
+    return this.sessionPromptResult(sessionId, text).then((r: DshrcPromptResult): boolean => {
+      return r.accepted;
     });
   }
 

@@ -349,6 +349,8 @@ export class SessionStore {
   @Trace timeline: TimelineItem[] = [];
   // ---- 历史消息（契约 §5.1 session.history，v1.0.4；活动会话投影）----
   @Trace historyLoading: boolean = false;
+  /** 历史请求在途时被合并的尾随刷新：sid → 是否向前翻页（最新页优先）。 */
+  private pendingHistory: Map<string, boolean> = new Map<string, boolean>();
   @Trace historyHasMore: boolean = false;
   @Trace historyLoaded: boolean = false;
   // ---- 子代理目录（契约 §5.6 v1.0.5；活动会话投影 + 每父会话缓存）----
@@ -469,6 +471,7 @@ export class SessionStore {
       }
     }
     if (s === 'stopped' || s === 'idle') {
+      this.pendingHistory.clear();
       // 断开/切换远程：清掉当前会话的投影，避免展示上一台主机的时间线
       this.activeId = '';
       this.timeline = [];
@@ -677,8 +680,28 @@ export class SessionStore {
         items.push(item);
       }
     }
+    const nextIds: Set<string> = new Set<string>();
+    for (let i: number = 0; i < items.length; i++) {
+      nextIds.add(items[i].itemId);
+    }
+    let removed: boolean = false;
+    const previous: DshrcQueueItem[] | undefined = this.queueCache.get(sid);
+    if (previous !== undefined) {
+      for (let i: number = 0; i < previous.length; i++) {
+        if (!nextIds.has(previous[i].itemId)) {
+          removed = true;
+          break;
+        }
+      }
+    }
     this.queueCache.set(sid, items);
     this.queueVersion = this.queueVersion + 1;
+    if (removed && this.link.getState() === 'online') {
+      // queue 项消失有两种原因：被宿主消费（user/message）或被取消。
+      // 前者必须把权威用户消息补进主时间线；后者多拉一次历史无副作用。
+      // 若此时已有历史请求在途，loadHistory 会登记尾随刷新，不会拿到旧页后停住。
+      this.loadHistory(sid, false);
+    }
   }
 
   /** 待处理的审批 + 提问总数（列表页角标）。 */
@@ -914,7 +937,14 @@ export class SessionStore {
   }
 
   loadHistory(sid: string, prepend: boolean): Promise<void> {
-    if (sid.length === 0 || this.link.getState() !== 'online' || this.historyLoading) {
+    if (sid.length === 0 || this.link.getState() !== 'online') {
+      return Promise.resolve();
+    }
+    if (this.historyLoading) {
+      // 不丢刷新意图：当前页可能是在 queue 项被消费前发出的，直接跳过会永远
+      // 缺这条权威用户消息。按 sid 合并，完成后自动再拉一次；最新页优先。
+      const previous: boolean | undefined = this.pendingHistory.get(sid);
+      this.pendingHistory.set(sid, previous === undefined ? prepend : previous && prepend);
       return Promise.resolve();
     }
     const meta: HistMeta = this.metaOf(sid);
@@ -935,18 +965,37 @@ export class SessionStore {
         this.historyLoaded = true;
       }
       this.historyLoading = false;
+      this.runNextHistory();
     }).catch((e: Error): void => {
       this.historyLoading = false;
       this.lastError = '加载历史失败：' + e.message;
       logDshrc(TAG, 'warn', 'session.history failed: ' + e.message);
+      this.runNextHistory();
     });
+  }
+
+  /** 串行执行一个在途期间合并下来的尾随历史刷新。 */
+  private runNextHistory(): void {
+    const keys: string[] = [];
+    this.pendingHistory.forEach((prepend: boolean, sid: string): void => {
+      keys.push(sid);
+    });
+    if (keys.length === 0) {
+      return;
+    }
+    const sid: string = keys[0];
+    const prepend: boolean = this.pendingHistory.get(sid) ?? false;
+    this.pendingHistory.delete(sid);
+    this.loadHistory(sid, prepend);
   }
 
   /**
    * 历史页并入缓存（契约 §5.7 v1.0.6：消息 + 工作步骤同轴合并，用 seq 对齐）：
    *  1) durable 项（消息/步骤）按页覆盖区间判重——与本页 [pageMin,pageMax] 重叠的旧副本摘除，
    *     统一按 seq 升序重排（页内可能含被过滤的非聊天事件，不能只按单点 seq 比对）；
-   *  2) 直播项（seq<0）：非 prepend 时若与本页某条历史同 role+text 的消息，视为同一句话，丢弃直播副本；
+   *  2) 直播项（seq<0）：非 prepend 时，若本页中**相对旧缓存新增**的 durable 消息与它同 role+text，
+   *     视为同一句话，丢弃直播副本（一一对应：一条 durable 最多覆盖一个直播副本；
+   *     旧副本不参与配对——否则「旧历史里的同文本」会误删后来出现的新 live/optimistic 消息）；
    *     直播步骤若本页已含同 callId 的持久步骤，同样丢弃（同一调用不显示两遍）；
    *  3) 组装：prepend=旧页在最前；否则历史接在旧 durable 之后；直播项永远在最后（到达顺序）。
    */
@@ -975,6 +1024,13 @@ export class SessionStore {
     }
     const durable: TimelineItem[] = [];
     const live: TimelineItem[] = [];
+    // 消息顺序修复「旧历史里同文本的 durable 误删后来出现的 live/optimistic 消息」：
+    // 覆盖判定只认「本页中相对旧缓存**新增**的 durable 项」，且与直播项**一一对应**
+    // （一条 durable 最多覆盖一个直播副本）——旧副本不参与配对。
+    let coveredLive: Set<string> = new Set<string>();
+    if (!prepend) {
+      coveredLive = this.coveredLiveIds(items, messages);
+    }
     for (let k: number = 0; k < items.length; k++) {
       const it: TimelineItem = items[k];
       if (it.seq >= 0) {
@@ -985,8 +1041,8 @@ export class SessionStore {
         continue;
       }
       if (!prepend && (it.isMessage() || it.isReasoning()) && it.text.length > 0 &&
-        this.textCoveredByPage(messages, it)) {
-        continue; // 直播副本已被 durable 历史覆盖，同一句话不显示两遍
+        coveredLive.has(it.id)) {
+        continue; // 直播副本已被**新增**的 durable 历史覆盖，同一句话不显示两遍
       }
       if (!prepend && it.isMessage() && it.text.length === 0 && it.images.length > 0 &&
         this.imagesCoveredByPage(messages, it)) {
@@ -1121,14 +1177,90 @@ export class SessionStore {
     }
   }
 
-  /** 直播气泡是否已被本页历史覆盖（存在同 role+text 的 durable 消息）。 */
-  private textCoveredByPage(messages: DshrcChatMessage[], it: TimelineItem): boolean {
-    for (let i: number = 0; i < messages.length; i++) {
-      if (messages[i].role === it.role && messages[i].text === it.text) {
-        return true;
+  /**
+   * 本页里「相对旧缓存**新增**」的 durable 消息候选（= 有资格覆盖直播副本的那些）。
+   *
+   * 为什么不能只看 role+text（消息顺序修复）：
+   *  旧历史里有一条同文本消息时，它会命中任何同文本的直播/乐观消息 → **新发的那条被误删**
+   *  （用户新发的消息凭空消失，只剩旧的那条）。故候选必须同时满足：
+   *   1) id 不在旧缓存的 durable id 集合里（不是我们已经见过的旧副本）；
+   *   2) seq 比旧缓存里最大的 durable seq 更新（更新的才可能是「刚被宿主持久化的那条」）。
+   * 边界：旧缓存里还没有 durable 时，没有 seq 基线，退化为整页一对一 reconcile；
+   *  否则首屏直播副本会因为没有「新增候选」而永久重复。后续刷新已有基线后，
+   *  仍只认新增 durable，旧同文本消息不会误删后来的 live。
+   */
+  private newDurableCandidates(oldItems: TimelineItem[], page: DshrcChatMessage[]): DshrcChatMessage[] {
+    const knownIds: Set<string> = new Set<string>();
+    let knownMaxSeq: number = -1;
+    for (let i: number = 0; i < oldItems.length; i++) {
+      const it: TimelineItem = oldItems[i];
+      if (it.seq >= 0) {
+        knownIds.add(it.id);
+        if (it.seq > knownMaxSeq) {
+          knownMaxSeq = it.seq;
+        }
       }
     }
-    return false;
+    const out: DshrcChatMessage[] = [];
+    for (let j: number = 0; j < page.length; j++) {
+      const msg: DshrcChatMessage = page[j];
+      if (knownIds.has(msg.id)) {
+        continue; // 旧副本：已经见过，不参与覆盖（否则同文本的新 live 消息会被误删）
+      }
+      if (msg.seq <= knownMaxSeq) {
+        continue; // 落在已知区间内：不是新持久化的那一条
+      }
+      out.push(msg);
+    }
+    return out;
+  }
+
+  /**
+   * 计算「被新增 durable 覆盖」的直播项 id 集合（一一对应 + 消费）。
+   *
+   * 配对顺序：直播项按**到达顺序**（旧→新），候选按 seq 升序
+   * （宿主持久化顺序 = 消息产生顺序）。同 role+text 的一一配对：
+   *  - 一条 durable 最多覆盖一个直播副本（候选被消费后不再参与）；
+   *  - 后来出现的那条同文本 live 消息不会被更早的 durable 顶掉
+   *    （连续两条同文本时，旧的直播项先被覆盖，新的那条留着）。
+   */
+  private coveredLiveIds(oldItems: TimelineItem[], page: DshrcChatMessage[]): Set<string> {
+    const covered: Set<string> = new Set<string>();
+    const candidates: DshrcChatMessage[] = this.newDurableCandidates(oldItems, page);
+    if (candidates.length === 0) {
+      return covered;
+    }
+    const ordered: DshrcChatMessage[] = candidates.slice();
+    ordered.sort((a: DshrcChatMessage, b: DshrcChatMessage): number => a.seq - b.seq);
+    const used: boolean[] = [];
+    for (let c: number = 0; c < ordered.length; c++) {
+      used.push(false);
+    }
+    // 直播项按到达顺序遍历（缓存数组里 live 段即到达顺序）
+    for (let i: number = 0; i < oldItems.length; i++) {
+      const it: TimelineItem = oldItems[i];
+      if (it.seq >= 0) {
+        continue; // durable 不参与配对
+      }
+      if (!it.isMessage() && !it.isReasoning()) {
+        continue;
+      }
+      if (it.text.length === 0) {
+        continue;
+      }
+      for (let c2: number = 0; c2 < ordered.length; c2++) {
+        if (used[c2]) {
+          continue; // 该候选已被消费（一条 durable 最多覆盖一个直播副本）
+        }
+        const msg: DshrcChatMessage = ordered[c2];
+        if (msg.role === it.role && msg.text === it.text) {
+          used[c2] = true;
+          covered.add(it.id);
+          break;
+        }
+      }
+    }
+    return covered;
   }
 
   /** 直播步骤是否已被本页持久步骤覆盖（同 callId）。 */

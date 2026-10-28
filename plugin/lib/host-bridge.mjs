@@ -24,8 +24,9 @@
 //      生成缩略图，按 §5.10 的 assistant.image / image.fetch 通道发给手机。
 import { randomUUID, createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { readFile } from "node:fs/promises";
-import { hostname } from "node:os";
+import { mkdir, readFile } from "node:fs/promises";
+import { homedir, hostname } from "node:os";
+import { join } from "node:path";
 import { createRequire } from "node:module";
 import { msg, sanitizeEnvelope } from "./protocol.mjs";
 import { ASSISTANT_THROTTLE_PER_SEC } from "./config.mjs";
@@ -50,6 +51,23 @@ import {
  * 20MB 足够覆盖绝大多数截图/预览图。
  */
 const DELIVERED_MAX_BYTES = 20 * 1024 * 1024;
+
+/**
+ * 单会话待发流式文本的字符上限（正文 + 思考合计）。
+ *
+ * 流式缓冲按「保序队列」实现：同一 125ms 窗口内的块都受这个上限约束，
+ * 超了从**最旧**的内容开始丢（保留顺序，不丢新内容），
+ * 避免长时间运行 / 异常事件流把内存吃满。
+ */
+const STREAM_BUFFER_MAX_CHARS = 65_536;
+
+/**
+ * 单会话待发流式**块**数的上限。
+ *
+ * 块只在「类型切换」时新增，125ms 窗口内正常也就几条；但异常事件流
+ * （重连回放 / 高频交替）不该让块数无界增长——超了从最旧的块开始丢。
+ */
+const STREAM_BUFFER_MAX_BLOCKS = 256;
 
 /**
  * 单会话待执行消息的条数上限（契约 §5.2 session.queue）。
@@ -783,6 +801,34 @@ export function hostErrorOf(e, fallbackCode) {
   return { code, message: errText(e) };
 }
 
+/**
+ * 契约 §5.1 session.create：**默认工作目录**。
+ *
+ * 手机端不传 cwd（或传空串）时，不再让宿主回退到 DSH 后端的 process.cwd()，
+ * 而是解析为 Host 用户主目录下的 `.dsh/remote`（用 node:path.join 拼，
+ * Windows / POSIX 都对）。
+ * @param {string} [home] 用户主目录（默认 os.homedir()）
+ * @returns {string} 绝对路径
+ */
+export function defaultSessionCwd(home = homedir()) {
+  return join(home, ".dsh", "remote");
+}
+
+/**
+ * 契约 §5.1 session.create：解析手机端传来的 cwd。
+ *
+ * 缺省 / undefined / 空串 / trim 后空串 → 默认目录（`~/.dsh/remote`）；
+ * 其余按既有行为 trim 后返回；显式 cwd 不自动创建目录。
+ * @param {unknown} raw payload.cwd
+ * @param {string} [home] 用户主目录（默认 os.homedir()）
+ * @returns {{cwd:string, isDefault:boolean}}
+ */
+export function resolveSessionCwd(raw, home = homedir()) {
+  const explicit = typeof raw === "string" ? raw : "";
+  if (explicit.trim() !== "") return { cwd: explicit.trim(), isDefault: false };
+  return { cwd: defaultSessionCwd(home), isDefault: true };
+}
+
 /** result / error 信封（契约 §5）。 */
 function resultOf(m, value) {
   return msg("result", { id: m.id, ok: true, value });
@@ -802,9 +848,16 @@ export class HostBridge {
   #cfg;
   #log;
   #pluginVersion;
+  // v1.1.4：session.create 的默认工作目录基准（用户主目录）+ 建目录实现
+  // —— 二者都可注入，生产用 homedir() / fs.mkdir，测试用临时目录（不写真实 home）。
+  #homeDir;
+  #mkdir;
   #disposed = false; // dispose() 后禁止一切出站与拦截
-  #deltaBuf = new Map(); // sessionId -> { text, timer }（正文增量）
-  #reasoningBuf = new Map(); // sessionId -> { text, timer }（思考增量，v1.0.7 与正文分流）
+  // v1.1.x：每个 session 一个**统一保序**的流式缓冲（正文 + 思考共用一条队列）
+  // sessionId -> { blocks: [{kind:"text"|"reasoning", text}], timer }
+  // 同一 125ms 窗口内只合并**相邻同类**块；不同类各占一块 → 冲刷时严格按
+  // 原始 chunk 顺序发 assistant.delta / assistant.reasoningDelta（跨类型也保序）。
+  #streamBuf = new Map();
   #modelSelections = new Map(); // sessionId -> {provider, model, reasoningEffort?}（v1.0.8 内存态）
   #pending = new Map(); // askId -> { resolve, kind, sessionId, timer, abortHandler, signal }
   #titles = new Map(); // sessionId -> title（turn.end 推送文案用）
@@ -836,6 +889,8 @@ export class HostBridge {
    *   push: { notify:(req:object)=>Promise<{ok:boolean,reason?:string}>, configured:boolean, unavailableReason?:()=>string },
    *   config: any,
    *   log: (level:"info"|"warn"|"error", message:string, extra?:object)=>void,
+   *   homeDir?: string,   // v1.1.4：默认 cwd 的基准目录（默认 os.homedir()）
+   *   mkdir?: (p:string)=>Promise<unknown>,  // v1.1.4：建默认目录（默认 fs.mkdir recursive）
    * }} deps
    */
   constructor(deps) {
@@ -844,6 +899,12 @@ export class HostBridge {
     this.#push = deps.push;
     this.#cfg = deps.config;
     this.#log = deps.log;
+    this.#homeDir =
+      typeof deps.homeDir === "string" && deps.homeDir !== "" ? deps.homeDir : homedir();
+    this.#mkdir =
+      typeof deps.mkdir === "function"
+        ? deps.mkdir
+        : (p) => mkdir(p, { recursive: true });
     this.#pluginVersion = pluginVersion();
     this.#hostName = hostname();
     this.#dshVersion = dshVersion();
@@ -872,6 +933,8 @@ export class HostBridge {
       this.#queues.delete(key);
       this.#deliveredEntries.delete(key);
       this.#runningSessions.delete(key);
+      // 待发的流式增量也没意义了（定时器一并清掉，别在会话没了之后还出站）
+      this.#dropStream(key);
       this.#sendEvent("session.removed", { sessionId: key });
     });
     this.#on("api-session/status", (sessionId, running) => {
@@ -890,20 +953,27 @@ export class HostBridge {
 
     // agent/assistant-stream：文本增量与**思考增量分流**，按 sessionId 合并节流（≤8 条/秒）
     // v1.0.7：chunk.type==='reasoning-delta' → assistant.reasoningDelta（§5.2）
+    // v1.1.x：两者进**同一条保序队列**——原先两个独立缓冲 + 固定「先正文后思考」
+    // 的冲刷顺序会把 reasoning→text 的 wire 顺序倒过来（手机端按到达顺序渲染，
+    // 与冷启动历史「思考在前」不一致，用户看到正文跑到思考前面）。
     this.#on("agent/assistant-stream", (payload) => {
       try {
         const frame = payload?.frame;
-        if (!frame || frame.type !== "chunk") return;
+        if (!frame) return;
+        const sessionId = payload?.agent?.session?.id;
+        if (!sessionId) return;
+        // 一条 assistant 流结束时立即冲刷，后续 tool.call/result、图片等持久事件
+        // 不得越过尚未上屏的正文/思考。
+        if (frame.type === "end") {
+          this.#flushStream(String(sessionId));
+          return;
+        }
+        if (frame.type !== "chunk") return;
         const chunk = frame.chunk;
         if (!chunk || typeof chunk.text !== "string" || chunk.text === "") return;
         if (chunk.type !== "text-delta" && chunk.type !== "reasoning-delta") return;
-        const sessionId = payload?.agent?.session?.id;
-        if (!sessionId) return;
-        if (chunk.type === "reasoning-delta") {
-          this.#queueReasoning(String(sessionId), chunk.text);
-          return;
-        }
-        this.#queueDelta(String(sessionId), chunk.text);
+        // 正文与思考进**同一条保序队列**（v1.1.x）：跨类型的先后关系必须保住
+        this.#queueStream(String(sessionId), chunk.type === "reasoning-delta" ? "reasoning" : "text", chunk.text);
       } catch (e) {
         this.#log("warn", "assistant-stream bridge error", { error: errText(e) });
       }
@@ -915,8 +985,8 @@ export class HostBridge {
         const sessionId = payload?.agent?.session?.id;
         if (!sessionId) return;
         if (payload.status === "idle") {
-          this.#flushDelta(String(sessionId));
-          this.#flushReasoning(String(sessionId));
+          // 先统一冲刷全部待发块（正文 + 思考，**保持原始顺序**），再发 turn.end
+          this.#flushStream(String(sessionId));
           this.#sendEvent("turn.end", { sessionId: String(sessionId), status: "idle" });
           this.#maybeNotifyTurnEnd(String(sessionId));
         }
@@ -931,8 +1001,8 @@ export class HostBridge {
         if (!sessionId) return;
         const err = payload.error;
         const message = err && typeof err.message === "string" ? err.message : String(err);
-        this.#flushDelta(String(sessionId));
-        this.#flushReasoning(String(sessionId));
+        // 与 idle 同口径：先统一冲刷（保序），再发 turn.end
+        this.#flushStream(String(sessionId));
         this.#sendEvent("turn.end", { sessionId: String(sessionId), status: "error", error: message });
         this.#maybeNotifyTurnEnd(String(sessionId), message);
       } catch (e) {
@@ -954,12 +1024,18 @@ export class HostBridge {
       const type = event?.type;
       if (type === "tool/call") {
         const mapped = mapToolCallEvent(sessionId, event);
-        if (mapped !== null) this.#sendEvent("tool.call", mapped);
+        if (mapped !== null) {
+          this.#flushStream(sessionId);
+          this.#sendEvent("tool.call", mapped);
+        }
         return;
       }
       if (type === "tool/result") {
         const mapped = mapToolResultEvent(sessionId, event);
-        if (mapped !== null) this.#sendEvent("tool.result", mapped);
+        if (mapped !== null) {
+          this.#flushStream(sessionId);
+          this.#sendEvent("tool.result", mapped);
+        }
         return;
       }
       if (type === "model/selection") {
@@ -971,13 +1047,16 @@ export class HostBridge {
         return;
       }
       if (type === "assistant/message") {
-        // v1.0.9（§5.10）：助手消息里的图片 → 广播 assistant.image（带内联缩略图）
+        // v1.0.9（§5.10）：助手消息里的图片 → 广播 assistant.image（带内联缩略图）。
+        // 即便本条没有图片，也先把之前的流式文本/思考冲出去，保持时间线顺序。
+        this.#flushStream(sessionId);
         this.#emitAssistantImages(sessionId, event);
         return;
       }
       if (type === "deliverables/presented") {
         // present 工具投递的文件：宿主记的是**路径**，不是图片附件块 →
         // 不桥接的话手机端永远看不到这些图（用户反馈：桌面有、手机没有）。
+        this.#flushStream(sessionId);
         void this.#emitDeliveredImages(sessionId, event);
         return;
       }
@@ -1212,14 +1291,10 @@ export class HostBridge {
   /** 释放全部资源（定时器/待答项/监听）。 */
   dispose() {
     this.#disposed = true;
-    for (const b of this.#deltaBuf.values()) {
+    for (const b of this.#streamBuf.values()) {
       if (b.timer !== null) clearTimeout(b.timer);
     }
-    this.#deltaBuf.clear();
-    for (const b of this.#reasoningBuf.values()) {
-      if (b.timer !== null) clearTimeout(b.timer);
-    }
-    this.#reasoningBuf.clear();
+    this.#streamBuf.clear();
     for (const entry of this.#pending.values()) {
       if (entry.timer !== null) clearTimeout(entry.timer);
       if (entry.signal && entry.abortHandler) {
@@ -1606,58 +1681,101 @@ export class HostBridge {
     }
   }
 
-  // ---- assistant.delta 节流 -------------------------------------------------
+  // ---- assistant 流式增量：统一保序缓冲（正文 + 思考，v1.1.x）---------------
 
-  #queueDelta(sessionId, text) {
-    let b = this.#deltaBuf.get(sessionId);
+  /**
+   * 入队一个流式增量块。
+   *
+   * 规则：
+   *  - 正文（text）与思考（reasoning）进**同一条队列**，块按到达顺序排；
+   *  - 同一窗口内**只合并相邻同类**块（尾块同类就并进去）；
+   *  - 不同类**不跨块合并**——否则 reasoning 与 text 会糊成一条，
+   *    冲刷时无法还原原始先后顺序。
+   *
+   * @param {string} sessionId
+   * @param {"text"|"reasoning"} kind
+   * @param {string} text
+   */
+  #queueStream(sessionId, kind, text) {
+    if (this.#disposed) return; // dispose() 后不再产生任何出站
+    let b = this.#streamBuf.get(sessionId);
     if (b === undefined) {
-      b = { text: "", timer: null };
-      this.#deltaBuf.set(sessionId, b);
+      b = { blocks: [], timer: null };
+      this.#streamBuf.set(sessionId, b);
     }
-    b.text += text;
-    if (b.text.length > 65_536) b.text = b.text.slice(-65_536); // 内存上限
+    const last = b.blocks[b.blocks.length - 1];
+    if (last !== undefined && last.kind === kind) {
+      last.text += text;
+    } else {
+      b.blocks.push({ kind, text });
+    }
+    this.#trimStreamBuffer(b);
     if (b.timer === null) {
-      b.timer = setTimeout(() => this.#flushDelta(sessionId), Math.ceil(1000 / ASSISTANT_THROTTLE_PER_SEC));
+      b.timer = setTimeout(() => this.#flushStream(sessionId), Math.ceil(1000 / ASSISTANT_THROTTLE_PER_SEC));
     }
   }
 
-  #flushDelta(sessionId) {
-    const b = this.#deltaBuf.get(sessionId);
+  /**
+   * 内存上限：单会话待发文本（正文 + 思考合计）不超过 STREAM_BUFFER_MAX_CHARS。
+   *
+   * 超了从**最旧**的内容开始丢（保序：只丢头，不动类型顺序，也不丢新内容）。
+   * 块数另有 STREAM_BUFFER_MAX_BLOCKS 上限（类型频繁切换时的兜底）。
+   * @param {{blocks:{kind:string,text:string}[]}} b
+   */
+  #trimStreamBuffer(b) {
+    let total = 0;
+    for (const blk of b.blocks) total += blk.text.length;
+    let excess = total - STREAM_BUFFER_MAX_CHARS;
+    while (excess > 0 && b.blocks.length > 0) {
+      const first = b.blocks[0];
+      if (first.text.length <= excess) {
+        excess -= first.text.length;
+        b.blocks.shift();
+      } else {
+        first.text = first.text.slice(excess);
+        excess = 0;
+      }
+    }
+    while (b.blocks.length > STREAM_BUFFER_MAX_BLOCKS) b.blocks.shift();
+  }
+
+  /**
+   * 冲刷一个会话的全部待发块：**严格按原始 chunk 顺序**逐块发
+   * （assistant.delta / assistant.reasoningDelta），跨类型也保序。
+   * @param {string} sessionId
+   */
+  #flushStream(sessionId) {
+    const b = this.#streamBuf.get(sessionId);
     if (b === undefined) return;
     if (b.timer !== null) {
       clearTimeout(b.timer);
       b.timer = null;
     }
-    const text = b.text;
-    b.text = "";
-    if (text !== "") this.#sendEvent("assistant.delta", { sessionId, text });
-  }
-
-  // ---- assistant.reasoningDelta 节流（v1.0.7，与正文同口径 ≤8 条/秒）--------
-
-  #queueReasoning(sessionId, text) {
-    let b = this.#reasoningBuf.get(sessionId);
-    if (b === undefined) {
-      b = { text: "", timer: null };
-      this.#reasoningBuf.set(sessionId, b);
-    }
-    b.text += text;
-    if (b.text.length > 65_536) b.text = b.text.slice(-65_536); // 内存上限
-    if (b.timer === null) {
-      b.timer = setTimeout(() => this.#flushReasoning(sessionId), Math.ceil(1000 / ASSISTANT_THROTTLE_PER_SEC));
+    const blocks = b.blocks;
+    b.blocks = [];
+    // 空了就别占着 map（会话很多时避免无界增长）
+    if (this.#streamBuf.get(sessionId) === b) this.#streamBuf.delete(sessionId);
+    if (this.#disposed) return; // dispose() 后不再产生任何出站
+    for (const blk of blocks) {
+      if (blk.text === "") continue;
+      if (blk.kind === "reasoning") {
+        this.#sendEvent("assistant.reasoningDelta", { sessionId, text: blk.text });
+      } else {
+        this.#sendEvent("assistant.delta", { sessionId, text: blk.text });
+      }
     }
   }
 
-  #flushReasoning(sessionId) {
-    const b = this.#reasoningBuf.get(sessionId);
+  /** 丢弃某会话的待发块（会话没了）——清定时器 + 清队列。 */
+  #dropStream(sessionId) {
+    const b = this.#streamBuf.get(sessionId);
     if (b === undefined) return;
     if (b.timer !== null) {
       clearTimeout(b.timer);
       b.timer = null;
     }
-    const text = b.text;
-    b.text = "";
-    if (text !== "") this.#sendEvent("assistant.reasoningDelta", { sessionId, text });
+    b.blocks = [];
+    this.#streamBuf.delete(sessionId);
   }
 
   // ---- 业务请求分发（§5.1）---------------------------------------------------
@@ -2073,19 +2191,43 @@ export class HostBridge {
     try {
       const sc = this.#sc();
       const req = {};
-      if (typeof p.cwd === "string" && p.cwd !== "") {
-        // v1.1.4：cwd 若命中某个**已注册工作区**的目录，改传 `workspaceId`
-        // 让会话自动归到该工作区下面（与 PC 端「在工作区里新建」一致——
-        // PC 走 createInWorkspace → createNamed({workspaceId})）。
-        // 旧实现只传 cwd，宿主不会 attach 到任何工作区 → PC 上显示「未分组」。
-        // 未命中（普通目录）保持传 cwd，与 PC 在任意目录新建一样 = 未分组。
-        // resolveByPath 不创建工作区、不改写注册表；路径不存在会 reject → 兜底回 cwd。
-        const ws = await this.#resolveWorkspaceByCwd(p.cwd);
-        if (ws !== null) {
-          req.workspaceId = ws;
-        } else {
-          req.cwd = p.cwd;
+      // v1.1.4：cwd 缺省 / undefined / 空串 / trim 后空串时，**不再**交给宿主
+      // 回退到 DSH 后端的 process.cwd()——解析为 Host 用户主目录下的
+      // `~/.dsh/remote`，并**先确保目录存在**（失败直接回错，不静默回退）。
+      // 显式非空 cwd 保持原行为（不自动建目录）。
+      const { cwd, isDefault } = resolveSessionCwd(p.cwd, this.#homeDir);
+      if (isDefault) {
+        if (p.cwd !== undefined && p.cwd !== null && typeof p.cwd !== "string") {
+          this.#log("warn", "session.create got a non-string cwd; using the default directory", {
+            type: typeof p.cwd,
+          });
         }
+        try {
+          await this.#mkdir(cwd);
+        } catch (e) {
+          this.#log("error", "failed to create the default session directory", {
+            error: errText(e),
+          });
+          this.#reply(
+            m,
+            errorOf(m, "session-create-failed", "cannot create session directory: " + errText(e)),
+          );
+          return;
+        }
+      }
+      // v1.1.4：cwd 若命中某个**已注册工作区**的目录，改传 `workspaceId`
+      // 让会话自动归到该工作区下面（与 PC 端「在工作区里新建」一致——
+      // PC 走 createInWorkspace → createNamed({workspaceId})）。
+      // 旧实现只传 cwd，宿主不会 attach 到任何工作区 → PC 上显示「未分组」。
+      // 未命中（普通目录）保持传 cwd，与 PC 在任意目录新建一样 = 未分组。
+      // resolveByPath 不创建工作区、不改写注册表；路径不存在会 reject → 兜底回 cwd。
+      // 默认目录（~/.dsh/remote）同样走这条反查：已注册 → 传 workspaceId，
+      // 未注册 → 传该 cwd（**不自动注册工作区**）。
+      const ws = await this.#resolveWorkspaceByCwd(cwd);
+      if (ws !== null) {
+        req.workspaceId = ws;
+      } else {
+        req.cwd = cwd;
       }
       if (agentPreset !== "") req.agentPreset = agentPreset;
       let value;

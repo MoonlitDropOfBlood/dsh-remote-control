@@ -247,11 +247,11 @@ export function resolveEffortId(models: DshrcModelOption[], modelId: string): st
  */
 export function directoryItems(rows: SessionListItem[], selectedCwd: string): DshrcChoiceItem[] {
   const out: DshrcChoiceItem[] = [];
-  // 第一项：主机默认目录（id='' → 不传 cwd，host 用自己的默认工作目录）
+  // 第一项：主机默认目录（id='' → 不传 cwd，插件解析为主机的 ~/.dsh/remote 并确保目录存在）
   out.push({
     id: '',
     name: '默认目录',
-    description: '使用主机当前工作目录'
+    description: '默认使用 ~/.dsh/remote'
   });
   const seen: string[] = [];
   for (let i: number = 0; i < rows.length; i++) {

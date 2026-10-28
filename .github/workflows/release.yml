@@ -144,16 +144,38 @@ jobs:
           # 发版前生成的那份索引就是权威版本（npm 包里也是这一份）——
           # **不要在这里重新生成**，否则仓库副本与 npm 副本的时间戳会不一致。
           cp market/index.json /tmp/market-index.json
-          git checkout main
-          git pull --ff-only origin main
-          cp /tmp/market-index.json market/index.json
-          if git diff --quiet market/index.json; then
-            echo "索引无变化"
-          else
+          # 并发安全（2026-10-28 修）：原来直接 `git push origin main`，
+          # 只要**有人恰好同时推 main**（人推代码 / 另一次 workflow 回提交），
+          # 这次 push 就是非快进被拒 → 该步失败 → 整条 Release 标红，
+          # **但 npm 已经发布出去了**（留下「发布成功却标红」的假象）。
+          # v1.1.4 与 v1.1.5 都因此各红过一次。
+          # 现在改成「fetch → 以远端 tip 为基线重建这一个提交 → push」的重试循环：
+          # push 被拒就重新 fetch 重建再试（我们只改 market/index.json 一个文件，
+          # 竞争提交几乎不会碰它 → 第二次通常就成功）。
+          for attempt in 1 2 3 4 5; do
+            git fetch origin main
+            base="$(git rev-parse origin/main)"
+            # `-f`：丢弃工作区改动（权威索引已存 /tmp），否则遇到未跟踪文件会
+            # 「path exists on disk, but not in origin/main」直接失败。
+            git checkout -f -B main "$base"
+            cp /tmp/market-index.json market/index.json
+            # 先 add 再看 staged 差异：`git diff --quiet <path>` **看不见未跟踪文件**
+            # → 会把「新增索引文件」误判成「无变化」而跳过提交。
             git add market/index.json
+            if git diff --cached --quiet market/index.json; then
+              echo "索引无变化"
+              exit 0
+            fi
             git commit -m "Update market index for v${{ steps.ver.outputs.version }}"
-            git push origin main
-          fi
+            if git push origin HEAD:main; then
+              echo "索引已提交回 main（attempt $attempt）"
+              exit 0
+            fi
+            echo "push 被拒（并发推 main），重试 $attempt/5"
+            sleep 5
+          done
+          echo "索引提交回 main：并发冲突重试 5 次仍失败" >&2
+          exit 1
 
       - name: 打包产物
         run: |

@@ -36,26 +36,32 @@ cd relay && npm install && node server.js            # 中继（默认 8787；�
 
 ## 发布（npm / 插件市场 / GitHub Release，2026-10-26 起全自动）
 
-- **三个 npm 包**（同属 `@duke-dsh-plugins` 作用域）：
-  `@duke-dsh-plugins/dsh-remote-control`（插件，含 vendor 中继副本）+
-  `@duke-dsh-plugins/dsh-remote-control-relay`（中继，独立部署用）+
-  `@duke-dsh-plugins/dsh-remote-control-market`（**插件市场索引包**，版本由 release
-  workflow 按标签自动改写）。前两个**版本必须同 bump**。
+- **两个 npm 包**（同属 `@duke-dsh-plugins` 作用域，**版本必须同 bump**）：
+  `@duke-dsh-plugins/dsh-remote-control`（插件，含 vendor 中继副本与**市场索引副本**）+
+  `@duke-dsh-plugins/dsh-remote-control-relay`（中继，独立部署用）。
+  ⚠️ **没有第三个「市场索引包」**：v1.1.4 起市场索引**并入插件包**自托管
+  （`plugin/market/index.json`，发布时由 `market/sync-into-plugin.mjs` 拷入，
+  该目录 gitignored）。release workflow 也**只 publish 这两个包**。
 - **发版 = 打标签**：同时 bump `relay/package.json` 与 `plugin/package.json` 的版本 +
   **`CHANGELOG.md` 补一段 `## [版本]`**（缺失时 release workflow 直接失败）→
   `git tag v<版本> && git push origin main --tags`。`.github/workflows/release.yml` 接管：
   门禁 → npm 发布（已发布自动跳过，重推标签安全）→ changelog 段落成为 Release 正文 →
   `market/generate-index.mjs` 重生成插件市场索引 → 官方校验器验证 → 提交回 main →
   GitHub Release（正文 + 自动 notes + 两个包的 tgz + 索引文件）。
+  - ⚠️ **推标签前先推 main**：标签必须指向 **main 上的提交**（否则 workflow 会从
+    一条不在 main 上的历史发布，并把「索引提交回 main」推成非快进 → Release 标红，
+    **但 npm 已经发出去了**）。2026-10-28 的 v1.1.5 因此红过一次。
 - **前置 secret（一次性）**：仓库 Settings → Secrets → Actions 配 `NPM_TOKEN`
   （npmjs.com Access Tokens，Automation 类型）。
-- **插件市场索引**：`market/index.json`（format 1）→ 发布成 npm 包
-  `@duke-dsh-plugins/dsh-remote-control-market` → 用户在 DSH「设置 → 插件市场」加
-  `https://unpkg.com/@duke-dsh-plugins/dsh-remote-control-market@latest/index.json`
+- **插件市场索引**：`market/index.json`（format 1）→ 随**插件包**发布 →
+  用户在 DSH「设置 → 插件市场」加
+  `https://unpkg.com/@duke-dsh-plugins/dsh-remote-control@latest/market/index.json`
   （见 `market/README.md`）。**为什么走 unpkg 而不是 GitHub raw**：实测国内网络下
   `raw.githubusercontent.com` 与 `cdn.jsdelivr.net` 连接被重置，只有 unpkg 通。
   索引只列插件包；中继包不是 bundle，不进索引。
-- **npm 令牌要按包授权**：granular token 必须同时含三个包，否则发布市场包会被要求
+  另有一条社区目录通道：提 PR 到 awesome-dsh-plugin（`market/awesome-dsh-plugin-entry.yml`），
+  合并后随上游每日 CI 进官方 `dsh-plugin-catalog` 包。
+- **npm 令牌要按包授权**：granular token 必须同时含**这两个**包，否则发布会被要求
   浏览器认证（ENEAUTH/401）。
 - CI（`.github/workflows/ci.yml`）：relay 测试+smoke；plugin 全部 verify 门禁
   （verify-settings 的 peers 从 npm 临时装）；市场索引格式校验。

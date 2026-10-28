@@ -9,7 +9,7 @@ DSH 插件市场（Discover）读的是**用户配置的索引 URL**——本目
 DSH「设置 → 插件市场」（或 Discover 页）添加索引 URL：
 
 ```
-https://unpkg.com/@duke-dsh-plugins/dsh-remote-control-market@latest/index.json
+https://unpkg.com/@duke-dsh-plugins/dsh-remote-control@latest/market/index.json
 ```
 
 之后在市场里搜「DSH Pocket」安装即可（安装目标 = npm 包
@@ -26,9 +26,12 @@ https://unpkg.com/@duke-dsh-plugins/dsh-remote-control-market@latest/index.json
 - **生成**：`node market/generate-index.mjs`（版本列表来自 npm registry，
   发布时间取 registry `time` 字段；离线回退 git tag 时间）。
 - **更新时机**：推 `v*` 标签后，`release.yml` 发布 npm 包 → 重生成本索引 →
-  校验 → **发布本 npm 包**（`@duke-dsh-plugins/dsh-remote-control-market`）→
-  索引提交回 main → 附进 GitHub Release。**平时不用手改**。
-- 本包的**版本号由 release workflow 按标签自动改写**（与插件包版本一致），
+  校验 → **把索引拷进插件包**（`market/sync-into-plugin.mjs` → `plugin/market/index.json`，
+  该目录 gitignored，发布时随包带上）→ 索引提交回 main → 附进 GitHub Release。
+  **平时不用手改**。
+- ⚠️ **不再有独立的「市场索引包」**：v1.1.4 起索引并入插件包自托管
+  （所以 npm 上查不到 `@duke-dsh-plugins/dsh-remote-control-market`），
+  release workflow 也只 publish 插件与中继**两个**包。
   手动发版时只需 bump `relay/` 与 `plugin/` 的版本。
 - 索引里只列**插件包**；中继是服务器包（不是 DSH bundle），只出现在描述链接里
   （`@duke-dsh-plugins/dsh-remote-control-relay`）。

@@ -75,7 +75,7 @@ scripts/verify-pairing.mjs  /remote-pairing 命令逻辑自检（mock ctx；devD
 
 ```bash
 # DSH 插件市场（推荐）：在「设置 → 插件市场」添加索引 URL 后搜「DSH Pocket」安装
-#   https://unpkg.com/@duke-dsh-plugins/dsh-remote-control-market@latest/index.json
+#   https://unpkg.com/@duke-dsh-plugins/dsh-remote-control@latest/market/index.json
 #
 # 或直接用插件管理器：会解析 peerDependencies 并做兼容性 gate
 plugin_manager install @duke-dsh-plugins/dsh-remote-control

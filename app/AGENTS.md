@@ -95,6 +95,8 @@ grep -rnE "@State|@Prop|@Link|@ObjectLink|@Observed[^V]|@Provide|@Consume|@Watch
 - **one-shot 子代理只读**：详情页输入条整条隐藏，替换为「一次性子代理 · 仅查看」说明行；
   continuable 正常输入（发送自动走 `session.subagentPrompt`，取消走 `session.subagentCancel`——
   详情页 send()/cancelTurn() 按 rowOf(sid).parentSessionId 分流，勿绕过）。
+- **所有 subagent 的模型/强度/权限只读**：三项信息放在输入分支之外，one-shot 也必须可见；
+  continuable 只保留消息输入，不得打开模型或权限选择面板。`custom` 权限只显示，不是可选预设。
 
 ## v1.0.6：主页 / 多远程 / 时间线 / 模式权限（2026-10-23）
 
@@ -115,6 +117,9 @@ grep -rnE "@State|@Prop|@Link|@ObjectLink|@Observed[^V]|@Provide|@Consume|@Watch
   `kind='message'`（对话）/ `'step'`（工具调用）/ `'system'`（系统消息）/ `'reasoning'`（思考）。
 - durable 项按 `seq` 升序在前，直播项（`seq=-1`）按到达顺序在末尾；
   历史页 `steps` 与直播 `tool.call`/`tool.result` 按 `callId` 配对去重。
+- **v1.1.7 收发闭环**：`link.ets` 对全部业务帧串行完成解密+分发、加密+发送；
+  停止/断线/重连使旧代次回调失效。历史合并支持 durable 聚合文本覆盖同 turn 的多个 live 片段，
+  空闲最新页清理已完成的助手/思考直播副本；不得靠忽略 `turn.end` 后事件来掩盖乱序。
 - 工作步骤卡与组头的 chevron 都用 **18×16 固定尺寸 SymbolGlyph**，禁止文字箭头影响行高。
   reasoning 用独立 ReasoningCard（默认收起的弱化「思考过程」），不进 assistant 气泡/StepGroup。
 
@@ -128,12 +133,14 @@ grep -rnE "@State|@Prop|@Link|@ObjectLink|@Observed[^V]|@Provide|@Consume|@Watch
   默认档；目录候选 = 「默认目录」（Host `~/.dsh/remote`，空 cwd 由插件解析并建目录）
   + 现有会话 cwd 去重。create 成功但 prompt 失败也要进详情提示重试。
 
-### 会话中切换模型 / 思考强度（契约 §5.8 v1.0.8）
-- 入口在**详情页输入框旁的模型胶囊**（对齐各家 Harness 习惯；one-shot 只读会话随输入条一起隐藏），
-  点开 bindSheet 选模型+强度，「应用」调 `store.applyModelSelection`（wire `session.selectModel`），
-  Host 拒绝 toast 原文。
-- 当前值：`store.sessionModel`（`session.model` 拉取 + `session.modelChanged` 事件实时覆盖；
+### 会话中切换模型 / 思考强度 / 权限（契约 §5.8 v1.0.8 + v1.1.7）
+- 入口在**详情页输入区上方的模型与权限胶囊**。根会话点开 bindSheet 选模型+强度或权限，
+  分别调 `store.applyModelSelection` / `store.applyPermissionSelection`，Host 拒绝 toast 原文。
+- 当前模型：`store.sessionModel`（`session.model` 拉取 + `session.modelChanged` 事件实时覆盖；
   null = 插件无记录 → 回退显示目录默认）。下一次 prompt 组装即用新模型，运行中 turn 不受影响。
+- 当前权限：`store.sessionPermission`（`session.permission` 拉取 + `session.permissionChanged`
+  事件实时覆盖；断线恢复也补拉）。`custom` 是 Host 派生当前态，只显示、不能作为选择目标。
+- **subagent 三项都只读**，one-shot 也不隐藏这三项；continuable 只保留消息输入。
 
 ### 品牌（2026-10-24，v3 鲸鱼版）
 - 应用名 **DSH Pocket**（AppScope app_name、EntryAbility_label、APP_NAME）；bundleName 不变。

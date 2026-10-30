@@ -24,6 +24,7 @@ import {
   postQuestionResolved
 } from './events';
 import { DshrcLink, DshrcHostInfo, LinkPeers, LinkState, dshrcLink } from './link';
+import { collectCoveredLiveTextIds, DshrcDurableText, DshrcLiveText } from './timeline-reconcile';
 import {
   DshrcMsg,
   DshrcPayload,
@@ -56,6 +57,7 @@ import {
   TOPIC_SESSION_ADDED,
   TOPIC_SESSION_ARCHIVES,
   TOPIC_SESSION_MODEL_CHANGED,
+  TOPIC_SESSION_PERMISSION_CHANGED,
   TOPIC_SESSION_QUEUE,
   TOPIC_SESSION_REMOVED,
   TOPIC_SESSION_STATUS,
@@ -398,6 +400,8 @@ export class SessionStore {
   @Trace busyEnter: string = 'queue';
   /** v1.0.8：当前活动会话的模型/思考强度（null = 未知，UI 回退目录默认）。 */
   @Trace sessionModel: DshrcModelSelection | null = null;
+  /** 当前活动会话权限；custom 是 Host 派生状态，只展示、不能作为预设提交。 */
+  @Trace sessionPermission: string | null = null;
 
   /** Index 挂载后设置：有待导航目标时立即回调（EntryAbility onNewWant 触发链）。 */
   onPendingNav: (() => void) | null = null;
@@ -407,6 +411,8 @@ export class SessionStore {
   private histMeta: Map<string, HistMeta> = new Map<string, HistMeta>();
   /** v1.0.8：各会话当前模型（源=session.model 请求 / session.modelChanged 事件）。 */
   private modelCache: Map<string, DshrcModelSelection> = new Map<string, DshrcModelSelection>();
+  /** 各会话当前权限（session.permission 请求 / permissionChanged 事件）。 */
+  private permissionCache: Map<string, string> = new Map<string, string>();
   /** v1.0.9：大图内存缓存（key = imageId + '@' + maxEdge），避免重复拉取。 */
   private imageCache: Map<string, string> = new Map<string, string>();
   /** v1.1.1：每会话待执行消息（宿主 session.queue 事件，契约 §5.2）。 */
@@ -464,6 +470,7 @@ export class SessionStore {
         // 若 WS 正在重连，aboutToAppear 里那次 session.model 恰好落在断链窗口
         // 静默失败，链路恢复后**永不重试** → 手机端一直显示目录默认模型。
         this.loadSessionModel(this.activeId);
+        this.loadSessionPermission(this.activeId);
         const row: SessionRow | undefined = this.findRow(this.activeId);
         if (row !== undefined && row.parentSessionId.length === 0) {
           this.loadSubagents(this.activeId);
@@ -486,6 +493,8 @@ export class SessionStore {
       this.capabilitiesLoaded = false;
       this.sessionModel = null;
       this.modelCache.clear();
+      this.sessionPermission = null;
+      this.permissionCache.clear();
       this.queueCache.clear(); // v1.1.1：断开后不留上一台主机的待执行消息
     }
     if (s === 'error') {
@@ -732,6 +741,8 @@ export class SessionStore {
     // v1.0.8：投影该会话当前模型（缓存里没有 → null，UI 回退目录默认）
     const known: DshrcModelSelection | undefined = this.modelCache.get(sid);
     this.sessionModel = known !== undefined ? known : null;
+    const knownPermission: string | undefined = this.permissionCache.get(sid);
+    this.sessionPermission = knownPermission !== undefined ? knownPermission : null;
     if (sid.length === 0) {
       this.timeline = [];
       this.historyHasMore = false;
@@ -862,6 +873,37 @@ export class SessionStore {
       this.modelCache.set(sid, applied);
       if (sid === this.activeId) {
         this.sessionModel = applied;
+      }
+    });
+  }
+
+  /** 查询当前权限；subagent 也只读调用，页面不提供切换入口。 */
+  loadSessionPermission(sid: string): void {
+    if (sid.length === 0 || this.link.getState() !== 'online') {
+      logDshrc(TAG, 'info', 'session.permission skipped: ' +
+        (sid.length === 0 ? 'sid empty' : 'link ' + this.link.getState()));
+      return;
+    }
+    this.link.sessionPermission(sid).then((permission: string | null): void => {
+      if (permission === null) {
+        this.permissionCache.delete(sid);
+      } else {
+        this.permissionCache.set(sid, permission);
+      }
+      if (sid === this.activeId) {
+        this.sessionPermission = permission;
+      }
+    }).catch((e: Error): void => {
+      logDshrc(TAG, 'info', 'session.permission unavailable: ' + e.message);
+    });
+  }
+
+  /** 根会话切换权限；Host 确认后更新投影，事件到达时幂等覆盖。 */
+  applyPermissionSelection(sid: string, permission: string): Promise<void> {
+    return this.link.sessionSelectPermission(sid, permission).then((applied: string): void => {
+      this.permissionCache.set(sid, applied);
+      if (sid === this.activeId) {
+        this.sessionPermission = applied;
       }
     });
   }
@@ -1029,7 +1071,7 @@ export class SessionStore {
     // （一条 durable 最多覆盖一个直播副本）——旧副本不参与配对。
     let coveredLive: Set<string> = new Set<string>();
     if (!prepend) {
-      coveredLive = this.coveredLiveIds(items, messages);
+      coveredLive = this.coveredLiveIds(items, messages, !this.runningOf(sid));
     }
     for (let k: number = 0; k < items.length; k++) {
       const it: TimelineItem = items[k];
@@ -1216,51 +1258,31 @@ export class SessionStore {
   }
 
   /**
-   * 计算「被新增 durable 覆盖」的直播项 id 集合（一一对应 + 消费）。
-   *
-   * 配对顺序：直播项按**到达顺序**（旧→新），候选按 seq 升序
-   * （宿主持久化顺序 = 消息产生顺序）。同 role+text 的一一配对：
-   *  - 一条 durable 最多覆盖一个直播副本（候选被消费后不再参与）；
-   *  - 后来出现的那条同文本 live 消息不会被更早的 durable 顶掉
-   *    （连续两条同文本时，旧的直播项先被覆盖，新的那条留着）。
+   * 计算被持久历史覆盖的直播文本 id。
+   * durable 仍按 seq、live 仍按到达顺序一对一消费；同 role 的多个 live 片段可聚合匹配，
+   * 以兼容 Host「一个 assistant/message 同类块合并」与 App「类型切换拆块」的粒度差。
+   * dropFinalized 只在非 prepend 且 Host 空闲时为 true，详见 timeline-reconcile.ts。
    */
-  private coveredLiveIds(oldItems: TimelineItem[], page: DshrcChatMessage[]): Set<string> {
-    const covered: Set<string> = new Set<string>();
+  private coveredLiveIds(oldItems: TimelineItem[], page: DshrcChatMessage[],
+    dropFinalized: boolean): Set<string> {
     const candidates: DshrcChatMessage[] = this.newDurableCandidates(oldItems, page);
-    if (candidates.length === 0) {
-      return covered;
-    }
     const ordered: DshrcChatMessage[] = candidates.slice();
     ordered.sort((a: DshrcChatMessage, b: DshrcChatMessage): number => a.seq - b.seq);
-    const used: boolean[] = [];
-    for (let c: number = 0; c < ordered.length; c++) {
-      used.push(false);
+    const durable: DshrcDurableText[] = [];
+    for (let i: number = 0; i < ordered.length; i++) {
+      durable.push({ role: ordered[i].role, text: ordered[i].text });
     }
-    // 直播项按到达顺序遍历（缓存数组里 live 段即到达顺序）
+    const live: DshrcLiveText[] = [];
     for (let i: number = 0; i < oldItems.length; i++) {
       const it: TimelineItem = oldItems[i];
-      if (it.seq >= 0) {
-        continue; // durable 不参与配对
-      }
-      if (!it.isMessage() && !it.isReasoning()) {
-        continue;
-      }
-      if (it.text.length === 0) {
-        continue;
-      }
-      for (let c2: number = 0; c2 < ordered.length; c2++) {
-        if (used[c2]) {
-          continue; // 该候选已被消费（一条 durable 最多覆盖一个直播副本）
-        }
-        const msg: DshrcChatMessage = ordered[c2];
-        if (msg.role === it.role && msg.text === it.text) {
-          used[c2] = true;
-          covered.add(it.id);
-          break;
-        }
+      if (it.seq < 0 && (it.isMessage() || it.isReasoning()) && it.text.length > 0) {
+        live.push({ itemId: it.id, role: it.role, text: it.text, streaming: it.streaming });
       }
     }
-    return covered;
+    // 运行中：允许 durable 聚合文本覆盖交错的多个 live 片段。
+    // 空闲 + 最新页：权威历史接管全部已完成的 assistant/reasoning 文本，
+    // 同时清掉「先见 durable、后到 live」造成的永久副本；prepend 不会进入这里。
+    return collectCoveredLiveTextIds(durable, live, dropFinalized);
   }
 
   /** 直播步骤是否已被本页持久步骤覆盖（同 callId）。 */
@@ -1583,6 +1605,7 @@ export class SessionStore {
         this.cache.delete(keys[j]);
         this.histMeta.delete(keys[j]);
         this.queueCache.delete(keys[j]); // v1.1.1：会话没了，它的待执行消息也没了
+        this.permissionCache.delete(keys[j]);
       }
     }
     if (this.activeId.length > 0 && !alive.has(this.activeId)) {
@@ -1812,6 +1835,17 @@ export class SessionStore {
           this.modelCache.set(sidM, sel);
           if (sidM === this.activeId) {
             this.sessionModel = sel;
+          }
+        }
+        break;
+      }
+      case TOPIC_SESSION_PERMISSION_CHANGED: {
+        const sidP: string = data.sessionId !== undefined ? data.sessionId : '';
+        const permission: string | undefined = data.permission;
+        if (sidP.length > 0 && permission !== undefined && permission.length > 0) {
+          this.permissionCache.set(sidP, permission);
+          if (sidP === this.activeId) {
+            this.sessionPermission = permission;
           }
         }
         break;

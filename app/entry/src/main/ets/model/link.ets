@@ -68,6 +68,8 @@ import {
   MSG_SESSION_UNARCHIVE,
   MSG_SESSION_SELECT_MODEL,
   MSG_SESSION_MODEL,
+  MSG_SESSION_SELECT_PERMISSION,
+  MSG_SESSION_PERMISSION,
   MSG_SESSION_QUEUE,
   MSG_SESSION_PROMPT,
   MSG_SESSION_CANCEL,
@@ -88,6 +90,7 @@ import {
   makeMsg
 } from './protocol';
 import { assertKat, deriveKey, helloSig, helloSig2, open, seal } from './crypto';
+import { DshrcOrderedQueue } from './ordered-queue';
 import { postBusMsg, postLinkPeers, postLinkState } from './events';
 
 const TAG: string = 'dshrc-link';
@@ -266,6 +269,12 @@ export class DshrcLink {
   private businessHelloSent: boolean = false;
   /** 加固模式下连续 sid 不匹配的帧数（达到阈值 → 重连自愈）。 */
   private sidMismatchCount: number = 0;
+  /** 异步帧世代：停止/断线/新连接后，旧连接的解密与加密回调一律失效。 */
+  private connectionGeneration: number = 0;
+  /** host→client：按 WS 到达顺序串行解密并分发，杜绝 turn.end 越过先前事件。 */
+  private inboundQueue: DshrcOrderedQueue = new DshrcOrderedQueue();
+  /** client→host：按 seq 分配顺序串行加密并发送。 */
+  private outboundQueue: DshrcOrderedQueue = new DshrcOrderedQueue();
 
   /** UI 回调（在 UIAbility 主线程设置；WS 回调也在主线程分发）。 */
   onState: ((s: LinkState) => void) | null = null;
@@ -367,7 +376,15 @@ export class DshrcLink {
     this.connectOnce();
   }
 
+  /** 作废旧连接的异步工作，并给新世代独立队列，避免旧积压阻塞新连接。 */
+  private invalidateAsyncFrames(): void {
+    this.connectionGeneration = this.connectionGeneration + 1;
+    this.inboundQueue = new DshrcOrderedQueue();
+    this.outboundQueue = new DshrcOrderedQueue();
+  }
+
   private stopInternal(reason: string): void {
+    this.invalidateAsyncFrames();
     this.clearHeartbeatTimer();
     this.clearHelloTimer();
     this.clearReconnectTimer();
@@ -415,6 +432,7 @@ export class DshrcLink {
     if (!this.shouldRun || this.cfg === null) {
       return;
     }
+    this.invalidateAsyncFrames();
     // 契约 §4 v1.0.2：每条 WS 连接（含重连）生成新 sid，seq 从 1 重新开始
     this.sid = newSid();
     this.sendSeq = 0;
@@ -491,7 +509,11 @@ export class DshrcLink {
     const ts: number = Date.now();
     const pv: number = PROTO_HELLO_V2;
     const sid: string = this.sid;
+    const generation: number = this.connectionGeneration;
     helloSig2(key, ROLE_CLIENT, cfg.channel, epoch, ts, pv, sid).then((sig: string) => {
+      if (generation !== this.connectionGeneration || this.sid !== sid) {
+        return;
+      }
       const hello: DshrcRelayFrame = {
         t: FRAME_HELLO,
         role: ROLE_CLIENT,
@@ -612,6 +634,7 @@ export class DshrcLink {
    *  - 对端在线但没带证明 → 旧端（pv 视为 1）→ 兼容模式。
    */
   private async handleWelcome(frame: DshrcRelayFrame): Promise<void> {
+    const generation: number = this.connectionGeneration;
     const peers: DshrcRelayPeers | undefined = frame.peers;
     if (peers !== undefined) {
       this.peers = { host: peers.host, client: peers.client };
@@ -622,8 +645,8 @@ export class DshrcLink {
     const proof: DshrcPeerProof | undefined = frame.peer;
     if (proof !== undefined) {
       const accepted: boolean = await this.acceptPeerProof(proof);
-      if (!accepted) {
-        return; // 已拒绝连接（状态已置 error，停止自动重连）
+      if (!accepted || generation !== this.connectionGeneration) {
+        return; // 已拒绝连接，或证明验签期间连接世代已变化
       }
     } else if (peers === undefined || peers.host) {
       // 对端在线却没带证明 → 旧端（pv 缺省视为 1）→ 兼容模式。
@@ -645,11 +668,12 @@ export class DshrcLink {
    * 证明里带新的 sid（host 每条连接一个新 sid）→ 重新钉扎；纪元必须比已接受值大。
    */
   private async handlePeerJoined(frame: DshrcRelayFrame): Promise<void> {
+    const generation: number = this.connectionGeneration;
     const proof: DshrcPeerProof | undefined = frame.peer;
     if (proof !== undefined) {
       const accepted: boolean = await this.acceptPeerProof(proof);
-      if (!accepted) {
-        return; // 已拒绝连接
+      if (!accepted || generation !== this.connectionGeneration) {
+        return; // 已拒绝连接，或证明验签期间连接世代已变化
       }
       this.log('host joined (proof accepted, epoch=' + this.epoch.peer.toString() + ')');
     } else {
@@ -670,6 +694,7 @@ export class DshrcLink {
    *  3. 通过 → 钉扎对端 sid + 持久化「已接受的对端纪元」。
    */
   private async acceptPeerProof(proof: DshrcPeerProof): Promise<boolean> {
+    const generation: number = this.connectionGeneration;
     const key: Uint8Array | null = this.key;
     const cfg: LinkConfig | null = this.cfg;
     if (key === null || cfg === null) {
@@ -699,8 +724,14 @@ export class DshrcLink {
       try {
         expect = await helloSig2(key, role, cfg.channel, epoch, ts, pv, sid);
       } catch (e) {
+        if (generation !== this.connectionGeneration) {
+          return false;
+        }
         this.rejectPeerProof('proof verify error');
         return false;
+      }
+      if (generation !== this.connectionGeneration) {
+        return false; // 旧连接的验签结果不得改变新连接的纪元、模式或状态。
       }
       if (expect !== sig) {
         this.rejectPeerProof('proof signature mismatch (pv=' + pv.toString() + ')');
@@ -786,7 +817,7 @@ export class DshrcLink {
     this.sendBusinessHello();
   }
 
-  /** 密文帧：按 sid+":"+seq 去重 → 解密 → 业务分发（契约 §4 v1.0.2 + §3.4.1 钉扎）。 */
+  /** 密文帧：按 sid+":"+seq 去重 → 串行解密 → 有序业务分发；旧世代回调失效。 */
   private onRelayFrame(frame: DshrcRelayFrame): void {
     const key: Uint8Array | null = this.key;
     const sid: string = frame.sid !== undefined ? frame.sid : SID_LEGACY;
@@ -815,20 +846,25 @@ export class DshrcLink {
       this.log('dup frame ' + sid + ':' + seq.toString() + ' dropped');
       return;
     }
-    if (this.hardened) {
-      // AAD 绑定**发送方**（host）的 sid —— 与钉扎值一致（上面已校验）。
-      open(key, ROLE_HOST, seq, data, sid).then((pt: string) => {
+    const generation: number = this.connectionGeneration;
+    const hardened: boolean = this.hardened;
+    // native convertKey 异步完成顺序不受控；解密与 correlator/store 分发必须同队保序。
+    this.inboundQueue.enqueue(async (): Promise<void> => {
+      if (generation !== this.connectionGeneration) {
+        return;
+      }
+      try {
+        const pt: string = hardened ? await open(key, ROLE_HOST, seq, data, sid) :
+          await open(key, ROLE_HOST, seq, data);
+        if (generation !== this.connectionGeneration) {
+          return;
+        }
         this.dispatchPlain(pt);
-      }).catch((e: BusinessError) => {
-        this.log('decrypt failed seq=' + seq + ' err=' + e.code);
-      });
-      return;
-    }
-    open(key, ROLE_HOST, seq, data).then((pt: string) => {
-      this.dispatchPlain(pt);
-    }).catch((e: BusinessError) => {
-      // 认证失败（AAD/密钥不匹配）：丢弃该帧
-      this.log('decrypt failed seq=' + seq + ' err=' + e.code);
+      } catch (e) {
+        const err: BusinessError = e as BusinessError;
+        // 认证失败（AAD/密钥不匹配）：丢弃该帧，但不阻塞后续帧。
+        this.log('decrypt failed seq=' + seq + ' err=' + err.code);
+      }
     });
   }
 
@@ -905,6 +941,7 @@ export class DshrcLink {
    *    随后的 close 事件进来时保持 error，不再退避重连。
    */
   private onWsDown(reason: string): void {
+    this.invalidateAsyncFrames();
     this.clearHeartbeatTimer();
     this.clearHelloTimer();
     this.clearReconnectTimer();
@@ -987,7 +1024,12 @@ export class DshrcLink {
     if (key === null || cfg === null) {
       return;
     }
+    const generation: number = this.connectionGeneration;
+    const sid: string = this.sid;
     helloSig(key, ROLE_CLIENT, cfg.channel).then((sig: string) => {
+      if (generation !== this.connectionGeneration || this.sid !== sid) {
+        return;
+      }
       const payload: DshrcPayload = {
         proto: PROTO_VERSION,
         clientName: cfg.clientName,
@@ -1160,6 +1202,31 @@ export class DshrcLink {
     });
   }
 
+  /** session.permission：查询会话当前权限；custom 为派生状态，原样返回供只读展示。 */
+  sessionPermission(sessionId: string): Promise<string | null> {
+    if (sessionId.length === 0) {
+      return Promise.reject(new Error('sessionId empty'));
+    }
+    const p: DshrcPayload = { sessionId: sessionId };
+    return this.request(MSG_SESSION_PERMISSION, p).then((v: DshrcValue): string | null => {
+      return typeof v.permission === 'string' ? v.permission : null;
+    });
+  }
+
+  /** session.selectPermission：根会话切换权限；Host 拒绝时 reject 原文，不做本机假成功。 */
+  sessionSelectPermission(sessionId: string, permission: string): Promise<string> {
+    if (sessionId.length === 0 || permission.length === 0) {
+      return Promise.reject(new Error('sessionId/permission empty'));
+    }
+    const p: DshrcPayload = { sessionId: sessionId, permission: permission };
+    return this.request(MSG_SESSION_SELECT_PERMISSION, p).then((v: DshrcValue): string => {
+      if (typeof v.permission !== 'string' || v.permission.length === 0) {
+        throw new Error('主机未返回权限结果');
+      }
+      return v.permission;
+    });
+  }
+
   /** session.subagents（§5.1 v1.0.5）：父会话的直接子代理目录。 */
   sessionSubagents(sessionId: string): Promise<DshrcSubagentInfo[]> {
     const p: DshrcPayload = { sessionId: sessionId };
@@ -1315,7 +1382,8 @@ export class DshrcLink {
    */
   private sealAndSend(m: DshrcMsg): void {
     const key: Uint8Array | null = this.key;
-    if (key === null || this.ws === null || this.sid.length === 0) {
+    const ws: webSocket.WebSocket | null = this.ws;
+    if (key === null || ws === null || this.sid.length === 0) {
       throw new Error('link not ready');
     }
     if (!this.peerPvKnown) {
@@ -1323,39 +1391,42 @@ export class DshrcLink {
     }
     this.sendSeq = this.sendSeq + 1;
     const seq: number = this.sendSeq;
-    const sid: string = this.sid; // 捕获本条连接的 sid（重连后旧帧不会串桶）
+    const sid: string = this.sid;
+    const hardened: boolean = this.hardened;
+    const generation: number = this.connectionGeneration;
     const pt: string = JSON.stringify(m);
-    const sendSealed: (data: string) => void = (data: string): void => {
-      const frame: DshrcRelayFrame = { t: FRAME_FRAME, sid: sid, seq: seq, data: data };
-      this.sendRelayJson(JSON.stringify(frame));
-    };
-    if (this.hardened) {
-      seal(key, ROLE_CLIENT, seq, pt, undefined, sid).then((data: string) => {
-        sendSealed(data);
-      }).catch((e: BusinessError) => {
-        this.log('seal failed: ' + e.code);
-      });
-      return;
-    }
-    seal(key, ROLE_CLIENT, seq, pt).then((data: string) => {
-      sendSealed(data);
-    }).catch((e: BusinessError) => {
-      this.log('seal failed: ' + e.code);
+    // seq 在调用序分配，加密与 ws.send 也必须按同一顺序完成，不能并发 seal 后直接发送。
+    this.outboundQueue.enqueue(async (): Promise<void> => {
+      if (generation !== this.connectionGeneration) {
+        return;
+      }
+      try {
+        const data: string = hardened ? await seal(key, ROLE_CLIENT, seq, pt, undefined, sid) :
+          await seal(key, ROLE_CLIENT, seq, pt);
+        if (generation !== this.connectionGeneration || this.ws !== ws) {
+          return;
+        }
+        const frame: DshrcRelayFrame = { t: FRAME_FRAME, sid: sid, seq: seq, data: data };
+        await this.sendRelayJson(JSON.stringify(frame));
+      } catch (e) {
+        const err: BusinessError = e as BusinessError;
+        this.log('seal failed: ' + err.code);
+      }
     });
   }
 
   /** 发送明文中继帧（hello/ping/pong/frame）。 */
-  private sendRelayJson(text: string): void {
+  private sendRelayJson(text: string): Promise<void> {
     const ws: webSocket.WebSocket | null = this.ws;
     if (ws === null) {
-      return;
+      return Promise.resolve();
     }
     this.lastSendTs = Date.now();
-    ws.send(text).then((ok: boolean) => {
+    return ws.send(text).then((ok: boolean): void => {
       if (!ok) {
         this.log('send returned false');
       }
-    }).catch((e: BusinessError) => {
+    }).catch((e: BusinessError): void => {
       this.log('send failed: ' + e.code);
       this.onWsDown('send-failed');
     });

@@ -20,6 +20,8 @@
 //  10. v1.1.x 流式顺序：正文/思考进**同一条保序队列**——reasoning→text→idle 的
 //      **跨 topic 全局顺序**必须与原始 chunk 顺序一致；相邻同类块合并、异类不合并；
 //      idle/error 先统一冲刷再发 turn.end；dispose 后不再出站。
+//  11. v1.1.7 权限：permissions.currentValue 投影查询、selectPermission 成功/宿主拒绝、
+//      三类 knob → permissionChanged（含 custom）、subagent 冷读与 Host 不额外禁止 select。
 //
 // 用法：node scripts/verify-steps.mjs（在 plugin/ 目录下）
 import { mkdtemp, mkdir as fsMkdir, rm, stat } from "node:fs/promises";
@@ -1432,6 +1434,173 @@ function eventsOf(sent, topic) {
   projectionsThrows = false;
 
   bridge.dispose();
+}
+
+// ===========================================================================
+// 场景 8c（v1.1.7）：会话权限查询 / 切换 / 跨端变更
+//
+// 桌面端权威口径 = permissions.currentValue 持久投影（三类 knob 事件折叠）。
+// 查询必须能冷读 subagent；select 则由 App 限制入口，Host 不额外禁止。
+// ===========================================================================
+{
+  const relay = makeRelay();
+  const projected = new Map();
+  const sessions = new Map([
+    ["sess-root", { id: "sess-root", permission: "workspace-write" }],
+    ["sess-child", { id: "sess-child", permission: "workspace-write" }],
+  ]);
+  const resolveCalls = [];
+  const selectCalls = [];
+  let projectionThrows = false;
+  let selectRejects = false;
+  const sessionController = {
+    async projections(req) {
+      if (projectionThrows) throw new Error("projection read failed");
+      if (!projected.has(req.sessionId)) return null;
+      const currentValue = projected.get(req.sessionId);
+      return {
+        kind: "sequenced",
+        asOfSeq: 1,
+        values: currentValue === null ? {} : { permissions: { currentValue } },
+      };
+    },
+    async inspect(sessionId) {
+      return {
+        meta: sessionId === "sess-cold-child"
+          ? { origin: "subagent", parentSessionId: "sess-root" }
+          : { origin: "user" },
+      };
+    },
+    async resolveAgent(sessionId) {
+      resolveCalls.push(sessionId);
+      if (sessionId === "sess-cold-child" || sessionId === "sess-tracked") {
+        throw new Error("cold subagent must not need activation");
+      }
+      if (sessionId === "sess-old-error") {
+        const error = new Error("old host session refusal");
+        error.code = "session/not-found";
+        return { error }; // 旧版 {error} 形状：必须原样回错。
+      }
+      // 新版宿主直接返回 Agent。
+      return { session: sessions.get(sessionId) };
+    },
+  };
+  const permissionPresets = {
+    current(session) {
+      return session.permission;
+    },
+    set(session, name) {
+      selectCalls.push({ sessionId: session.id, name });
+      if (selectRejects) {
+        const e = new Error(`permission: unknown preset "${name}"`);
+        e.code = "permission/unknown-preset";
+        throw e;
+      }
+      session.permission = name;
+    },
+  };
+  const ctx = makeCtx({ sessionController, permissionPresets });
+  const bridge = makeBridge(ctx, relay);
+  bridge.attach();
+
+  projected.set("sess-root", "workspace-write");
+  await bridge.dispatch({ id: "perm-q1", type: "session.permission", ts: Date.now(), payload: { sessionId: "sess-root" } });
+  const q1 = lastResult(relay.sent, "perm-q1");
+  check("session.permission：读 permissions.currentValue 投影", q1?.value?.permission === "workspace-write" && q1?.error === undefined, JSON.stringify(q1));
+
+  projected.set("sess-custom", "custom");
+  await bridge.dispatch({ id: "perm-q2", type: "session.permission", ts: Date.now(), payload: { sessionId: "sess-custom" } });
+  const q2 = lastResult(relay.sent, "perm-q2");
+  check("session.permission：派生 custom 是合法当前态", q2?.value?.permission === "custom", JSON.stringify(q2));
+
+  projected.set("sess-cold-child", "read-only");
+  await bridge.dispatch({ id: "perm-child", type: "session.permission", ts: Date.now(), payload: { sessionId: "sess-cold-child" } });
+  const childQuery = lastResult(relay.sent, "perm-child");
+  check("session.permission：subagent 冷读成功", childQuery?.value?.permission === "read-only", JSON.stringify(childQuery));
+  check("session.permission：subagent 查询不 resolveAgent/不激活", !resolveCalls.includes("sess-cold-child"), JSON.stringify(resolveCalls));
+  projectionThrows = true;
+  await bridge.dispatch({ id: "perm-child-fallback", type: "session.permission", ts: Date.now(), payload: { sessionId: "sess-cold-child" } });
+  const childFallback = lastResult(relay.sent, "perm-child-fallback");
+  check("session.permission：投影故障时 subagent 也只回冷读/内存态", childFallback?.value?.permission === "read-only", JSON.stringify(childFallback));
+  check("session.permission：投影故障也不激活 subagent", !resolveCalls.includes("sess-cold-child"), JSON.stringify(resolveCalls));
+  projectionThrows = false;
+
+  await bridge.dispatch({
+    id: "perm-select",
+    type: "session.selectPermission",
+    ts: Date.now(),
+    payload: { sessionId: "sess-root", permission: "danger-full-access" },
+  });
+  const selected = lastResult(relay.sent, "perm-select");
+  check("session.selectPermission：调 permissionPresets.set(session,name)", selectCalls[0]?.sessionId === "sess-root" && selectCalls[0]?.name === "danger-full-access", JSON.stringify(selectCalls));
+  check("session.selectPermission：成功回宿主有效值", selected?.value?.permission === "danger-full-access" && selected?.error === undefined, JSON.stringify(selected));
+
+  await bridge.dispatch({
+    id: "perm-select-child",
+    type: "session.selectPermission",
+    ts: Date.now(),
+    payload: { sessionId: "sess-child", permission: "read-only" },
+  });
+  const selectedChild = lastResult(relay.sent, "perm-select-child");
+  check("session.selectPermission：Host 不额外禁止 subagent", selectedChild?.value?.permission === "read-only" && selectCalls[1]?.sessionId === "sess-child", JSON.stringify(selectedChild));
+
+  selectRejects = true;
+  await bridge.dispatch({
+    id: "perm-reject",
+    type: "session.selectPermission",
+    ts: Date.now(),
+    payload: { sessionId: "sess-root", permission: "missing" },
+  });
+  const rejected = lastResult(relay.sent, "perm-reject");
+  check("session.selectPermission：宿主拒绝原样回错", rejected?.error?.code === "permission/unknown-preset" && rejected?.error?.message === 'permission: unknown preset "missing"' && rejected?.value === undefined, JSON.stringify(rejected));
+  selectRejects = false;
+
+  await bridge.dispatch({
+    id: "perm-old-reject",
+    type: "session.selectPermission",
+    ts: Date.now(),
+    payload: { sessionId: "sess-old-error", permission: "read-only" },
+  });
+  const oldRejected = lastResult(relay.sent, "perm-old-reject");
+  check("session.selectPermission：旧版 resolveAgent {error} 也原样回错", oldRejected?.error?.code === "session/not-found" && oldRejected?.error?.message === "old host session refusal", JSON.stringify(oldRejected));
+
+  await bridge.dispatch({ id: "perm-bad1", type: "session.selectPermission", ts: Date.now(), payload: { sessionId: "sess-root", permission: " " } });
+  await bridge.dispatch({ id: "perm-bad2", type: "session.permission", ts: Date.now(), payload: {} });
+  check("权限请求：非法参数回 bad-params", lastResult(relay.sent, "perm-bad1")?.error?.code === "bad-params" && lastResult(relay.sent, "perm-bad2")?.error?.code === "bad-params", "bad-params");
+
+  // 三类 knob 都影响有效权限；不能只桥接 permission/preset。
+  relay.sent.length = 0;
+  const live = { id: "sess-events", permission: "danger-full-access" };
+  ctx.emit("session/event", live, { type: "permission/preset", seq: 50, time: 6000, data: { preset: "danger-full-access" } });
+  live.permission = "custom";
+  ctx.emit("session/event", live, { type: "sandbox/mode", seq: 51, time: 6001, data: { mode: "read-only" } });
+  live.permission = "read-only";
+  ctx.emit("session/event", live, { type: "approval/policy", seq: 52, time: 6002, data: { policy: "ask" } });
+  const permissionEvents = eventsOf(relay.sent, "session.permissionChanged");
+  check("permission/preset + sandbox/mode + approval/policy 均广播", permissionEvents.length === 3, JSON.stringify(permissionEvents));
+  check("session.permissionChanged：按 Host 顺序携带有效值（含 custom）", permissionEvents.map((e) => e.permission).join(",") === "danger-full-access,custom,read-only" && permissionEvents.every((e) => e.sessionId === "sess-events"), JSON.stringify(permissionEvents));
+
+  // 投影故障：先退 live current，再退直播内存态，均不向客户端报错。
+  projectionThrows = true;
+  await bridge.dispatch({ id: "perm-live-fallback", type: "session.permission", ts: Date.now(), payload: { sessionId: "sess-root" } });
+  const liveFallback = lastResult(relay.sent, "perm-live-fallback");
+  check("session.permission：投影故障退回 permissionPresets.current", liveFallback?.value?.permission === "danger-full-access" && liveFallback?.error === undefined, JSON.stringify(liveFallback));
+  ctx.emit("session/event", { id: "sess-tracked", permission: "workspace-write" }, { type: "permission/preset", seq: 53, time: 6003, data: { preset: "workspace-write" } });
+  await bridge.dispatch({ id: "perm-memory-fallback", type: "session.permission", ts: Date.now(), payload: { sessionId: "sess-tracked" } });
+  const memoryFallback = lastResult(relay.sent, "perm-memory-fallback");
+  check("session.permission：live 不可用再退直播内存态", memoryFallback?.value?.permission === "workspace-write" && memoryFallback?.error === undefined, JSON.stringify(memoryFallback));
+
+  bridge.dispose();
+
+  const noServiceRelay = makeRelay();
+  const noServiceCtx = makeCtx({ sessionController: {} });
+  const noServiceBridge = makeBridge(noServiceCtx, noServiceRelay);
+  noServiceBridge.attach();
+  await noServiceBridge.dispatch({ id: "perm-none", type: "session.permission", ts: Date.now(), payload: { sessionId: "sess-none" } });
+  await noServiceBridge.dispatch({ id: "perm-none-select", type: "session.selectPermission", ts: Date.now(), payload: { sessionId: "sess-none", permission: "read-only" } });
+  check("session.permission：无权限服务 fail-open 回 null", lastResult(noServiceRelay.sent, "perm-none")?.value?.permission === null, JSON.stringify(lastResult(noServiceRelay.sent, "perm-none")));
+  check("session.selectPermission：无权限服务明确回 service-unavailable", lastResult(noServiceRelay.sent, "perm-none-select")?.error?.code === "service-unavailable", JSON.stringify(lastResult(noServiceRelay.sent, "perm-none-select")));
+  noServiceBridge.dispose();
 }
 
 // ===========================================================================

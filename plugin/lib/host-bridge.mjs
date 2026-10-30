@@ -859,6 +859,8 @@ export class HostBridge {
   // 原始 chunk 顺序发 assistant.delta / assistant.reasoningDelta（跨类型也保序）。
   #streamBuf = new Map();
   #modelSelections = new Map(); // sessionId -> {provider, model, reasoningEffort?}（v1.0.8 内存态）
+  // v1.1.7：有效权限的直播兜底；权威查询仍优先走 permissions 持久投影。
+  #permissionSelections = new Map(); // sessionId -> string（含派生态 custom）
   #pending = new Map(); // askId -> { resolve, kind, sessionId, timer, abortHandler, signal }
   #titles = new Map(); // sessionId -> title（turn.end 推送文案用）
   #pushToken = ""; // 手机 push.register 上报的 token（内存态）
@@ -929,6 +931,7 @@ export class HostBridge {
     this.#on("api-session/removed", (sessionId) => {
       const key = String(sessionId);
       this.#titles.delete(key);
+      this.#permissionSelections.delete(key);
       // 会话没了，它的待执行列表与交付物历史条目也没有意义了（避免内存泄漏）
       this.#queues.delete(key);
       this.#deliveredEntries.delete(key);
@@ -1046,6 +1049,13 @@ export class HostBridge {
         this.#sendEvent("session.modelChanged", { sessionId, model: selection });
         return;
       }
+      if (type === "permission/preset" || type === "sandbox/mode" || type === "approval/policy") {
+        // v1.1.7：桌面端当前权限由这三类 knob 事件共同折叠，不是单看 preset。
+        // current(session) 与桌面端 permissions.currentValue 投影共用同一 derive；
+        // 因而直接改 sandbox/approval 导致的 custom 也能同步到手机。
+        this.#emitPermissionChanged(session, event);
+        return;
+      }
       if (type === "assistant/message") {
         // v1.0.9（§5.10）：助手消息里的图片 → 广播 assistant.image（带内联缩略图）。
         // 即便本条没有图片，也先把之前的流式文本/思考冲出去，保持时间线顺序。
@@ -1086,6 +1096,35 @@ export class HostBridge {
     });
 
     return () => this.dispose();
+  }
+
+  /**
+   * 权限 knob 变化 → session.permissionChanged（v1.1.7）。
+   * 新宿主用 permissionPresets.current(session) 取有效值；旧宿主没有 current 时，
+   * 只在明确的 permission/preset 事件上回退其 preset，不对 sandbox/approval 臆造值。
+   */
+  #emitPermissionChanged(session, event) {
+    const sessionId = String(session?.id ?? "");
+    if (sessionId === "") return;
+    const svc = this.#service("permissionPresets");
+    let permission = null;
+    if (svc && typeof svc.current === "function") {
+      try {
+        const current = svc.current(session);
+        if (typeof current === "string" && current !== "") permission = current;
+      } catch (e) {
+        this.#log("warn", "permission current failed; change event skipped", {
+          sessionId,
+          error: errText(e),
+        });
+      }
+    } else if (event?.type === "permission/preset") {
+      const preset = event?.data?.preset;
+      if (typeof preset === "string" && preset !== "") permission = preset;
+    }
+    if (permission === null) return;
+    this.#permissionSelections.set(sessionId, permission);
+    this.#sendEvent("session.permissionChanged", { sessionId, permission });
   }
 
   /** 广播归档全集（契约 §5.2 session.archives）。没有注册表 → 不发。 */
@@ -1809,6 +1848,10 @@ export class HostBridge {
           return await this.#rSessionSelectModel(m);
         case "session.model":
           return await this.#rSessionModel(m);
+        case "session.selectPermission":
+          return await this.#rSessionSelectPermission(m);
+        case "session.permission":
+          return await this.#rSessionPermission(m);
         case "session.queue":
           return this.#rSessionQueue(m);
         case "session.archive":
@@ -2465,6 +2508,146 @@ export class HostBridge {
       });
     }
     this.#reply(m, resultOf(m, { model: this.#modelSelections.get(sessionId) ?? null }));
+  }
+
+  /** 契约 §5.1/§5.8（v1.1.7）session.selectPermission：切换已存在会话的权限。
+   *  Host 不做根会话/subagent 的额外限制（App 自行限制入口）；未知 preset、Auto 准入
+   *  与 resolveAgent 的宿主拒绝均按原错误码/原文回传，绝不在本机假成功。 */
+  async #rSessionSelectPermission(m) {
+    const p = m.payload ?? {};
+    const sessionId = typeof p.sessionId === "string" ? p.sessionId : "";
+    const permission = typeof p.permission === "string" ? p.permission.trim() : "";
+    if (sessionId === "" || permission === "") {
+      this.#reply(m, errorOf(m, "bad-params", "sessionId and permission required"));
+      return;
+    }
+    const svc = this.#service("permissionPresets");
+    if (!svc || typeof svc.set !== "function") {
+      this.#reply(m, errorOf(m, "service-unavailable", "permissionPresets.set unavailable"));
+      return;
+    }
+    let sc = null;
+    try {
+      sc = this.#sc();
+    } catch (e) {
+      this.#reply(m, errorOf(m, "service-unavailable", errText(e)));
+      return;
+    }
+    if (typeof sc.resolveAgent !== "function") {
+      this.#reply(m, errorOf(m, "service-unavailable", "sessionController.resolveAgent unavailable"));
+      return;
+    }
+    let session = null;
+    try {
+      const agentRes = await sc.resolveAgent(sessionId);
+      // 与创建时一致：兼容直接 Agent、{agent} 与旧版 {error}；拒绝不得改写。
+      if (agentRes?.error) throw agentRes.error;
+      session = agentRes?.agent?.session ?? agentRes?.session ?? null;
+      if (!session) {
+        this.#reply(m, errorOf(m, "session-not-found", `session "${sessionId}" has no live agent`));
+        return;
+      }
+    } catch (e) {
+      const err = hostErrorOf(e, "session-select-permission-failed");
+      this.#log("warn", "resolveAgent for selectPermission failed", { sessionId, code: err.code });
+      this.#reply(m, errorOf(m, err.code, err.message));
+      return;
+    }
+    try {
+      await svc.set(session, permission);
+    } catch (e) {
+      const err = hostErrorOf(e, "session-select-permission-failed");
+      this.#log("warn", "selectPermission failed", { sessionId, code: err.code });
+      this.#reply(m, errorOf(m, err.code, err.message));
+      return;
+    }
+    // set() 已成功即不能把它伪装成失败。新宿主回读有效值（与桌面端同 derive），
+    // 旧宿主没有 current() 时回显刚被 set 接受的 preset。
+    let selected = permission;
+    if (typeof svc.current === "function") {
+      try {
+        const current = svc.current(session);
+        if (typeof current === "string" && current !== "") selected = current;
+      } catch (e) {
+        this.#log("warn", "permission current readback failed; returning accepted preset", {
+          sessionId,
+          error: errText(e),
+        });
+      }
+    }
+    this.#permissionSelections.set(sessionId, selected);
+    this.#reply(m, resultOf(m, { permission: selected }));
+  }
+
+  /** 契约 §5.1/§5.8（v1.1.7）session.permission：查询有效权限。
+   *  权威来源是 permissions 持久投影 values.permissions.currentValue（桌面端同源），
+   *  因而根会话与 subagent 都可冷读，且不要求激活 live Agent。投影不可用时依次退回
+   *  permissionPresets.current(liveSession) 与直播内存态；全部不可用回 null，不臆造。 */
+  async #rSessionPermission(m) {
+    const p = m.payload ?? {};
+    const sessionId = typeof p.sessionId === "string" ? p.sessionId : "";
+    if (sessionId === "") {
+      this.#reply(m, errorOf(m, "bad-params", "sessionId required"));
+      return;
+    }
+    try {
+      const sc = this.#sc();
+      if (typeof sc.projections === "function") {
+        const projections = await sc.projections({ sessionId }, this.#signal(10_000));
+        const view = projections?.values?.permissions;
+        if (view !== undefined && view !== null) {
+          const permission =
+            typeof view.currentValue === "string" && view.currentValue !== "" ? view.currentValue : null;
+          if (permission !== null) this.#permissionSelections.set(sessionId, permission);
+          this.#reply(m, resultOf(m, { permission }));
+          return;
+        }
+      }
+    } catch (e) {
+      this.#log("warn", "permissions projection unavailable; falling back to live tracking", {
+        sessionId,
+        error: errText(e),
+      });
+    }
+
+    // 旧宿主没有 permissions 投影时，live Session 的 current() 仍是有效值权威来源。
+    // 但 subagent 查询绝不能为了兜底而激活 Agent：先用 inspect 冷读身份，命中即只回内存态。
+    try {
+      const svc = this.#service("permissionPresets");
+      const sc = this.#sc();
+      let coldSubagent = false;
+      if (typeof sc.inspect === "function") {
+        try {
+          const inspected = await sc.inspect(sessionId, this.#signal(10_000));
+          const meta = inspected?.meta;
+          coldSubagent = meta?.origin === "subagent" ||
+            (typeof meta?.parentSessionId === "string" && meta.parentSessionId !== "");
+        } catch (e) {
+          this.#log("warn", "permission subagent identity inspect unavailable", {
+            sessionId,
+            error: errText(e),
+          });
+        }
+      }
+      if (!coldSubagent && svc && typeof svc.current === "function" && typeof sc.resolveAgent === "function") {
+        const agentRes = await sc.resolveAgent(sessionId);
+        const session = agentRes?.agent?.session ?? agentRes?.session ?? null;
+        if (session) {
+          const current = svc.current(session);
+          if (typeof current === "string" && current !== "") {
+            this.#permissionSelections.set(sessionId, current);
+            this.#reply(m, resultOf(m, { permission: current }));
+            return;
+          }
+        }
+      }
+    } catch (e) {
+      this.#log("warn", "live permission read unavailable; falling back to tracked value", {
+        sessionId,
+        error: errText(e),
+      });
+    }
+    this.#reply(m, resultOf(m, { permission: this.#permissionSelections.get(sessionId) ?? null }));
   }
 
   /** 模式目录（宿主 Agent preset 目录）。服务缺失/抛错 → 空目录。 */

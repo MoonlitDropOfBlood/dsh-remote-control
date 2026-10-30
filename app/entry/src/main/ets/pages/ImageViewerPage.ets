@@ -8,7 +8,7 @@
 import { HRouter } from 'hrouter';
 import { sessionStore } from '../model/sessionstore';
 import { ImageViewerParam, goBack } from '../model/routes';
-import { FS_CAPTION, FS_SMALL, RADIUS_CTRL, SP_2, SP_3, SP_4 } from '../model/theme';
+import { FS_CAPTION, FS_SMALL, RADIUS_PILL, SP_2, SP_3, SP_4 } from '../model/theme';
 
 /** 缩放上下限（契约：1x~4x）。 */
 const SCALE_MIN: number = 1;
@@ -126,7 +126,7 @@ export struct ImageViewerPage {
       .width(36)
       .height(36)
       .backgroundColor($r('app.color.bg_layer_2'))
-      .borderRadius(RADIUS_CTRL)
+      .borderRadius(RADIUS_PILL)
       .onClick((): void => {
         goBack();
       })

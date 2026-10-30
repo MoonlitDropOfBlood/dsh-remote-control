@@ -39,6 +39,12 @@
 > ② **直播事件保序（§5.2 末注）**：正文/思考增量共用一条按 session 保序的合并队列；
 > `turn.end` 在全部待发增量之后发出；`tool.call` / `tool.result` / `assistant.image`
 > 不越过未冲刷的文本/思考增量（客户端按到达顺序渲染，依赖该保证）。
+> **v1.1.7 于 2026-10-30 修订（会话权限切换 + 收发保序闭环）**：
+> ① 新增 `session.permission` / `session.selectPermission` 请求与
+> `session.permissionChanged` 事件（§5.1/§5.2/§5.8）；当前权限与桌面端同读
+> `permissions.currentValue` 持久投影，catalog 仍沿用 `session.capabilities.permissions`；
+> ② §4 明确发送端按 seq 串行加密+发送、接收端按 WS 到达顺序串行解密+分发，
+> 重连/停止后旧连接代次的异步回调不得再发送/分发，补齐直播保序的收发闭环。
 > 三个实现（DSH 插件 / 中继服务器 / HarmonyOS App）
 > 都必须以本文档为准；任何协议改动必须先改本文档并通知 Lead。
 
@@ -170,7 +176,15 @@ dshrc://pair?r=<encodeURIComponent(relayUrl)>&c=<channel>&s=<secret>[&t=<encodeU
 - `ch` 必须匹配 `^[A-Z2-7]{16,64}$`；同一 channel 同一 role 只允许一个活跃连接（新连接顶掉旧连接）。
 - **离线缓存**：对端不在线时，中继缓存发往该端的 `frame`，上限 256 条 / 24h（FIFO 丢旧），重连后按 seq 顺序补发。
   `urgent` 标记的帧（审批/提问）优先补发。
-- seq 为发送端单调递增序号（**每条连接从 1 开始**），用于去重与排序；接收端容忍乱序（按 seq 缓冲或直接上交应用层均可）。
+- seq 为发送端单调递增序号（**每条连接从 1 开始**），用于去重与排序。
+- **v1.1.7 发送保序**：同一连接的发送端必须只有一条顺序发送链，严格按 seq 递增顺序完成
+  **加密并调用 WebSocket send**；后一 seq 的异步加密即使先完成，也不得越过前一 seq 先发送。
+- **v1.1.7 接收保序**：接收端必须按 **WebSocket 实际到达顺序**串行完成每帧的
+  **解密 + 业务分发**，前一帧分发完成后才处理下一帧；不得并行解密后按 Promise 完成先后分发，
+  也不得用「按 seq 重排」替代 WS 到达顺序。`sid:seq` 仍按本节约束用于去重。
+- **v1.1.7 连接代次失效**：重连或停止立即使旧连接代次失效；旧代次已经在途的加密、解密、
+  定时器及其他异步回调，即使稍后完成，也不得再向 WebSocket 发送或向业务层分发。
+  新连接使用新的发送/接收链，不继续执行旧代次队列。
 - **v1.1.3：中继是哑管道**——它**不验证** `sig`（没有密钥），只**原样复制**对端 hello 证明到
   `welcome.peer` / `peer-joined.peer`。复制时**字段必须逐字透传**（不重排、不补默认值、
   不校验数值），否则对端验签失败。`peer-joined` 在该 role **真正新上线**时发；
@@ -212,6 +226,8 @@ dshrc://pair?r=<encodeURIComponent(relayUrl)>&c=<channel>&s=<secret>[&t=<encodeU
 | `session.unarchive` | `{sessionId}` | `{sessionId, archived:false}` | **v1.0.7** 从 Workspace 归档集合恢复；幂等 |
 | `session.selectModel` | `{sessionId, model:ModelSelection}` | `{model:ModelSelection}` | **v1.0.8** 对**已存在会话**切换模型/思考强度；插件调 `sessionController.selectModel({sessionId,…})`。Host 拒绝时回 `error`（原文带出），成功回归一化后的 selection，并视为一次 `model/selection`（同样触发 `session.modelChanged`） |
 | `session.model` | `{sessionId}` | `{model:ModelSelection\|null}` | **v1.0.8** 查询会话当前模型/思考强度。**v1.1.4 改数据源**：优先读宿主 `modelSelection` **持久投影**（`sessionController.projections` 的 `values.modelSelection`，视图 `{lastUsed, next}`，`next = pending ?? lastUsed`）——与桌面端 composer 同源（`selection = projected.next ?? catalog.default`）；投影不可用才退回 `model/selection` 直播事件维护的内存态；两者皆空回 `null`（客户端回退展示目录默认，与 PC 的 `catalog.default` 回退一致），**不得臆造** |
+| `session.selectPermission` | `{sessionId, permission:string}` | `{permission:string}` | **v1.1.7** 对已存在会话切换权限档位；Host 取 live Session 后调 `permissionPresets.set(session, permission)`，成功回读并返回有效当前值。宿主拒绝（未知 preset、Auto 准入、会话不可解析等）按原错误码/原文回 `error`，不得假成功。**App 只在根会话详情页提供此动作；Host 不额外禁止 subagent select** |
+| `session.permission` | `{sessionId}` | `{permission:string\|null}` | **v1.1.7** 查询会话有效当前权限。优先读 `sessionController.projections` 的 `values.permissions.currentValue`（与桌面端同源；可能是派生态 `custom`），不可用时依次退回 live `permissionPresets.current(session)` 与直播内存态，皆无则回 `null`。subagent 查询为只读冷读，不得为查询激活 Agent |
 | `session.prompt` | `{sessionId, text}` | `{accepted:bool, mode:'queue'\|'steer'}` | 立即返回；实际回复走事件流。**v1.1.2 起投递行为由宿主设置决定**：客户端**不传** mode（传了也**忽略**）。插件读宿主「繁忙时的发送行为」（`ui-conversation.busyEnter`：排队发送/插话发送），agent 忙时按设置投递、空闲时总是 queue；宿主拒绝插话时插件**自动退回 queue**（消息不丢）。回包的 `mode` 是**实际**使用的投递行为 |
 | `session.queue` | `{sessionId}` | `{sessionId, items:[{itemId, text, target:'next-turn'\|'next-step'}]}` | **v1.1.2** 拉取该会话**当前**待执行消息的全量快照。与 §5.2 的 `session.queue` 事件同形状：事件只在**变化时**推，客户端断线重连后必须拉一次才能补上断线期间变过的队列 |
 | `session.cancel` | `{sessionId}` | `{cancelled:bool}` | 取消当前运行的 turn |
@@ -231,6 +247,7 @@ dshrc://pair?r=<encodeURIComponent(relayUrl)>&c=<channel>&s=<secret>[&t=<encodeU
 | `session.status` | `{sessionId, running:bool}` | 事件 `api-session/status` / `agent/status` |
 | `session.archives` | `{archivedSessionIds:string[]}` | **v1.0.7** Workspace `domain/changed` 后的归档全集快照；客户端据此覆盖各行 `archived`，不做增量猜测 |
 | `session.modelChanged` | `{sessionId, model:ModelSelection}` | **v1.0.8** 会话模型/思考强度变化：源为 Host 会话事件 `model/selection`（桌面端切换、手机端 `session.selectModel` 都会触发）；客户端更新会话当前模型显示 |
+| `session.permissionChanged` | `{sessionId, permission:string}` | **v1.1.7** 有效当前权限变化：源为 Host 会话事件 `permission/preset`、`sandbox/mode`、`approval/policy` 三类 knob；每条按 Host 顺序携带 `permissionPresets.current(session)` 有效值（含派生态 `custom`），与桌面端 `permissions.currentValue` 同口径。客户端更新当前权限显示；`custom` 仅可展示，不得变成选择目标 |
 | `session.activity` | `{sessionId, updatedAt}` | 事件 `api-session/activity` |
 | `session.queue` | `{sessionId, items:[{itemId, text, target:'next-turn'\|'next-step'}]}` | **v1.1.1** 该会话**待执行**的用户消息（排队中 / 已插入当前 turn 但尚未消费）。源为 Host 会话事件 `agent/inbox/spliced`（入队）与 `user/message`（被消费时出队）。客户端据此显示「排队中」列表——**只做展示，不做猜测**；items 为空数组 = 没有待执行消息 |
 | `assistant.delta` | `{sessionId, text}` | 事件 `agent/assistant-stream`（文本增量；**按 sessionId 合并节流 ≤8 条/秒**）。**v1.1.6**：与思考增量共用保序队列（见本表末注） |
@@ -352,7 +369,7 @@ Host `sessionController.list` 本身仍不回归档标记，插件必须用
 **降级**：宿主/旧插件不提供步骤（无 `steps` 字段、无 `tool.*` 事件）时，客户端只渲染
 `messages`，功能不受影响——**不得**因此报错或阻断会话。
 
-### 5.8 新建会话的「模式 / 权限 / 模型 / 思考强度」（v1.0.6；模型 v1.0.7；强度与切换 v1.0.8）
+### 5.8 新建会话的「模式 / 权限 / 模型 / 思考强度」（v1.0.6；模型 v1.0.7；强度与切换 v1.0.8；权限切换 v1.1.7）
 
 手机端「新建会话」允许在创建前选择 Host 已有的**模式**（Agent preset）、**权限档位**
 （permission preset）、**模型**与**思考强度**，与 DSH 桌面端语义一致：
@@ -395,6 +412,15 @@ Host `sessionController.list` 本身仍不回归档标记，插件必须用
 - **v1.0.8 会话中切换**：`session.selectModel` 对已存在会话调 `sessionController.selectModel`，
   下一次 prompt 组装即用新模型（与桌面端语义一致；运行中的 turn 不受影响）。客户端把入口放在
   会话详情页输入框旁（模型+强度一起选）；当前值用 `session.model` 读取、`session.modelChanged` 保持实时。
+- **v1.1.7 会话中切换权限**：可选 catalog 继续复用 `session.capabilities.permissions`，不另建
+  wire 目录；根会话详情页用 `session.permission` 读当前值、`session.selectPermission` 提交选择，
+  并监听 `session.permissionChanged` 接收桌面端或其他端的变更。Host 以
+  `values.permissions.currentValue` / `permissionPresets.current(session)` 的有效值为准，
+  **不是只回显最近一次 `permission/preset`**——直接改 sandbox/approval 可能得到 `custom`。
+- **v1.1.7 `custom` 与 subagent 边界**：`custom` 是宿主 knob 组合不匹配任何 preset 时的派生
+  当前态，只允许出现在查询/事件/切换成功回读中，绝不出现在可选 catalog，也不得由客户端作为
+  切换目标。subagent 的 `session.permission` 查询必须支持（只读、冷读、不激活）；App 不在
+  subagent 详情页提供选择动作，Host 则不额外增加 subagent select 禁令。
 
 ### 5.9 Workspace 真实归档同步（v1.0.7）
 
@@ -642,10 +668,17 @@ AAD     = ""   ← 注意：本 KAT 用空 AAD，便于对齐；AAD 绑定逻辑
     `PresetOption = { id, name, description? }`（`id` 即提交用的 key；`custom` 只是展示态，永不可选）。
     **⚠️ 宿主 0.2.1-rc.2 实测：catalog 的 option 字段名是 `value`（不是 `id`）**——
     插件两种字段名都要接受，**wire 侧统一输出 `id`**（本契约口径）。
-  - `set(session, name): void` —— 把档位写入**某个已存在的会话**（追加 `permission/preset` 与
-    沙箱/审批 knob 事件）；需拿到 live Session 对象（`sessionController.resolveAgent(sessionId)`
-    → 宿主 0.2.1-rc.2 **直接返回 Agent**（失败时 throw），更早/更晚版本可能返回 `{agent}|{error}`，
-    插件两种形状都要兜住）。
+  - `set(session, name): void` —— 把档位写入**某个已存在的会话**（有效 preset 变化时追加
+    `permission/preset`，再通过权威 setter 写 `sandbox/mode` / `approval/policy`；净变化为零不追加）；
+    需拿到 live Session 对象（`sessionController.resolveAgent(sessionId)` → 宿主 0.2.1-rc.2
+    **直接返回 Agent**（失败时 throw），更早/更晚版本可能返回 `{agent}|{error}`，插件两种形状都要兜住）。
+    桌面端当前会话选择通过 `/permission <preset>` 命令，最终也落到此 `set()` 路径。
+  - **当前有效权限（v1.1.7 核对安装源码）**：`current(session): string` 与
+    `sessionController.projections({sessionId}, signal)` → `values.permissions.currentValue`
+    使用同一 derive；`permissions` 投影由 `permission/preset`、`sandbox/mode`、`approval/policy`
+    三类事件折叠。返回配置 preset、`auto` 或派生态 `custom`；桌面端
+    `dsh-client-ui-permission-presets` 正是读取 `session.projections.faceOf("permissions").getSnapshot()`。
+    `projections` 支持冷读持久会话（含 subagent），查询不应为此调用 `resolveAgent` 激活。
   - 宿主未装载该插件时 `ctx.get('permissionPresets')` 为空 → 插件回空目录，客户端隐藏权限选择。
 - **内容块**：`ContentBlock` 的 `type` ∈ `text` / `image` / `file` / `reasoning` / `tool-call` …；
   结果文本只取 `type==='text'` 的 `text` 拼接，image/file 用占位符（`[图片]` / `[文件]`）。

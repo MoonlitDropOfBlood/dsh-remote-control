@@ -92,6 +92,8 @@ export const MSG_SESSION_ARCHIVE: string = 'session.archive'; // v1.0.7：Worksp
 export const MSG_SESSION_UNARCHIVE: string = 'session.unarchive'; // v1.0.7：从 Workspace 归档恢复
 export const MSG_SESSION_SELECT_MODEL: string = 'session.selectModel'; // v1.0.8：会话中切换模型/思考强度
 export const MSG_SESSION_MODEL: string = 'session.model'; // v1.0.8：查询会话当前模型
+export const MSG_SESSION_SELECT_PERMISSION: string = 'session.selectPermission'; // 会话中切换权限
+export const MSG_SESSION_PERMISSION: string = 'session.permission'; // 查询会话当前权限
 export const MSG_IMAGE_FETCH: string = 'image.fetch'; // v1.0.9：拉取图片大图（§5.10）
 export const MSG_SESSION_QUEUE: string = 'session.queue'; // v1.1.1：拉取待执行消息快照（§5.2）
 export const MSG_SESSION_PROMPT: string = 'session.prompt';
@@ -114,6 +116,7 @@ export const TOPIC_SESSION_ACTIVITY: string = 'session.activity';
 export const TOPIC_SESSION_ARCHIVES: string = 'session.archives'; // v1.0.7：Workspace 归档全集快照
 export const TOPIC_SESSION_QUEUE: string = 'session.queue'; // v1.1.1：待执行消息（排队中 / 已插入当前 turn）
 export const TOPIC_SESSION_MODEL_CHANGED: string = 'session.modelChanged'; // v1.0.8：会话模型/强度变化
+export const TOPIC_SESSION_PERMISSION_CHANGED: string = 'session.permissionChanged'; // 会话权限变化
 export const TOPIC_ASSISTANT_DELTA: string = 'assistant.delta';
 export const TOPIC_ASSISTANT_REASONING_DELTA: string = 'assistant.reasoningDelta'; // v1.0.7：思考增量
 export const TOPIC_ASSISTANT_IMAGE: string = 'assistant.image'; // v1.0.9：会话消息里的图片（§5.10）
@@ -271,6 +274,8 @@ export interface DshrcValue {
   permissions?: DshrcPermissionOption[];
   defaultPreset?: string;
   defaultPermission?: string;
+  // session.permission / session.selectPermission / session.permissionChanged
+  permission?: string;
   // session.capabilities（§5.1 v1.0.7）：模型目录 + 真实归档能力标记
   models?: DshrcModelOption[];
   defaultModelId?: string;

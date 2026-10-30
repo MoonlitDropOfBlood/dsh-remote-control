@@ -7,7 +7,8 @@
  *  - assistant.delta 流式追加到当前气泡（带光标），turn.end 定稿
  *  - 底部输入条 + 发送；running 时显示「取消」；顶部标题栏 + 运行状态徽标
  *  - 本会话的审批 / 提问卡片内嵌在输入条上方（AskCards），resolved 后自动消失
- *  - v1.0.8：输入条上方「模型 / 思考强度」胶囊 → bindSheet 选模型与强度（session.selectModel）
+ *  - 输入区上方「模型 / 思考强度 / 权限」：根会话可切换；subagent 全部只读，
+ *    一次性 subagent 无输入条但仍保留三项信息。
  *  - v1.1.4：模型/强度显示与 PC composer 同口径（modelSelection 投影 + 默认强度回退）；
  *    markdown 代码块/表格复制接入系统剪贴板（此前报「未设置复制监听」）
  *  - v1.1.1：待执行消息列表（宿主 session.queue 事件）在输入区上方展示，只展示不猜测
@@ -21,6 +22,7 @@ import {
   DshrcEffortOption,
   DshrcModelOption,
   DshrcModelSelection,
+  DshrcPermissionOption,
   DshrcPromptResult,
   DshrcQueueItem
 } from '../model/protocol';
@@ -108,6 +110,10 @@ export struct SessionDetailPage {
   @Local followBottom: boolean = true;
   /** 模型选择面板是否展开（V2 bindSheet 用 $$ 双向绑定）。 */
   @Local modelSheetOpen: boolean = false;
+  /** 权限选择面板是否展开；subagent 永远不会置 true。 */
+  @Local permissionSheetOpen: boolean = false;
+  /** 权限面板内选中的预设 id（custom 不进入目录）。 */
+  @Local sheetPermissionId: string = '';
   /** 下拉刷新进行中（Refresh !! 双向绑定）。 */
   @Local refreshing: boolean = false;
   /** 面板内选中的模型目录 id。 */
@@ -228,6 +234,7 @@ export struct SessionDetailPage {
       this.store.loadHistory(this.sessionId, false);
       // 契约 §5.1 v1.0.8：拉会话当前模型 / 思考强度（静默，失败不打扰时间线）
       this.store.loadSessionModel(this.sessionId);
+      this.store.loadSessionPermission(this.sessionId);
       // 契约 §5.2 v1.1.2：拉待执行消息快照（事件只在变化时推 → 重连后必须拉一次）
       this.store.loadQueue(this.sessionId);
       // v1.1.2：拉宿主「繁忙时的发送行为」（只读展示，手机端不提供切换）
@@ -246,6 +253,7 @@ export struct SessionDetailPage {
             this.store.openSession(this.sessionId);
             this.store.loadHistory(this.sessionId, false);
             this.store.loadSessionModel(this.sessionId);
+            this.store.loadSessionPermission(this.sessionId);
           }
         }
       },
@@ -256,6 +264,7 @@ export struct SessionDetailPage {
           this.store.loadHistory(this.sessionId, false);
           // 重进页面刷新会话当前模型（桌面端切换后回来即最新）
           this.store.loadSessionModel(this.sessionId);
+          this.store.loadSessionPermission(this.sessionId);
           this.maybeLoadSubagents();
         }
       }
@@ -635,6 +644,9 @@ export struct SessionDetailPage {
   /** 打开面板：初值 = 当前会话模型（未知 → 目录默认）；强度取**有效值**（与 PC 选择器
    *  同口径：显式强度 → 所选模型默认强度 → 「默认」）。 */
   private openModelSheet(): void {
+    if (this.isSubagentView()) {
+      return; // 所有 subagent 的模型/强度只读展示，不允许切换
+    }
     const cur: DshrcModelOption | undefined = this.currentModelOption();
     const def: DshrcModelOption | undefined = this.defaultModelOption();
     const base: DshrcModelOption | undefined = cur !== undefined ? cur : def;
@@ -691,6 +703,10 @@ export struct SessionDetailPage {
 
   /** 应用：按目录项构造 ModelSelection 调 session.selectModel（成功收面板，失败回主机原文）。 */
   private applySheetModel(): void {
+    if (this.isSubagentView()) {
+      this.modelSheetOpen = false;
+      return;
+    }
     const option: DshrcModelOption | undefined = this.modelOptionById(this.sheetModelId);
     if (option === undefined) {
       promptAction.showToast({ message: '模型目录不可用', duration: 2000 });
@@ -708,7 +724,110 @@ export struct SessionDetailPage {
     });
   }
 
-  /** 输入条上方的「模型 / 思考强度」胶囊（one-shot 只读会话随输入条一起隐藏）。 */
+  /** 当前权限显示名；custom 是 Host 派生状态，只展示，不伪造成 catalog 预设。 */
+  private permissionCapsuleText(): string {
+    const current: string | null = this.store.sessionPermission;
+    if (current === 'custom') {
+      return '自定义权限';
+    }
+    const permissions: DshrcPermissionOption[] = this.store.permissions;
+    if (current !== null) {
+      for (let i: number = 0; i < permissions.length; i++) {
+        if (permissions[i].id === current) {
+          return permissions[i].name;
+        }
+      }
+      return current;
+    }
+    if (this.isSubagentView()) {
+      return '权限';
+    }
+    for (let i: number = 0; i < permissions.length; i++) {
+      if (permissions[i].id === this.store.defaultPermissionId) {
+        return permissions[i].name;
+      }
+    }
+    return '权限';
+  }
+
+  private permissionSelectOptions(): SelectOption[] {
+    const out: SelectOption[] = [];
+    const permissions: DshrcPermissionOption[] = this.store.permissions;
+    for (let i: number = 0; i < permissions.length; i++) {
+      out.push({ value: permissions[i].name });
+    }
+    return out;
+  }
+
+  private permissionSelectIndex(): number {
+    const permissions: DshrcPermissionOption[] = this.store.permissions;
+    for (let i: number = 0; i < permissions.length; i++) {
+      if (permissions[i].id === this.sheetPermissionId) {
+        return i;
+      }
+    }
+    return permissions.length > 0 ? 0 : -1;
+  }
+
+  private permissionSelectValue(): string {
+    const permissions: DshrcPermissionOption[] = this.store.permissions;
+    const index: number = this.permissionSelectIndex();
+    return index >= 0 && index < permissions.length ? permissions[index].name : '选择权限';
+  }
+
+  private openPermissionSheet(): void {
+    if (this.isSubagentView()) {
+      return; // 所有 subagent 权限只读，continuable 也不例外
+    }
+    const permissions: DshrcPermissionOption[] = this.store.permissions;
+    if (permissions.length === 0) {
+      promptAction.showToast({ message: '权限目录不可用', duration: 1800 });
+      return;
+    }
+    const current: string | null = this.store.sessionPermission;
+    let selected: string = current !== null && current !== 'custom' ? current : this.store.defaultPermissionId;
+    let found: boolean = false;
+    for (let i: number = 0; i < permissions.length; i++) {
+      if (permissions[i].id === selected) {
+        found = true;
+        break;
+      }
+    }
+    this.sheetPermissionId = found ? selected : permissions[0].id;
+    this.permissionSheetOpen = true;
+  }
+
+  private onSheetPermissionSelect(index: number): void {
+    const permissions: DshrcPermissionOption[] = this.store.permissions;
+    if (index >= 0 && index < permissions.length) {
+      this.sheetPermissionId = permissions[index].id;
+    }
+  }
+
+  private applySheetPermission(): void {
+    if (this.isSubagentView()) {
+      this.permissionSheetOpen = false;
+      return;
+    }
+    const permissions: DshrcPermissionOption[] = this.store.permissions;
+    const index: number = this.permissionSelectIndex();
+    if (index < 0 || index >= permissions.length) {
+      promptAction.showToast({ message: '权限目录不可用', duration: 1800 });
+      return;
+    }
+    const selected: string = permissions[index].id;
+    if (selected === 'custom') {
+      return; // 防御：custom 永不是合法选择目标
+    }
+    this.store.applyPermissionSelection(this.sessionId, selected).then((): void => {
+      promptAction.showToast({ message: '已切换权限', duration: 1500 });
+      this.permissionSheetOpen = false;
+    }).catch((e: Error): void => {
+      promptAction.showToast({ message: e.message, duration: 2500 });
+    });
+  }
+
+  /** 输入区上方的「模型 / 思考强度」胶囊；subagent 仅展示且没有下拉箭头。 */
   @Builder
   modelCapsule() {
     Row() {
@@ -723,32 +842,147 @@ export struct SessionDetailPage {
           .fontColor($r('app.color.label_tertiary'))
           .margin({ left: SP_1 })
       }
-      SymbolGlyph($r('sys.symbol.chevron_down'))
-        .fontSize(14)
-        .fontColor([$r('app.color.label_tertiary')])
-        .width(16)
-        .height(14)
-        .margin({ left: SP_1 })
+      if (this.isSubagentView()) {
+        Text('只读')
+          .fontSize(FS_CAPTION)
+          .fontColor($r('app.color.label_tertiary'))
+          .margin({ left: SP_1 })
+      } else {
+        SymbolGlyph($r('sys.symbol.chevron_down'))
+          .fontSize(14)
+          .fontColor([$r('app.color.label_tertiary')])
+          .width(16)
+          .height(14)
+          .margin({ left: SP_1 })
+      }
     }
     .padding({ left: SP_2, right: SP_2, top: SP_1, bottom: SP_1 })
     .backgroundColor($r('app.color.bg_layer_2'))
     .borderRadius(RADIUS_PILL)
     .border({ width: HAIRLINE, color: $r('app.color.border_l1') })
-    .constraintSize({ maxWidth: '76%' })
+    .constraintSize({ maxWidth: '55%' })
     .onClick((): void => {
       this.openModelSheet();
     })
+  }
+
+  /** 权限胶囊：根会话可切换；subagent 与一次性 subagent 均只读。 */
+  @Builder
+  permissionCapsule() {
+    Row() {
+      Text(this.permissionCapsuleText())
+        .fontSize(FS_SMALL)
+        .fontColor($r('app.color.label_secondary'))
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+      Text(this.isSubagentView() ? '只读' : '权限')
+        .fontSize(FS_CAPTION)
+        .fontColor($r('app.color.label_tertiary'))
+        .margin({ left: SP_1 })
+      if (!this.isSubagentView()) {
+        SymbolGlyph($r('sys.symbol.chevron_down'))
+          .fontSize(14)
+          .fontColor([$r('app.color.label_tertiary')])
+          .width(16)
+          .height(14)
+          .margin({ left: SP_1 })
+      }
+    }
+    .padding({ left: SP_2, right: SP_2, top: SP_1, bottom: SP_1 })
+    .backgroundColor($r('app.color.bg_layer_2'))
+    .borderRadius(RADIUS_PILL)
+    .border({ width: HAIRLINE, color: $r('app.color.border_l1') })
+    .constraintSize({ maxWidth: '40%' })
+    .onClick((): void => {
+      this.openPermissionSheet();
+    })
+    .bindSheet(this.permissionSheetOpen, this.permissionSheet(), {
+      height: SheetSize.FIT_CONTENT,
+      showClose: false,
+      dragBar: true,
+      backgroundColor: $r('app.color.bg_layer_1'),
+      onDisappear: (): void => {
+        this.permissionSheetOpen = false;
+      }
+    })
+  }
+
+  /**
+   * 弹窗头部：标题 + 关闭按钮。
+   *
+   * **不要用 bindSheet 的 `showClose`**：不给 `title` 时系统关闭图标是**悬浮在内容层
+   * 右上角**的，会正好压住选择框的右端（真机实测：权限面板的 ✕ 盖在 Select 上面）。
+   * 自绘头部后彻底避开，关闭入口行为也更可控。
+   */
+  @Builder
+  sheetHeader(title: string, onClose: () => void) {
+    Row() {
+      Text(title)
+        .fontSize(FS_SUBTITLE)
+        .fontColor($r('app.color.label_primary'))
+      Blank()
+      Button() {
+        Text('✕')
+          .fontSize(18)
+          .fontColor($r('app.color.label_primary'))
+      }
+      .type(ButtonType.Normal)
+      .width(36)
+      .height(36)
+      .backgroundColor($r('app.color.bg_layer_2'))
+      .borderRadius(RADIUS_PILL)
+      .onClick((): void => {
+        onClose();
+      })
+    }
+    .width('100%')
+    .alignItems(VerticalAlign.Center)
+    .margin({ bottom: SP_3 })
+  }
+
+  /** 权限选择面板；catalog 只含真实预设，不含派生态 custom。 */
+  @Builder
+  permissionSheet() {
+    Column() {
+      this.sheetHeader('切换权限', (): void => {
+        this.permissionSheetOpen = false;
+      })
+      Select(this.permissionSelectOptions())
+        .selected(this.permissionSelectIndex())
+        .value(this.permissionSelectValue())
+        .fontColor($r('app.color.label_primary'))
+        .selectedOptionFontColor($r('app.color.brand_label'))
+        .optionFontColor($r('app.color.label_primary'))
+        .menuBackgroundColor($r('app.color.bg_layer_1'))
+        .width('100%')
+        .onSelect((index: number, value?: string): void => {
+          this.onSheetPermissionSelect(index);
+        })
+      if (this.store.sessionPermission === 'custom') {
+        Text('当前是自定义权限；应用预设后将替换这组自定义设置。')
+          .fontSize(FS_CAPTION)
+          .fontColor($r('app.color.label_secondary'))
+          .width('100%')
+          .margin({ top: SP_2 })
+      }
+      Button('应用')
+        .width('100%')
+        .margin({ top: SP_4 })
+        .onClick((): void => {
+          this.applySheetPermission();
+        })
+    }
+    .padding(SP_4)
+    .width('100%')
   }
 
   /** 模型 / 思考强度选择面板（bindSheet 内容）。 */
   @Builder
   modelSheet() {
     Column() {
-      Text('模型与思考强度')
-        .fontSize(FS_SUBTITLE)
-        .fontColor($r('app.color.label_primary'))
-        .width('100%')
-        .margin({ bottom: SP_3 })
+      this.sheetHeader('模型与思考强度', (): void => {
+        this.modelSheetOpen = false;
+      })
 
       Text('模型')
         .fontSize(FS_CAPTION)
@@ -912,6 +1146,10 @@ export struct SessionDetailPage {
     if (this.store.linkState !== 'online') {
       promptAction.showToast({ message: '未连接，请先在配对页连接中继', duration: 2500 });
       return;
+    }
+    if (this.isSubagentView() && this.subagentMode() === 'one-shot') {
+      promptAction.showToast({ message: '一次性子代理仅支持查看', duration: 1800 });
+      return; // 不仅隐藏输入条，发送逻辑也禁止绕过
     }
     // 捕获原会话 id：主机回包是异步的，期间用户可能已经切到别的会话
     const sid: string = this.sessionId;
@@ -1303,6 +1541,16 @@ export struct SessionDetailPage {
         .scrollBar(BarState.Off)
       }
 
+      // 模型 / 强度 / 权限：所有会话可见；subagent 全部只读，一次性也不随输入条隐藏。
+      Row({ space: SP_2 }) {
+        this.modelCapsule()
+        this.permissionCapsule()
+        Blank()
+      }
+      .width('100%')
+      .alignItems(VerticalAlign.Center)
+      .padding({ left: SP_3, right: SP_3, top: SP_2, bottom: SP_1 })
+
       // 输入条：one-shot 子代理只读（契约 §5.6：一次性子代理不能发消息），其余正常
       if (this.isSubagentView() && this.subagentMode() === 'one-shot') {
         Row() {
@@ -1322,15 +1570,6 @@ export struct SessionDetailPage {
           if (this.pendingQueue().length > 0) {
             this.pendingQueueBar()
           }
-          // 模型 / 思考强度胶囊（v1.0.8）：在输入框上方一行，点击弹选择面板
-          Row() {
-            this.modelCapsule()
-            Blank()
-          }
-          .width('100%')
-          .alignItems(VerticalAlign.Center)
-          .padding({ left: SP_3, right: SP_3, top: SP_2, bottom: SP_1 })
-
           // 繁忙时的发送行为：**只读**（v1.1.2）——行为由 DSH 设置决定
           // （「繁忙时的发送行为：排队发送/插话发送」），手机端不提供切换。
           if (this.agentRunning()) {
@@ -1404,8 +1643,8 @@ export struct SessionDetailPage {
     .backgroundColor($r('app.color.bg_base'))
     // v1.0.8：模型 / 思考强度选择面板（bindSheet；用户关闭时 onDisappear 回写开关）
     .bindSheet(this.modelSheetOpen, this.modelSheet(), {
-      height: 300,
-      showClose: true,
+      height: SheetSize.FIT_CONTENT,
+      showClose: false,
       dragBar: true,
       backgroundColor: $r('app.color.bg_layer_1'),
       onDisappear: (): void => {

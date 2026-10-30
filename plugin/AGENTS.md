@@ -523,3 +523,19 @@ Remote 方法（返回 `{ok:true,value}` 或 `{ok:false,error:{code,message}}`�
 ### 回归
 
 `node scripts/verify-steps.mjs` **165 项**（新增场景 8b 投影路径 5 项 + 场景 2b 归组 4 项 + 2 项）。
+
+## v1.1.7：会话权限切换 + 收发保序闭环
+
+- **当前权限**：`session.permission` 优先读 `sc.projections()` 的
+  `values.permissions.currentValue`（与桌面端同源，可能为派生态 `custom`）；
+  投影不可用时退回 live `permissionPresets.current()` 与事件内存态。
+- **subagent 冷读**：投影失败后的 live 降级前先走 `sc.inspect()` 判断身份，
+  不得为了显示权限而 `resolveAgent` 激活 subagent。
+- **切换**：`session.selectPermission` 通过 `resolveAgent` 取 live Session 后调
+  `permissionPresets.set(session,name)`，再回读有效当前值；Host 拒绝原样回错。
+- **变更**：`permission/preset`、`sandbox/mode`、`approval/policy` 三类事件都按 Host 顺序
+  广播 `session.permissionChanged`，一次切换可能出现过渡 `custom`，客户端不得假定只有一条事件。
+- **保序**：App 必须按 WS 到达顺序串行解密+分发、按 seq 串行加密+发送；
+  重连/停止使旧连接代次失效，不能只给某类 assistant 事件单独排序。
+- 回归：`node scripts/verify-steps.mjs`（场景 8c，含 custom、subagent 冷读及投影故障不激活、
+  select 拒绝原文、三类 knob 事件、投影→live→内存降级）。

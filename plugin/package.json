@@ -1,6 +1,6 @@
 {
   "name": "@duke-dsh-plugins/dsh-remote-control",
-  "version": "1.1.6",
+  "version": "1.1.7",
   "description": "Remote-control bridge for DeepSeek Harness: pairs a HarmonyOS phone app with the desktop Host over an end-to-end-encrypted public relay (WebSocket). Lets the phone list/create/switch sessions, send prompts, watch streamed replies, cancel turns, and answer approval and ask-user-question requests from anywhere; pushes Huawei Push Kit notifications (gracefully disabled when AGC is unconfigured) for approvals, questions, and turn completion. The pairing QR lives in the DSH settings panel (\"DSH Pocket\"). Fail-open by design: any relay timeout or fault hands the request back to the desktop answerer.",
   "type": "module",
   "main": "index.js",

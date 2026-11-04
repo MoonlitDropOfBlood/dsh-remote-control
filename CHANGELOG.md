@@ -5,6 +5,31 @@ GitHub Release 的正文——**bump 版本时必须同步补一段 `## [版本]
 
 ## [Unreleased]
 
+## [1.1.8] - 2026-11-04
+
+修复 DSH 设置面板里「DSH Pocket」分区的导航图标在 DSH 0.2.2-rc.1 上的渲染问题
+（**仅客户端 UI，无协议/线格式变化**）。用户实测反馈：自定义图标与核心齿轮同时显示，
+且该图标比其他分区更宽、不协调。
+
+### 插件（Web 半边）
+
+- **导航图标改走原生 `settings.section.icon` slot**：DSH 0.2.2-rc.1 给设置外壳加了按
+  分区 id 寻址的图标 slot（外壳把每行图标包进 `<span.navIcon>`，组件收到
+  `{ size 像素, active }`）。本插件以与分区相同的 id（`remote-control`）注册鲸鱼图标，
+  外壳因此**只画本插件的图标**，通用齿轮仅在没有匹配贡献时作为 fallback 出现。
+- **删除旧的 DOM hack**：此前靠「给导航行打标记 + `button > svg:first-child{display:none}`
+  藏齿轮 + `::before` 画 currentColor mask」实现。0.2.2 把图标包进 `span.navIcon` 后该
+  选择器失配 → 齿轮没被藏住 → **双图标**。同时删掉了那段每次 DOM 变更都扫一遍
+  `document.body` 的 MutationObserver 导航行扫描。
+- **图标尺寸跟随外壳**（16px，与外壳自带图标同宽），不再写死 20px 的盒子。
+- 老 DSH（无该 slot）回落成默认齿轮，不再出现双图标。
+
+### 门禁
+
+- `scripts/verify-settings.mjs` 由 112 项增至 **151 项**：新增「已注册
+  `settings.section.icon`」「图标 id 与分区 id 一致」「旧 DOM hack 已删除」
+  「`NavIcon` 尊重外壳给的 `size`」「图标 CSS 不写死宽高」等用例；变异测试 5/5 全部杀死。
+
 ## [1.1.7] - 2026-10-30
 
 协议修订 v1.1.7：补齐手机端异步收发保序，并新增会话权限切换与 subagent 只读信息展示。

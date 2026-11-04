@@ -34,7 +34,7 @@ node -e "import('./lib/protocol.mjs').then(m=>m.assertKat())"           # KAT
 node scripts/verify-qr.mjs && node scripts/verify-pairing.mjs           # QR/配对 API 回归（需 devDependencies）
 node scripts/verify-steps.mjs                                          # v1.0.9 步骤/模式/权限/归档/模型/思考/强度 + 图片回归（无依赖，154 项）
 node scripts/verify-images.mjs                                         # 图片专项 + 交付物桥接 + 排队(session.queue)/宿主投递设置(busyEnter)：元数据映射/缩略图降级/image.fetch/帧预算守卫/交付物进历史/排队追踪（无依赖，153 项）
-node scripts/verify-settings.mjs                                       # v1.1.x 设置页/manifest/combo/信封自检 + Host 真跑一遍（112 项）
+node scripts/verify-settings.mjs                                       # v1.1.x 设置页/manifest/combo/信封自检 + Host 真跑一遍 + 导航图标（151 项）
 node scripts/verify-relay-supervisor.mjs                               # v1.1.1 中继进程托管：决策/端口占用不抢/启停/看门狗/跨平台/bundle（无依赖，162 项）
 node scripts/verify-crypto.mjs                                          # v1.1.3 加密层/抗重放：KAT+AAD 两模式+sid 绑定+证明 v2+纪元单调性+接线层（无依赖，45 项）
 node scripts/sync-client-icon.mjs                                      # 改了 icon.svg 后同步 client.js 的图标 data-uri
@@ -395,7 +395,7 @@ present 出来的图当图片记**：
 |---|---|
 | `index.js` | **类插件** `export default class RemoteControlService extends TypertRemoteService`（服务名 `remoteControl`）。`[Service.init]()` 里启动宿主链路（`startRemoteHost`）并把四个方法标记成 Remote 导出。 |
 | `typert.host.js` | **TYPERT Host manifest**：`package` 必须等于 package.json 的 name，`face:"host"`，四个 invocation（`getPairing` / `setRelayUrl` / `rotateSecret` / `setHidden`）。 |
-| `client.js` | **Web 半边**：`window.__ModuleLoader__.load({id: <包名>, factory})` → `ctx.slots.inject("settings.section", …)` 注册 `{id:"remote-control", order:40, label:()=>"DSH Pocket"}`，并 `ctx.remote.$mount(CLIENT_REMOTE)` 挂自己的 Remote 命名空间。 |
+| `client.js` | **Web 半边**：`window.__ModuleLoader__.load({id: <包名>, factory})` → `ctx.slots.inject("settings.section", …)` 注册 `{id:"remote-control", order:40, label:()=>"DSH Pocket"}`（**同一 id** 再注册 `settings.section.icon` → 导航图标，DSH 0.2.2-rc.1+），并 `ctx.remote.$mount(CLIENT_REMOTE)` 挂自己的 Remote 命名空间。 |
 
 设置页长这样（用户**不需要改任何文件**）：
 
@@ -448,13 +448,26 @@ Remote 方法（返回 `{ok:true,value}` 或 `{ok:false,error:{code,message}}`�
   所有 Remote 调用静默失败。`verify-settings.mjs` 会用**真实的 validateTypertManifest** 校验。
 - **client 包的 `id` 必须等于包名**：`__ModuleLoader__.load` 的 id 同时是 HMR 样式归属
   （`data-plugin`）的键；不一致时 `removeOwnedStyles(thatId)` 会把本包的样式剥掉。
-- **`settings.section` 没有 icon 字段**：外壳给所有外部分区画通用齿轮。照抄 token-stats 的
-  做法：给本包的导航行打 `data-dsh-remote-control-settings-nav` 标记，CSS 里
-  `>svg:first-child{display:none}` + `::before` 用 currentColor mask 画自家图标。
+- **导航图标走 `settings.section.icon` slot（DSH 0.2.2-rc.1 起）**：外壳把每行图标包进
+  `<span.navIcon>`，并从该 slot 取图标——按**分区 id**注册图标组件即可替换默认齿轮
+  （组件收到 `{ size（像素）, active }`；外壳负责按钮、标签、装饰容器；id 不匹配的
+  贡献永不渲染，释放贡献即回落默认图标）。
+  ⚠️ 0.2.2 之前没有这个 slot：当时只能打 DOM hack（给本包导航行打
+  `data-dsh-remote-control-settings-nav` 标记 + CSS `>svg:first-child{display:none}` 藏齿轮
+  + `::before` 用 currentColor mask 画鲸鱼）。0.2.2 把图标包进 `span.navIcon` 后
+  `button > svg:first-child` **失配** → 齿轮没被藏住 → **自定义鲸鱼与核心齿轮同时显示**
+  （2026-11-04 实测）。现已改走原生 slot，并**删除全部 DOM hack**
+  （含那段每次 DOM 变更都跑一遍的 MutationObserver 导航行扫描——它正是双图标的根源）。
+  - 图标盒子尺寸**由外壳给的 `size` 决定**（16px，与外壳自带图标同宽）。写死 20px 会
+    显得比其他分区宽、不协调（2026-11-04 用户反馈）。CSS 的 `.rc-nav-icon`
+    **不许写死宽高**；`NavIcon` 组件必须尊重 `props.size`。
+  - 老 DSH（无该 slot）回落成默认齿轮——可接受降级，**别再为它加 DOM hack**。
 - **本包 CSS 标签要自己 `setAttribute("data-plugin", 包名)`**：`apply()` 是异步的，追加
   <style> 时 client-modules 的 `claimStyles(ownerId)` 扫描已经过去，不认领会被别的包收养。
-- 回归：`node scripts/verify-settings.mjs`（**112 项**，含双层信封解包用例 + combo 拼接安全 +
-  Host 半边真跑一遍 + setRelayUrl 校验/落盘/清除/回环警告）+ `node scripts/verify-pairing.mjs`（47 项）。
+- 回归：`node scripts/verify-settings.mjs`（**151 项**，含双层信封解包用例 + combo 拼接安全 +
+  Host 半边真跑一遍 + setRelayUrl 校验/落盘/清除/回环警告 + **导航图标**：注册了
+  `settings.section.icon`、图标 id 与分区 id 一致、旧 DOM hack 已删、`NavIcon` 尊重
+  外壳给的 `size`（写死 20px 的变异会被杀死）、CSS 不写死宽高）+ `node scripts/verify-pairing.mjs`（47 项）。
 
 ## v1.1.3：抗重放的会话纪元 + 中继令牌/TLS（2026-10-26，契约 §3.4.1 / §3.4.2）
 

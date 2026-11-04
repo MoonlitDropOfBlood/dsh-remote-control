@@ -109,15 +109,25 @@ if (!loaderChecked) {
 check("client.js 使用 window.__ModuleLoader__.load", clientSrc.includes("window.__ModuleLoader__.load"));
 check("client.js 的 load id 等于包名", clientSrc.includes('const CLIENT_BUNDLE_ID = "' + pkg.name + '"'), pkg.name);
 check("client.js 注入 settings.section 分区", clientSrc.includes('ctx.slots.inject("settings.section"'));
-check(
-  "分区注册 id=remote-control / order=40 / label=DSH Pocket",
-  /id:\s*"remote-control"/.test(clientSrc) && /order:\s*40/.test(clientSrc) && /label:\s*\(\)\s*=>\s*SETTINGS_LABEL/.test(clientSrc),
-);
+check("分区注册 id=remote-control / order=40 / label=DSH Pocket", /const SETTINGS_SECTION_ID = "remote-control";/.test(clientSrc) && /order:\s*40/.test(clientSrc) && /label:\s*\(\)\s*=>\s*SETTINGS_LABEL/.test(clientSrc));
 check("SETTINGS_LABEL 常量为 DSH Pocket", /const SETTINGS_LABEL = "DSH Pocket";/.test(clientSrc));
 check("client.js 挂载自己的 Remote 命名空间", clientSrc.includes("ctx.remote.$mount(CLIENT_REMOTE)"));
 check("CLIENT_REMOTE 的 namespace 是 remoteControl", /namespace:\s*"remoteControl"/.test(clientSrc));
 check("client.js 声明 inject（slots + remote）", /exports\.inject = \[[^\]]*"slots"[^\]]*"remote"[^\]]*\]/.test(clientSrc));
 check("client.js 导出 apply", clientSrc.includes("exports.apply = apply"));
+
+// ---- 导航图标：DSH 0.2.2-rc.1 的 settings.section.icon slot ----------------
+// 外壳把每行图标包进 <span.navIcon>，并从该 slot 取图标；注册 id 必须等于分区 id。
+check("client.js 注入 settings.section.icon slot", clientSrc.includes('ctx.slots.inject("settings.section.icon"'));
+check(
+  "图标注册用同一个分区 id（SETTINGS_SECTION_ID）",
+  /name:\s*"settings\.section\.icon",\s*id:\s*SETTINGS_SECTION_ID/.test(clientSrc),
+);
+// 旧 hack 必须彻底移除：0.2.2 把图标包进 span 后 `button > svg:first-child`
+// 失配 → 齿轮没被藏住，自定义图标与核心齿轮同时显示（2026-11-04 实测）。
+check("已删除旧的导航行 DOM 标记 hack", !clientSrc.includes("data-dsh-remote-control-settings-nav"));
+check("已删除旧的 svg:first-child 齿轮隐藏规则", !/svg:first-child\s*\{/.test(clientSrc));
+check("已删除旧的导航行 MutationObserver 扫描", !clientSrc.includes("MutationObserver"));
 
 // client 侧 descriptor 的 codec 也要带 create()
 const clientDescriptorBlock = clientSrc.slice(clientSrc.indexOf("const CLIENT_REMOTE"), clientSrc.indexOf("function unwrapRemote"));
@@ -148,8 +158,55 @@ if (iconMatch) {
   check("图标 data-uri 与 icon.svg 一致（改图标后需跑 sync-client-icon.mjs）", iconMatch[1] === expected, "长度 " + iconMatch[1].length + " vs " + expected.length);
   check("图标素材取自本仓库 icon.svg（whale 家族样式）", iconMatch[1].includes("data:image/svg+xml"));
 }
-check("client.js 声明了导航图标 mask 标记", clientSrc.includes("data-dsh-remote-control-settings-nav"));
+check("client.js 声明了导航图标 mask 样式", clientSrc.includes(".rc-nav-icon{"));
 check("client.js 的 CSS 用了 DSH 设计变量", clientSrc.includes("--dsw-alias-"));
+
+// 导航图标盒子不能写死尺寸：外壳给外壳自带的图标 16px，本包图标必须跟着走，
+// 否则就是「比其他分区宽、看起来不协调」（2026-11-04 用户反馈）。
+const navIconCss = /\.rc-nav-icon\{[^}]*\}/.exec(clientSrc)?.[0] ?? "";
+check("导航图标 CSS 不写死宽高（由外壳的 size 决定）", !!navIconCss && !/width:\s*\d+px/.test(navIconCss) && !/height:\s*\d+px/.test(navIconCss), navIconCss);
+check("导航图标 CSS 用 currentColor mask（跟随外壳配色）", navIconCss.includes("mask:url(") && navIconCss.includes("currentColor"), navIconCss);
+
+// NavIcon 组件：从 client.js 里把源码抠出来真跑一遍（stub React），
+// 断言它**尊重外壳给的 size** —— 写死 20px 的变异必须被这条杀死。
+{
+  const vm = await import("node:vm");
+  const start = clientSrc.indexOf("function NavIcon(");
+  let navIconSrc = "";
+  if (start >= 0) {
+    let depth = 0;
+    let i = clientSrc.indexOf("{", start);
+    for (; i < clientSrc.length; i++) {
+      if (clientSrc[i] === "{") depth++;
+      else if (clientSrc[i] === "}") {
+        depth--;
+        if (depth === 0) break;
+      }
+    }
+    navIconSrc = clientSrc.slice(start, i + 1);
+  }
+  let navIcon = null;
+  let extracted = false;
+  try {
+    const ReactStub = {
+      createElement: (type, props) => ({ type, props: props ?? {} }),
+    };
+    navIcon = vm.runInNewContext(`(${navIconSrc})`, { React: ReactStub });
+    extracted = typeof navIcon === "function";
+  } catch {
+    extracted = false;
+  }
+  check("NavIcon 可从 client.js 提取并实例化", extracted, navIconSrc ? "提取的源码不可执行" : "client.js 里找不到 NavIcon");
+  if (extracted) {
+    const at16 = navIcon({ size: 16, active: false });
+    check("NavIcon 渲染 .rc-nav-icon 盒子", at16?.props?.className === "rc-nav-icon", JSON.stringify(at16?.props ?? {}));
+    check("NavIcon 尊重外壳给的 size（16px）", at16?.props?.style?.width === "16px" && at16?.props?.style?.height === "16px", JSON.stringify(at16?.props?.style ?? {}));
+    const at20 = navIcon({ size: 20, active: true });
+    check("NavIcon 跟随外壳改尺寸（20px）", at20?.props?.style?.width === "20px" && at20?.props?.style?.height === "20px", JSON.stringify(at20?.props?.style ?? {}));
+    const noSize = navIcon({});
+    check("NavIcon 缺 size 时回落 16px", noSize?.props?.style?.width === "16px", JSON.stringify(noSize?.props?.style ?? {}));
+  }
+}
 
 // ============================================================================
 // 4. Host 半边：类插件 + Remote 方法 + 无命令注册

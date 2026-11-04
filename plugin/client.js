@@ -9,6 +9,10 @@
  *   - the actions: save the relay address, rotate the pairing key and
  *     hide / show the pairing.
  *
+ * The nav glyph of that section comes from the `settings.section.icon` slot
+ * (DSH 0.2.2-rc.1+): we register our whale under the same id as the section,
+ * so the shell draws it instead of the generic gear.
+ *
  * The phone pairing flow is unchanged: the QR still encodes the same
  * `dshrc://pair?…` URI as before (contract §3.5) — only the entry point moved
  * from the `/remote-pairing` command into this settings page (v1.1.x).
@@ -80,52 +84,45 @@ const CLIENT_ICON_MASK_URI =
 .rc-spinner{width:16px;height:16px;border-radius:50%;border:2px solid var(--dsw-alias-border-l1);border-top-color:var(--dsw-alias-brand-primary);animation:rc-spin .8s linear infinite;flex:none}
 @keyframes rc-spin{to{transform:rotate(360deg)}}
 
-/* Settings nav icon: DSH 0.1.x settings.section only projects id/order/label,
-   and the settings shell paints a generic gear for every external section
-   (client-ui-settings-general's navIcon()). registerSettingsNavIcon marks our
-   own nav row; hide the shell's gear and draw this package's whale glyph as a
-   currentColor mask so it follows the native nav hover/active colors.
-   20px (2026-10-24 user feedback): the mask viewBox is cropped tight to the
-   whale+wave, so at 16px the glyph itself rendered only ~9px — too small next
-   to the section labels; 20px restores legibility. */
-[data-dsh-remote-control-settings-nav]>svg:first-child{display:none}
-[data-dsh-remote-control-settings-nav]::before{content:'';flex:none;width:20px;height:20px;background:currentColor;-webkit-mask:url("__ICON_MASK__") center/contain no-repeat;mask:url("__ICON_MASK__") center/contain no-repeat}
+/* Settings nav icon (DSH 0.2.2-rc.1+): the shell wraps every nav row's glyph in
+   <span.navIcon> and takes the glyph from the "settings.section.icon" slot, so we
+   contribute our whale there (see NavIcon) instead of patching the shell's DOM.
+   This rule only draws the mask — the shell owns the box, the button and the
+   label. The mask viewBox is cropped tight to the whale+wave, so the ink covers
+   ~84% of the box and lands on the same optical size as the shell's own 16px
+   glyphs (the old hack hardcoded a 20px box and read as too wide next to the
+   other sections). */
+.rc-nav-icon{display:block;flex:none;background:currentColor;-webkit-mask:url("__ICON_MASK__") center/contain no-repeat;mask:url("__ICON_MASK__") center/contain no-repeat}
 `;
 
-    // ---- Settings nav icon --------------------------------------------------
-    // DSH 0.1.x does not yet carry an icon through the settings.section
-    // registration contract: its shell projects only id/order/label and paints
-    // a generic gear for every external section. Mark only this plugin's
-    // localized nav row so the CSS above can replace the fallback gear; the
-    // disposer clears the marker for HMR / plugin disable.
+    // ---- Settings section identity + nav icon --------------------------------
+    // DSH 0.2.2-rc.1 gave the settings shell a `settings.section.icon` slot:
+    // register an icon component under the **same id** as the section and the
+    // shell draws it instead of the generic gear (the component receives
+    // { size in pixels, active }; the shell owns button, label and the
+    // decorative wrapper). Before 0.2.2 that slot did not exist, so this
+    // package patched the shell's DOM instead (mark our nav row, hide the gear
+    // with `button > svg:first-child`, paint the whale with ::before). 0.2.2
+    // wrapped the glyph in <span.navIcon>, so that selector stopped matching:
+    // the gear was no longer hidden and BOTH the gear and the whale showed up
+    // (2026-11-04). The DOM hack is gone now — we use the native slot, and on
+    // pre-0.2.2 hosts the row simply falls back to the default gear.
     const SETTINGS_LABEL = "DSH Pocket";
-    const SETTINGS_NAV_MARKER = "data-dsh-remote-control-settings-nav";
+    const SETTINGS_SECTION_ID = "remote-control";
 
-    function registerSettingsNavIcon(label) {
-      let disposed = false;
-      const sync = function () {
-        if (disposed) return;
-        const currentLabel = String(label).trim();
-        const buttons = document.querySelectorAll('[role="dialog"] nav button');
-        for (let i = 0; i < buttons.length; i++) {
-          const button = buttons[i];
-          const text = button.textContent ? button.textContent.trim() : "";
-          if (currentLabel.length > 0 && text === currentLabel) {
-            button.setAttribute(SETTINGS_NAV_MARKER, "");
-          } else {
-            button.removeAttribute(SETTINGS_NAV_MARKER);
-          }
-        }
-      };
-      sync();
-      const observer = new MutationObserver(sync);
-      observer.observe(document.body, { childList: true, subtree: true, characterData: true });
-      return function () {
-        disposed = true;
-        observer.disconnect();
-        const marked = document.querySelectorAll("[" + SETTINGS_NAV_MARKER + "]");
-        for (let i = 0; i < marked.length; i++) marked[i].removeAttribute(SETTINGS_NAV_MARKER);
-      };
+    // Nav glyph for our settings section: this package's whale, drawn as a
+    // currentColor mask (see the .rc-nav-icon rule above) so it follows the
+    // shell's nav colors. `size` comes from the shell (16px, the same size it
+    // asks of its own glyphs) — honour it instead of hardcoding a width, so the
+    // row stays aligned with the other sections.
+    function NavIcon(props) {
+      const requested = props ? Number(props.size) : NaN;
+      const size = Number.isFinite(requested) && requested > 0 ? requested : 16;
+      return React.createElement("span", {
+        className: "rc-nav-icon",
+        style: { width: size + "px", height: size + "px" },
+        "aria-hidden": "true",
+      });
     }
 
     // ---- Client Remote contribution ----------------------------------------
@@ -348,13 +345,9 @@ const CLIENT_ICON_MASK_URI =
         /* cosmetic only */
       }
 
-      // Mark our settings-nav row so the CSS above replaces the shell's
-      // fallback gear (no icon field exists in settings.section yet).
-      try {
-        ctx.effect(() => registerSettingsNavIcon(SETTINGS_LABEL));
-      } catch (e) {
-        /* cosmetic only */
-      }
+      // The nav glyph is contributed through the `settings.section.icon` slot
+      // (registered next to the section itself, further down) — no DOM
+      // patching of the shell's nav rows any more.
 
       function PairingPage() {
         const [state, setState] = React.useState({ loading: true, value: null, error: "", hint: "", hintKind: "" });
@@ -726,7 +719,7 @@ const CLIENT_ICON_MASK_URI =
       try {
         ctx.slots.inject("settings.section", () =>
           ctx.slots.register(
-            { name: "settings.section", id: "remote-control", order: 40, label: () => SETTINGS_LABEL },
+            { name: "settings.section", id: SETTINGS_SECTION_ID, order: 40, label: () => SETTINGS_LABEL },
             PairingPage,
           ),
         );
@@ -734,6 +727,24 @@ const CLIENT_ICON_MASK_URI =
         // eslint-disable-next-line no-console
         (typeof console !== "undefined" && console.warn ? console.warn : () => {})(
           "[dsh-remote-control] settings.section registration failed:",
+          e,
+        );
+      }
+
+      // Nav glyph for our section (DSH 0.2.2-rc.1+). The registration id must
+      // equal the section id — the shell renders the matching contribution and
+      // keeps its default gear for every id without one.
+      try {
+        ctx.slots.inject("settings.section.icon", () =>
+          ctx.slots.register(
+            { name: "settings.section.icon", id: SETTINGS_SECTION_ID, order: 40 },
+            NavIcon,
+          ),
+        );
+      } catch (e) {
+        // eslint-disable-next-line no-console
+        (typeof console !== "undefined" && console.warn ? console.warn : () => {})(
+          "[dsh-remote-control] settings.section.icon registration failed:",
           e,
         );
       }

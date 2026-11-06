@@ -18,6 +18,8 @@ lib/relay-supervisor.mjs 中继进程托管（v1.1.1）：本机中继随插件�
 lib/host-bridge.mjs   Host 桥接：sessionController + api-session/agent 事件 + 审批/提问瀑布
 lib/images.mjs        会话消息里的图片（契约 §5.10）：image 块识别 + sharp 缩略图/大图
                       （imageBlocksOf / makeThumb / makeLarge / imageRefMeta）
+lib/attachments.mjs  用户提示词的附件（契约 §5.11 v1.2.0）：分块上传登记表（UploadRegistry）
+                      + 校验/错误码 + 文件块映射（fileBlocksOf / fileRefsOfContent）
 lib/pairing.mjs       配对核心：URI（§3.5）/QR（SVG+ASCII）/rotatePairingIdentity/setPairingHidden
                       /isLoopbackRelayUrl+loopbackWarning（回环地址判定与警告文案）
 lib/qr.mjs            内嵌 QR 编码器（移植 Nayuki qrcodegen，MIT；byte 模式 ECC-M v1-10）
@@ -32,11 +34,12 @@ scripts/sync-client-icon.mjs  把 icon.svg 同步成 client.js 里的导航图�
 node --check index.js client.js typert.host.js lib/*.mjs scripts/*.mjs   # 语法
 node -e "import('./lib/protocol.mjs').then(m=>m.assertKat())"           # KAT
 node scripts/verify-qr.mjs && node scripts/verify-pairing.mjs           # QR/配对 API 回归（需 devDependencies）
-node scripts/verify-steps.mjs                                          # v1.0.9 步骤/模式/权限/归档/模型/思考/强度 + 图片回归（无依赖，154 项）
-node scripts/verify-images.mjs                                         # 图片专项 + 交付物桥接 + 排队(session.queue)/宿主投递设置(busyEnter)：元数据映射/缩略图降级/image.fetch/帧预算守卫/交付物进历史/排队追踪（无依赖，153 项）
+node scripts/verify-steps.mjs                                          # 步骤/模式/权限/归档/模型/思考/强度 + 图片/附件回归（无依赖，234 项）
+node scripts/verify-images.mjs                                         # 图片专项 + 交付物桥接 + 排队(session.queue)/宿主投递设置(busyEnter)：元数据映射/缩略图降级/image.fetch/帧预算守卫/交付物进历史/排队追踪（无依赖，154 项）
 node scripts/verify-settings.mjs                                       # v1.1.x 设置页/manifest/combo/信封自检 + Host 真跑一遍 + 导航图标（151 项）
 node scripts/verify-relay-supervisor.mjs                               # v1.1.1 中继进程托管：决策/端口占用不抢/启停/看门狗/跨平台/bundle（无依赖，162 项）
 node scripts/verify-crypto.mjs                                          # v1.1.3 加密层/抗重放：KAT+AAD 两模式+sid 绑定+证明 v2+纪元单调性+接线层（无依赖，45 项）
+node scripts/verify-attachments.mjs                                    # v1.2.0 附件：分块状态机/canonical base64/limits/TTL/消费墓碑 + HostBridge 真接线 + 历史 files[]（无依赖，129 项）
 node scripts/sync-client-icon.mjs                                      # 改了 icon.svg 后同步 client.js 的图标 data-uri
 ```
 
@@ -571,3 +574,49 @@ Remote 方法（返回 `{ok:true,value}` 或 `{ok:false,error:{code,message}}`�
   重连/停止使旧连接代次失效，不能只给某类 assistant 事件单独排序。
 - 回归：`node scripts/verify-steps.mjs`（场景 8c，含 custom、subagent 冷读及投影故障不激活、
   select 拒绝原文、三类 knob 事件、投影→live→内存降级）。
+
+## v1.2.0：用户提示词的附件（2026-11-06，契约 §5.11）
+
+手机端输入框与 DSH 桌面端 composer 同能力：图片（png/jpeg/webp/gif）与任意文件。
+**中继单帧 1MiB**（密文帧）→ 大图/大文件必须分块，不能把 base64 塞进 `session.prompt`。
+
+### 协议与实现
+
+- **四个新请求**：`attachment.upload.begin/chunk/commit/abort`（§5.11.2）。
+  `begin` 声明 `{sessionId, kind, name?, mediaType?, bytes}` → `{uploadId, chunkBytes}`；
+  `chunk` 的 `data` 必须是 **canonical 标准 base64**，index 从 0 连续；
+  `commit` 把内存缓冲写进宿主附件存储 → `UploadedAttachment`（图片带归一化后的
+  `bytes/width/height`，文件带净化后的 `name/bytes`）。
+- **`session.prompt` 新增 `uploads:[uploadId]`**（§5.11.3）：`text` 可为空串
+  （附件单独发送），text 与 uploads 至少一项非空。顺序 = 正文在前、附件按列表顺序。
+- **必须走 `ctx.fileUploads` 的 receipt**：图片用 `uploadImageStream`、文件用
+  `uploadStream`，都返回 `{receiptId, image|file}`；prompt content 里传
+  `{type:"file", receiptId}` —— 宿主 `resolvePromptFileReceipts()` 会把 file receipt
+  解回 staged 的图片/文件块。**直接塞 `{type:"file", attachment}` 会被宿主拒**
+  （`FILE_NOT_STAGED`，见契约附录 D）。
+- **一次消费**：宿主成功接受 prompt 后 `UploadRegistry.markConsumed()` →
+  staged 记录删除 + 墓碑；同一 uploadId 再次使用回 `attachment-upload-consumed`
+  （宿主拒绝 prompt 时 receipt 未被消费，uploadId 仍可重试，宿主错误码原样透传）。
+- **内存与生命周期**（防滥用，不是业务上限）：单个上传 20MiB、单条消息附件合计 40MiB、
+  最多 9 个附件、同时最多 4 个未提交上传；未提交 5 分钟过期、已提交 60 分钟过期。
+  `abort` 只丢弃内存缓冲（宿主已存附件不可删除）。
+- **能力目录**：`session.capabilities.attachments` 只在宿主同时有
+  `attachments` + `fileUploads` 两个服务时出现（`#attachmentHostReady()`）；
+  旧宿主/自定义组合缺服务 → **省略该字段**，客户端隐藏附件入口；begin 回
+  `attachment-unsupported`。
+- **范围**：根会话。`fileUploads.uploadStream/uploadImageStream` 对 subagent 自身会拒绝
+  （`SUBAGENT_FILE_UNSUPPORTED`），插件不额外放开；`session.subagentPrompt` 仍只收文本。
+- **历史消息**：`mapHistoryMessages` 新增 `files:FileRef[]`（`{fileId,name,bytes}`），
+  用户消息的 `images[]` 复用既有图片通道（`attachThumbs` 同样补缩略图）；
+  **正文不再给 file 块写 `[文件]` 占位符**（v1.0.9 图片口径的延续）；纯附件消息也成条。
+  `image.fetch` 对所有历史/直播图片（含用户消息）照常可用。
+
+### 门禁
+
+`node scripts/verify-attachments.mjs` **129 项**：能力目录/文件名净化/canonical base64/
+begin 与 uploads 校验/文件块映射；上传状态机（跳号、重复、超长、未收满 commit、
+abort 幂等、并发上限、TTL、宿主失败可重试、消费墓碑）；HostBridge 真接线
+（四请求、prompt 附件 receipt、附件-only、顺序、消费、宿主错误透传、
+capabilities 有无降级、历史 files[]）；源码级断言（不直接塞 attachment ref、
+成功后才 markConsumed、日志不写文件名/字节）。
+`verify-images` / `verify-steps` 的 `[文件]` 占位断言已按 v1.2.0 更新。

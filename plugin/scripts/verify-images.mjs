@@ -233,10 +233,11 @@ function eventsOf(sent, topic) {
   check("纯图片消息正文为空", (pure[0]?.text ?? "") === "", pure[0]?.text);
   check("纯图片消息带 images", (pure[0]?.images ?? []).length === 1, JSON.stringify(pure[0]?.images));
 
-  // 消息正文口径：图片不占位、文件仍占位
+  // 消息正文口径（v1.2.0 §5.11.4）：图片与文件都独立渲染，正文都不占位
   check("messageText：图片不占位", messageText([{ type: "image", attachment: {} }]) === "", JSON.stringify(messageText([{ type: "image" }])));
-  check("messageText：文件仍占位", messageText([{ type: "file" }]) === "[文件]", messageText([{ type: "file" }]));
+  check("messageText：文件也不占位（v1.2.0）", messageText([{ type: "file" }]) === "", messageText([{ type: "file" }]));
   check("messageText：文本拼接", messageText([{ type: "text", text: "a" }, { type: "text", text: "b" }]) === "ab");
+  check("messageText：文本+文件只留文本", messageText([{ type: "text", text: "hi" }, { type: "file", attachment: { attachmentId: "f", name: "a.txt", bytes: 1 } }]) === "hi");
   check("contentText（工具结果口径）仍给 [图片] 占位", contentText([{ type: "image" }, { type: "file" }]) === "[图片][文件]", contentText([{ type: "image" }, { type: "file" }]));
 
   // 图片块提取

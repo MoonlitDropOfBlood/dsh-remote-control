@@ -10,12 +10,15 @@ protocol.mjs      信封 + HKDF/AES-GCM 参考实现 + assertKat()（契约 §7 
 link.mjs          中继链路层（hello/welcome/frame/心跳/sid:seq 去重/重连退避/outbox 缓冲）
                   + LoopbackLink/createLoopbackPair：进程内直连回环（自测用，不经中继）
 mock-host.mjs     模拟 DSH 端：假会话、流式回复、审批问答演示（给 App 无 DSH 联调）
+                  + v1.2.0：附件分块上传（begin/chunk/commit/abort）+ prompt uploads
+                    + 历史 files[]/images[]（与插件 §5.11 同口径）
                   + v1.0.7：模式/权限/模型目录、真实归档事件、steps 与 reasoning 历史/直播
                   + v1.0.8：模型 efforts 强度目录、session.selectModel / session.model、
                     模型变化广播 session.modelChanged
 mock-phone.mjs    模拟手机端：命令行 REPL（list/new/prompt/cancel/answer）
 auto-test.mjs     自动化联调（读本机插件配置做真实链路验证；E2E_PROMPT=1 跑 prompt 闭环）
                   + v1.0.6/1.0.7/1.0.8 新链路用例（回环 + mock host 恒跑；真实宿主探针尽力而为）
+                  + v1.2.0 附件用例（回环 + mock host：上传→prompt→历史 files/images→消费/abort）
                   + E2E_LOOPBACK_ONLY=1：只跑回环用例（手机在线时用，不连真实中继）
 probe-raw.mjs     原始帧探针（看帧顶层字段，如 sid 是否透传）
 ```

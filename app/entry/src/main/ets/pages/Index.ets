@@ -13,7 +13,7 @@
  *  - 推送点击直达（契约 §6 intent）：takePendingNav / EVT_PENDING_NAV 消费逻辑保留
  * 设计：卡片 bg_layer_1 + 1px border_l1 + 12vp 圆角；主按钮 brand_fill 配 label_on_brand。
  */
-import { promptAction } from '@kit.ArkUI';
+import { KeyboardAvoidMode, promptAction } from '@kit.ArkUI';
 import { common } from '@kit.AbilityKit';
 import { EventPost } from 'eventpost';
 import { HRouter } from 'hrouter';
@@ -53,34 +53,25 @@ interface SessionSwipeParam {
 /**
  * 单张会话卡（列表项；只显示根会话——subagent 入口在父会话详情页，契约 §5.3 v1.0.5）。
  *
- * v1.0.6（修「刷新后数据没有变化」）：入参改成**简单原始字段**的 @Param
- * （官方 Repeat 迁移示例5 的写法：`ChildComponent({ data: repeatItem.item.message })`
- * ——向子组件传被观察的原始字段，而不是整个同引用对象）：
- *  - 父组件 build 直接读取数据项的字段并建立依赖；
- *  - 子组件只消费原始类型，不依赖「跨组件观察同一个可变对象」这一不稳定路径。
- * 数据源仍是 store.listItems() 产出的**不可变投影**（每次重建都是新实例），
- * 保证 Repeat 能识别到「数据确实变了」。
+ * Repeat 与自定义组件混用时传完整 RepeatItem：节点复用会更新 cell.item，
+ * 卡片随之切换到当前会话；只拆传 cell.item 的字段会保留旧绑定。
  */
 @ComponentV2
 export struct SessionCard {
-  @Require @Param sessionId: string = '';
-  @Require @Param title: string = '';
-  @Require @Param cwd: string = '';
-  @Require @Param running: boolean = false;
-  @Require @Param updatedAt: number = 0;
+  @Require @Param cell: RepeatItem<SessionListItem>;
   @Event onOpen: (sessionId: string) => void;
 
   build() {
     Column() {
       Row() {
-        Text(this.title.length > 0 ? this.title : this.sessionId)
+        Text(this.cell.item.title.length > 0 ? this.cell.item.title : this.cell.item.sessionId)
           .fontSize(FS_BODY)
           .fontWeight(FontWeight.Medium)
           .fontColor($r('app.color.label_primary'))
           .layoutWeight(1)
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
-        if (this.running) {
+        if (this.cell.item.running) {
           Row() {
             Circle({ width: 6, height: 6 }).fill($r('app.color.brand_fill'))
             Text('运行中')
@@ -106,8 +97,8 @@ export struct SessionCard {
       .width('100%')
       .alignItems(VerticalAlign.Center)
 
-      if (this.cwd.length > 0) {
-        Text(this.cwd)
+      if (this.cell.item.cwd.length > 0) {
+        Text(this.cell.item.cwd)
           .fontSize(FS_SMALL)
           .fontColor($r('app.color.label_secondary'))
           .width('100%')
@@ -117,7 +108,7 @@ export struct SessionCard {
       }
 
       Row() {
-        Text(relTime(this.updatedAt))
+        Text(relTime(this.cell.item.updatedAt))
           .fontSize(FS_CAPTION)
           .fontColor($r('app.color.label_tertiary'))
           .layoutWeight(1)
@@ -135,7 +126,7 @@ export struct SessionCard {
     .borderRadius(RADIUS_CARD)
     .border({ width: HAIRLINE, color: $r('app.color.border_l1') })
     .onClick((): void => {
-      this.onOpen(this.sessionId);
+      this.onOpen(this.cell.item.sessionId);
     })
   }
 }
@@ -155,6 +146,10 @@ struct Index {
   private projItems: SessionListItem[] = [];
 
   aboutToAppear(): void {
+    // 沉浸式（v1.2.1）：软键盘避让用 **OFFSET**（整页上移），而不是让系统 RESIZE 窗口。
+    // 实测：全屏布局（setWindowLayoutFullScreen）+ 默认 RESIZE 时，键盘收起后窗口高度
+    // 可能停在键盘高度（页面只占屏幕上半，下面露黑）——必须在首个页面统一指定 OFFSET。
+    this.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.RESIZE);
     // hrouter：把本 Navigation 的栈注册为默认栈；页面跳转统一走 model/routes.ets。
     HRouter.registerNavPathStack('default', this.navPathStack);
     const ctx: common.Context = getContext(this) as common.Context;
@@ -532,14 +527,8 @@ struct Index {
               Repeat(this.listItems())
                 .each((cell: RepeatItem<SessionListItem>): void => {
                   ListItem() {
-                    // 传**原始字段**给卡片（官方 Repeat 迁移示例5 的写法）：
-                    // 父 build 直接读取数据项字段建立依赖，子组件只消费原始类型。
                     SessionCard({
-                      sessionId: cell.item.sessionId,
-                      title: cell.item.title,
-                      cwd: cell.item.cwd,
-                      running: cell.item.running,
-                      updatedAt: cell.item.updatedAt,
+                      cell: cell,
                       onOpen: (sid: string): void => {
                         this.openSession(sid);
                       }
@@ -597,6 +586,8 @@ struct Index {
       .width('100%')
       .height('100%')
       .backgroundColor($r('app.color.bg_base'))
+      // 沉浸式：背景铺到状态栏 / 导航条区域（expandSafeArea 只扩绘制，不重排子节点）
+      .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
       // 根页被 NavDestination 盖住 → 可见比例跌到 0；返回时回到 1 → 刷新列表。
       .onVisibleAreaChange([0.0, 1.0], (isExpanding: boolean, currentRatio: number): void => {
         if (isExpanding && currentRatio > 0.9) {

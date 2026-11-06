@@ -12,6 +12,7 @@ import { BusinessError } from '@kit.BasicServicesKit';
 import { notificationManager } from '@kit.NotificationKit';
 import { HRouter } from 'hrouter';
 import { flushLogs, initLogger, logDshrc } from '../model/logger';
+import { SYSTEM_BAR_TRANSPARENT } from '../model/theme';
 import { parsePushIntent, PushIntentTarget, pushKit } from '../model/push';
 import { sessionStore } from '../model/sessionstore';
 import { dshrcLink } from '../model/link';
@@ -73,6 +74,10 @@ export default class EntryAbility extends UIAbility {
         return;
       }
       logDshrc(TAG, 'info', 'Succeeded in loading the content.');
+      // 沉浸式观感：系统栏透明 + 页面背景用 expandSafeArea 铺到状态栏/导航条区域
+      // （**不用** setWindowLayoutFullScreen——真机/模拟器上它会和软键盘避让打架：
+      //  键盘收起后页面停在“键盘高度”，下方露黑，见 app/AGENTS.md「沉浸式」小节）
+      this.applyImmersiveBars(windowStage);
       // 通知授权（必须在页面加载完成后请求，否则弹窗体验/时序不合规）
       notificationManager.requestEnableNotification(this.context).then((): void => {
         logDshrc(TAG, 'info', '[ANS] requestEnableNotification success');
@@ -88,6 +93,27 @@ export default class EntryAbility extends UIAbility {
 
   onWindowStageDestroy(): void {
     logDshrc(TAG, 'info', 'Ability onWindowStageDestroy');
+  }
+
+  /**
+   * 沉浸式（组件级）：系统栏底色透明，露出页面背景。
+   * 页面侧用 `.expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])`
+   * 把自己的背景画到状态栏/导航条区域（只扩绘制，不重排子节点）。
+   */
+  private applyImmersiveBars(windowStage: window.WindowStage): void {
+    try {
+      const win: window.Window = windowStage.getMainWindowSync();
+      win.setWindowSystemBarProperties({
+        statusBarColor: SYSTEM_BAR_TRANSPARENT,
+        navigationBarColor: SYSTEM_BAR_TRANSPARENT
+      }).catch((e: BusinessError): void => {
+        logDshrc(TAG, 'warn', 'setWindowSystemBarProperties failed: ' +
+          e.code.toString() + ' ' + e.message);
+      });
+    } catch (e) {
+      const err: BusinessError = e as BusinessError;
+      logDshrc(TAG, 'warn', 'applyImmersiveBars failed: ' + err.message);
+    }
   }
 
   onForeground(): void {

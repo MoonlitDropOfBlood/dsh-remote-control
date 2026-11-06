@@ -40,6 +40,16 @@ export const FS_HERO: number = 26;
 /** 1px 细描边。 */
 export const HAIRLINE: number = 1;
 
+/**
+ * 系统栏透明色（沉浸式）：`setWindowSystemBarProperties` 只接受**字符串色值**
+ * （不能传 $r('app.color.*') 资源），故这里用具名常量而不是散落的字面量。
+ * 语义：状态栏/导航条区域透出应用背景色 → 页面背景铺满整屏（沉浸式观感）。
+ */
+export const SYSTEM_BAR_TRANSPARENT: string = '#00000000';
+
+/** composer 输入卡圆角（vp）：比卡片稍圆，输入区是「一块软软的面板」。 */
+export const RADIUS_COMPOSER: number = 20;
+
 /** 链路状态 → 状态色 token（状态灯 / 徽标描边）。 */
 export function linkStateColor(s: LinkState): ResourceColor {
   if (s === 'online') {

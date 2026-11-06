@@ -21,6 +21,6 @@ url: https://github.com/MoonlitDropOfBlood/dsh-remote-control
 name: MoonlitDropOfBlood/dsh-remote-control
 category: remote
 description:
-  en: Remote-control DeepSeek Harness from a HarmonyOS phone over an end-to-end encrypted relay: list and switch sessions, send prompts, stream replies and tool steps, answer approval requests, view images, and switch models.
-  zh: 通过端到端加密中继用 HarmonyOS 手机遥控 DeepSeek Harness：浏览与切换会话、发送提示词、流式接收回复与工具步骤、应答审批请求、查看图片、切换模型。
+  en: Remote-control DeepSeek Harness from a HarmonyOS phone over an end-to-end encrypted relay: list and switch sessions, send prompts with image/file attachments, stream replies and tool steps, answer approval requests, view images, and switch models.
+  zh: 通过端到端加密中继用 HarmonyOS 手机遥控 DeepSeek Harness：浏览与切换会话、发送带图片/文件附件的提示词、流式接收回复与工具步骤、应答审批请求、查看图片、切换模型。
 icon: https://raw.githubusercontent.com/MoonlitDropOfBlood/dsh-remote-control/main/plugin/assets/icon-180.png

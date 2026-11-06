@@ -45,6 +45,16 @@
 > `permissions.currentValue` 持久投影，catalog 仍沿用 `session.capabilities.permissions`；
 > ② §4 明确发送端按 seq 串行加密+发送、接收端按 WS 到达顺序串行解密+分发，
 > 重连/停止后旧连接代次的异步回调不得再发送/分发，补齐直播保序的收发闭环。
+> **v1.2.0 于 2026-11-06 增补：用户提示词的附件（§5.11）**——
+> 手机端输入框支持图片/文件附件，与 DSH 桌面端 composer 同能力：
+> ① 新增 `attachment.upload.begin/chunk/commit/abort` 四个请求，**分块上传**
+> （明文块 256KiB，密文帧 ≈ 460KB < 中继 1MiB 上限），由插件落盘到宿主附件服务；
+> ② `session.prompt` 新增可选 `uploads:[uploadId]`（保持正文 `text` 不变），
+> 插件把已提交附件转成宿主 receipt 后随正文一起 `prompt`（附件可单独发送、无正文）；
+> ③ `session.capabilities` 新增只读 `attachments` 目录（支持标记/上限/块大小），
+> 旧插件无该字段 → 客户端隐藏附件入口；④ `ChatMessage` 新增可选 `files:FileRef[]`
+> （用户消息里的文件），**正文不再为 file 块写 `[文件]` 占位符**（与 v1.0.9 图片同口径）。
+> **中继/加密/帧格式不变**（附件走普通业务帧）；附件只对**根会话**开放（subagent 不支持）。
 > 三个实现（DSH 插件 / 中继服务器 / HarmonyOS App）
 > 都必须以本文档为准；任何协议改动必须先改本文档并通知 Lead。
 
@@ -221,14 +231,18 @@ dshrc://pair?r=<encodeURIComponent(relayUrl)>&c=<channel>&s=<secret>[&t=<encodeU
 | `session.subagentPrompt` | `{parentSessionId, childSessionId, text}` | `{accepted:bool}` | **v1.0.5** 向 **continuable** 子代理发消息（delivery:'queue'）；one-shot 子代理返回 `unsupported` 错误。回复走同一事件流（sessionId=child） |
 | `session.subagentCancel` | `{parentSessionId, childSessionId}` | `{accepted:bool}` | **v1.0.5** 取消 continuable 子代理当前 turn（interruptByParent；accepted=信号已受理，非已停止） |
 | `session.create` | `{title?, cwd?, agentPreset?, permission?, model?}` | `{sessionId, agentPreset?, model?, modelError?}` | cwd 缺省或为空串时，插件解析为 Host 用户主目录下的 `~/.dsh/remote` 并在创建前递归确保目录存在；不再使用 DSH 后端 `process.cwd()`。该路径随后仍按 §5.1 的工作区反查规则归组，未注册则允许未分组；目录创建失败回错，不静默回退。显式 cwd 行为不变。**v1.0.6**：`agentPreset` / `permission` = 模式与权限（§5.8）。**v1.0.7**：`model:{provider,model,reasoningEffort?}` = 模型选择；Host 在创建后、首条 prompt 前 `selectModel`。会话已创建但模型设置失败时仍回成功并带 `modelError`，客户端不得重复创建 |
-| `session.capabilities` | `{}` | `{presets:[ModeOption], permissions:[PermissionOption], defaultPreset?, defaultPermission?, models:[ModelOption], defaultModelId?, archiveSupported:bool, busyEnter:'queue'\|'steer'}` | **v1.0.6** 模式与权限目录。**v1.0.7** 增加模型目录与真实归档能力标记（§5.8/§5.9）。**v1.0.8** `ModelOption.efforts` 暴露该模型可选思考强度（§5.8）；宿主未提供对应能力时 models 为空 / archiveSupported=false，客户端隐藏对应选择区，不得报错。**v1.1.2** 增补 `busyEnter`：宿主「繁忙时的发送行为」——**只读**（客户端不得提供切换），宿主读不到时按 'queue' |
+| `session.capabilities` | `{}` | `{presets:[ModeOption], permissions:[PermissionOption], defaultPreset?, defaultPermission?, models:[ModelOption], defaultModelId?, archiveSupported:bool, busyEnter:'queue'\|'steer', attachments?:{...}}` | **v1.0.6** 模式与权限目录。**v1.0.7** 增加模型目录与真实归档能力标记（§5.8/§5.9）。**v1.0.8** `ModelOption.efforts` 暴露该模型可选思考强度（§5.8）；宿主未提供对应能力时 models 为空 / archiveSupported=false，客户端隐藏对应选择区，不得报错。**v1.1.2** 增补 `busyEnter`：宿主「繁忙时的发送行为」——**只读**（客户端不得提供切换），宿主读不到时按 'queue'。**v1.2.0** 增补 `attachments`（§5.11）：宿主不支持附件时**缺省该字段**（客户端隐藏附件入口） |
 | `session.archive` | `{sessionId, stopActivity?:bool}` | `{sessionId, archived:true}` | **v1.0.7** 写入 Workspace 真实归档集合；`stopActivity=true` 时按 Host 语义停止运行活动，缺省为 false |
 | `session.unarchive` | `{sessionId}` | `{sessionId, archived:false}` | **v1.0.7** 从 Workspace 归档集合恢复；幂等 |
 | `session.selectModel` | `{sessionId, model:ModelSelection}` | `{model:ModelSelection}` | **v1.0.8** 对**已存在会话**切换模型/思考强度；插件调 `sessionController.selectModel({sessionId,…})`。Host 拒绝时回 `error`（原文带出），成功回归一化后的 selection，并视为一次 `model/selection`（同样触发 `session.modelChanged`） |
 | `session.model` | `{sessionId}` | `{model:ModelSelection\|null}` | **v1.0.8** 查询会话当前模型/思考强度。**v1.1.4 改数据源**：优先读宿主 `modelSelection` **持久投影**（`sessionController.projections` 的 `values.modelSelection`，视图 `{lastUsed, next}`，`next = pending ?? lastUsed`）——与桌面端 composer 同源（`selection = projected.next ?? catalog.default`）；投影不可用才退回 `model/selection` 直播事件维护的内存态；两者皆空回 `null`（客户端回退展示目录默认，与 PC 的 `catalog.default` 回退一致），**不得臆造** |
 | `session.selectPermission` | `{sessionId, permission:string}` | `{permission:string}` | **v1.1.7** 对已存在会话切换权限档位；Host 取 live Session 后调 `permissionPresets.set(session, permission)`，成功回读并返回有效当前值。宿主拒绝（未知 preset、Auto 准入、会话不可解析等）按原错误码/原文回 `error`，不得假成功。**App 只在根会话详情页提供此动作；Host 不额外禁止 subagent select** |
 | `session.permission` | `{sessionId}` | `{permission:string\|null}` | **v1.1.7** 查询会话有效当前权限。优先读 `sessionController.projections` 的 `values.permissions.currentValue`（与桌面端同源；可能是派生态 `custom`），不可用时依次退回 live `permissionPresets.current(session)` 与直播内存态，皆无则回 `null`。subagent 查询为只读冷读，不得为查询激活 Agent |
-| `session.prompt` | `{sessionId, text}` | `{accepted:bool, mode:'queue'\|'steer'}` | 立即返回；实际回复走事件流。**v1.1.2 起投递行为由宿主设置决定**：客户端**不传** mode（传了也**忽略**）。插件读宿主「繁忙时的发送行为」（`ui-conversation.busyEnter`：排队发送/插话发送），agent 忙时按设置投递、空闲时总是 queue；宿主拒绝插话时插件**自动退回 queue**（消息不丢）。回包的 `mode` 是**实际**使用的投递行为 |
+| `session.prompt` | `{sessionId, text, uploads?:string[]}` | `{accepted:bool, mode:'queue'\|'steer'}` | 立即返回；实际回复走事件流。**v1.1.2 起投递行为由宿主设置决定**：客户端**不传** mode（传了也**忽略**）。插件读宿主「繁忙时的发送行为」（`ui-conversation.busyEnter`：排队发送/插话发送），agent 忙时按设置投递、空闲时总是 queue；宿主拒绝插话时插件**自动退回 queue**（消息不丢）。回包的 `mode` 是**实际**使用的投递行为。**v1.2.0**：`uploads` = 已 `attachment.upload.commit` 的 uploadId 列表（§5.11）；`text` 与 `uploads` 至少一项非空（附件可单独发送）；附件顺序与列表一致 |
+| `attachment.upload.begin` | `{sessionId, kind:'image'\|'file', name?:string, mediaType?:string, bytes:number}` | `{uploadId, chunkBytes}` | **v1.2.0** 开启一次附件上传（§5.11）。`bytes` = 附件原始字节数；`kind:'image'` 时 `mediaType` 必须是 `image/png\|jpeg\|webp\|gif`，`kind:'file'` 时 `name` 必填。超上限回 `attachment-too-large` / `attachment-too-many` |
+| `attachment.upload.chunk` | `{uploadId, index:number, data:string}` | `{received:number}` | **v1.2.0** 上传一个分块：`index` 从 0 连续递增，`data` = **标准 base64**（canonical）的明文块（≤`chunkBytes`，最后一块可短）；`received` = 截至目前累计字节数。乱序/重复/超长回 `attachment-chunk-mismatch` |
+| `attachment.upload.commit` | `{uploadId}` | `{uploadId, attachment:UploadedAttachment}` | **v1.2.0** 提交：插件把累积字节写入宿主附件服务（图片归一化、文件逐字节存储）。成功后该 uploadId 只能用于一次 `session.prompt`。宿主校验失败原样回 `session/attachment-invalid`（reason 带宿主码） |
+| `attachment.upload.abort` | `{uploadId}` | `{aborted:bool}` | **v1.2.0** 放弃上传并释放缓冲；幂等（未知/已提交/已过期 → `aborted:false`，不报错）。已 commit 的附件不可撤回（宿主附件不可删除） |
 | `session.queue` | `{sessionId}` | `{sessionId, items:[{itemId, text, target:'next-turn'\|'next-step'}]}` | **v1.1.2** 拉取该会话**当前**待执行消息的全量快照。与 §5.2 的 `session.queue` 事件同形状：事件只在**变化时**推，客户端断线重连后必须拉一次才能补上断线期间变过的队列 |
 | `session.cancel` | `{sessionId}` | `{cancelled:bool}` | 取消当前运行的 turn |
 | `session.rename` | `{sessionId, title}` | `{title}` | |
@@ -507,6 +521,125 @@ v1.1.1 的口径：
 - 交付物图片的 `imageId` 仍以 `d` 开头（与宿主附件 id 命名空间隔离），
   `image.fetch` 照样能取到原图。
 
+### 5.11 用户提示词的附件（v1.2.0）
+
+手机端输入框与 DSH 桌面端 composer 一样支持**图片**与**文件**附件：先分块上传到宿主并
+落到宿主附件存储，再把 uploadId 随 `session.prompt` 一并提交。**附件不是 base64 塞进
+`session.prompt`**——中继单帧 1MiB（密文帧），大图/大文件必须分块。
+
+#### 5.11.1 能力目录（`session.capabilities.attachments`）
+
+```json
+{ "supported": true, "maxCount": 9, "maxItemBytes": 20971520,
+  "maxMessageBytes": 41943040, "chunkBytes": 262144,
+  "imageMediaTypes": ["image/png", "image/jpeg", "image/webp", "image/gif"] }
+```
+
+| 字段 | 含义 |
+|---|---|
+| `supported` | 宿主具备附件服务（`ctx.attachments` + `ctx.fileUploads`）且插件实现了 §5.11；false/缺省时客户端**隐藏附件入口**（旧插件没有该字段） |
+| `maxCount` | 单条 `session.prompt` 的 `uploads` 数量上限（当前 9） |
+| `maxItemBytes` | 单个附件原始字节上限（当前 20MiB） |
+| `maxMessageBytes` | 单条消息附件总字节上限（当前 40MiB） |
+| `chunkBytes` | `attachment.upload.chunk.data` 的**明文**最大字节数（当前 256KiB；客户端可更小） |
+| `imageMediaTypes` | 宿主接受的图片媒体类型（客户端不得上传其他图片格式） |
+
+**范围**：附件只对**根会话**开放。subagent（`kind='subagent'` 且带父会话血缘）详情页
+不显示附件入口；对 subagent 会话 `begin` 回 `attachment-unsupported`。
+
+#### 5.11.2 上传协议
+
+```
+client → host: attachment.upload.begin {sessionId, kind, name?, mediaType?, bytes}
+host → client: {uploadId, chunkBytes}
+client → host: attachment.upload.chunk {uploadId, index, data}       （index = 0,1,2…）
+host → client: {received}
+client → host: attachment.upload.commit {uploadId}
+host → client: {uploadId, attachment: UploadedAttachment}
+client → host: attachment.upload.abort {uploadId}                    （放弃时可选）
+host → client: {aborted}
+```
+
+- `data` 必须是**标准 base64（canonical）**：`Buffer.from(data,'base64').toString('base64') === data`。
+  手机端按明文块 → base64 → 业务信封 → AES-GCM → base64url 的既有链路发送，
+  256KiB 明文 → 约 341KB base64 → 约 460KB 密文帧 < 1MiB。
+- 分块必须**从 0 连续递增、每块只发一次**；`received` 为累计解码字节数。
+  乱序/跳号/重复/超过 `begin.bytes` 一律 `attachment-chunk-mismatch`。
+- `begin.bytes ≤ maxItemBytes`；同一 uploadId 只允许一条 chunk 流（客户端应串行）。
+- **生命周期**：`begin` 后 **5 分钟**内未 `commit` → 记录过期（`attachment-upload-not-found`）；
+  `commit` 成功后附件在**60 分钟**内可用于一次 prompt，之后过期（宿主已存对象保留）。
+  插件同时最多保留 **4 个未提交** uploadId（防内存滥用，第 5 个回 `attachment-too-many`）。
+- `commit` 前 `abort` 释放内存缓冲；`commit` 后不可撤回（宿主附件存储不可删除）。
+- 分块/回包都走**普通业务帧**（加密、按 seq 串行发送，§4/§7 不变；中继无需改动）。
+- 插件**不得**把附件字节、文件名、data URI 写日志（只允许 kind/字节数/uploadId 前缀）。
+
+**UploadedAttachment**（`commit` 回包）：
+
+```json
+{ "kind": "image", "name": "IMG_0001.jpg", "mediaType": "image/jpeg",
+  "bytes": 123456, "width": 2048, "height": 1536 }
+{ "kind": "file",  "name": "report.pdf", "bytes": 12345 }
+```
+
+- 图片：宿主归一化后的元数据（`bytes/width/height` 是**归一化存储后**的值）；
+  `name` 可缺省。宿主会校验字节与声明 `mediaType` 一致（不匹配回
+  `session/attachment-invalid` + `reason:"IMAGE_TYPE_MISMATCH"`），并按部署限制
+  （单图 50MiB / 6400 万像素 / 每消息 20 张）做准入。
+- 文件：宿主逐字节存储，`name` 为宿主净化后的文件名，`bytes` 为原始长度。
+
+#### 5.11.3 随提示词发送
+
+`session.prompt {sessionId, text, uploads:[uploadId,…]}`：
+
+- `uploads` 内附件按数组顺序拼成消息内容：`[text(若有非空正文), ...附件内容块]`。
+  `text` 可为空串（**附件单独发送**合法，宿主 `hasPromptContent` 认附件）；
+  `text` 与 `uploads` 同时为空 → `bad-params`。
+- 插件把每个 uploadId 解为宿主 **file receipt**（`ctx.fileUploads` 的 staged receipt；
+  图片/文件都用 receipt 通道，宿主在 prompt 准入时把 receipt 解成附件块），
+  然后以 `mode` 与既有逻辑（§5.1）调用宿主 `sessionController.prompt`。
+- 同一 uploadId **只能成功用于一次 prompt**：成功回包后插件标记已消费；
+  重复使用 → `attachment-upload-not-found`；宿主拒绝 prompt（如模型不支持图片输入）
+  时 receipt 未被消费，uploadId 仍可重试，宿主错误码/原因**原样**回给客户端。
+- 失败语义：`session/attachment-invalid`（宿主附件校验失败，`reason` 带宿主码，
+  如 `MODEL_DOES_NOT_SUPPORT_IMAGES` / `IMAGE_TOO_LARGE`）、
+  `attachment-upload-not-found`、`attachment-upload-consumed`。
+- 附件只对**已存在**会话生效；`session.create` 不接受附件（先建会话再发）。
+
+#### 5.11.4 客户端渲染：用户消息里的附件（历史）
+
+`ChatMessage` 新增可选 `files: FileRef[]`（旧插件不返该字段时按空数组处理）：
+
+```json
+{ "id": "…", "role": "user", "text": "", "ts": 1760000000000, "seq": 42,
+  "images": [ ImageRef… ],
+  "files": [ { "fileId": "sha256:…", "name": "report.pdf", "bytes": 12345 } ] }
+```
+
+- `images` / `files` 与正文并列：客户端把图片渲染成缩略图（点击 `image.fetch` 看大图），
+  文件渲染成**文件卡片**（图标 + 文件名 + 大小；手机端 v1.2.0 **不提供下载**）。
+- **v1.2.0 起正文不再为 `file` 块写 `[文件]` 占位符**——文件由 `files[]` 单独渲染
+  （与 v1.0.9 图片口径一致）。旧客户端会少一行占位文本，属可接受降级。
+- 手机端发送时**乐观上屏**（本地缩略图 + 文件名）；宿主消费该消息后由
+  `session.history` 的权威副本替换（同一 `seq`），**不得**出现重复气泡。
+- 图片附件与既有 §5.10 完全同通道：`imageId` = 宿主 attachmentId，缩略图内联、
+  大图 `image.fetch` 按需拉取。`attachThumbs` 同样要给**用户消息**的图片补缩略图。
+- 单条消息里图片+文件都有时，客户端按 `images` 在前、`files` 在后渲染。
+
+#### 5.11.5 错误码
+
+| code | 触发 |
+|---|---|
+| `attachment-unsupported` | 宿主无附件服务 / 目标是 subagent / 插件未实现 |
+| `attachment-bad-params` | kind/mediaType/name/bytes/index 非法；`text` 与 `uploads` 同时为空 |
+| `attachment-too-large` | `begin.bytes > maxItemBytes`；或 prompt 附件总字节超 `maxMessageBytes` |
+| `attachment-too-many` | 单条 prompt 附件数 > `maxCount`；或未提交 uploadId 已达并发上限 |
+| `attachment-upload-not-found` | 未知/过期/已消费/会话不匹配的 uploadId |
+| `attachment-chunk-mismatch` | 分块乱序/跳号/重复/超长/非 canonical base64 |
+| `attachment-upload-failed` | 宿主写入附件存储失败（未映射的存储错误） |
+
+宿主入口的附件校验错误（`session/attachment-invalid`）**原样透传**（连带 `reason`），
+客户端按宿主文案提示，不吞成通用错误。
+
 ## 6. Push Kit（华为推送）旁路
 
 - 配置项（插件 config）：`push.enabled`、`push.appId`、`push.clientId`、`push.clientSecret`、
@@ -700,3 +833,35 @@ AAD     = ""   ← 注意：本 KAT 用空 AAD，便于对齐；AAD 绑定逻辑
 - **思考**：`agent/assistant-stream` 的 `frame.chunk.type==="reasoning-delta"`，文本字段与 text-delta 相同；
   历史 assistant/message 的 content 里 `type:"reasoning"` 是独立 ReasoningBlock。
   普通 `contentText()` 仍忽略 reasoning；必须走独立映射，避免污染工具结果文本。
+
+## 附录 D：Host API 事实（v1.2.0 提示词附件，2026-11-06 实测自 DSH 0.2.2-rc.1 安装源码）
+
+- **附件存储**：`ctx.get("attachments")`（`AttachmentStore`，本地后端 `dsh-attachment-local`）。
+  - `attachments.saveImages([{data: Uint8Array, mediaType, name?}])` → `Promise<ImageAttachmentRef[]>`
+    （图片归一化 + 内容寻址存储；host 部署限制见 `attachments.imageLimits`）。
+  - `attachments.admitEncodedFile({data:<canonical base64>, name?})` → `Promise<FileAttachmentRef>`
+    （逐字节存储；`data` 非 canonical base64 回 `INVALID_FILE_BASE64`）。
+  - `ImageMediaType = "image/png" | "image/jpeg" | "image/webp" | "image/gif"`；
+    `ImageAttachmentRef = {attachmentId, mediaType, bytes, width, height, name?, originalDimensions?}`；
+    `FileAttachmentRef = {attachmentId, name, bytes}`。
+- **上传 receipt**：`ctx.get("fileUploads")`（`dsh-client-file-upload` 的 Host 服务）。
+  - `fileUploads.uploadStream({sessionId, data: AsyncIterable<Uint8Array>, name?, signal?})`
+    → `{receiptId, file: FileAttachmentRef}`（内部 `attachments.saveFileStream`）。
+  - `fileUploads.uploadImageStream({sessionId, data, mediaType, name?, signal?})`
+    → `{receiptId, image: ImageAttachmentRef}`（内部 `attachments.saveImages`）。
+  - 两方法内部 `resolveAgent(sessionId)`（冷会话会被激活）；**subagent 会被拒**
+    （`subagent/attachment-invalid`，reason `SUBAGENT_FILE_UNSUPPORTED`）。
+  - `fileUploads.resolve(agent, receiptId)` 取 staged 项；`bindPrompt` 在宿主 `prompt()` 内部自动调用。
+  - 宿主服务缺失（自定义组合未装 `dsh-client-file-upload`）→ 插件 `attachments.supported=false`。
+- **prompt 内容块**：`sessionController.prompt({requestId, sessionId, mode, content}, signal)` 的
+  `content` 是 `PromptContentPart[]`：`{type:'text', text}` / `{type:'image', mediaType, data}` /
+  `{type:'file', receiptId}`。**图片与文件都用 `{type:'file', receiptId}` 传 staged receipt**：
+  宿主 `resolvePromptFileReceipts()` 把 file receipt 解回 staged 的 `{type:'image', attachment,
+  encodedBytes}` 或 `{type:'file', attachment}`，再 `attachments.admitPromptContent()` 落成
+  消息内容块。直接传 `{type:'file', attachment}`（无 receipt）会被拒（`FILE_NOT_STAGED`）。
+- **消息内容块**：`ImageBlock = {type:'image', attachment: ImageAttachmentRef}`、
+  `FileBlock = {type:'file', attachment: FileAttachmentRef}`；历史 `user/message` 的
+  `content` 里两者都可能是持久化形态（插件 `mapHistoryMessages` 可直接读附件元数据）。
+- **图片模态校验**：`prompt` 时若 content 含 image 且当前模型 `inputModalities` 不含 `"image"`，
+  宿主回 `session/attachment-invalid`（`reason:"MODEL_DOES_NOT_SUPPORT_IMAGES"`）。
+- **附件不可删除**：宿主附件存储没有删除 API，`abort` 只能丢弃插件内存缓冲。

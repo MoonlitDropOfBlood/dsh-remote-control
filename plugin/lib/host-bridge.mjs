@@ -45,6 +45,14 @@ import {
   makeThumb,
   mediaTypeOfPath,
 } from "./images.mjs";
+import {
+  ATTACHMENT_KIND_IMAGE,
+  AttachmentWireError,
+  UploadRegistry,
+  attachmentCapabilities,
+  fileRefsOfContent,
+  uploadedAttachmentOf,
+} from "./attachments.mjs";
 
 /**
  * present 投递文件的字节上限（超过就不桥接：内存与带宽都不值得）。
@@ -182,10 +190,12 @@ export function contentText(blocks) {
 }
 
 /**
- * 会话消息正文文本（契约 §5.10）：**图片块不占位**。
+ * 会话消息正文文本（契约 §5.10 / §5.11.4）：**图片与文件块都不占位**。
  *
- * 图片在 ChatMessage.images[] 里单独渲染（客户端画缩略图气泡），正文里再写一遍
- * "[图片]" 会出现重复的假文字。file 块仍保留占位符（文件没有独立渲染通道）。
+ * 图片在 ChatMessage.images[] 里单独渲染（客户端画缩略图气泡），
+ * 文件在 ChatMessage.files[] 里单独渲染（文件卡片）；正文里再写一遍
+ * "[图片]"/"[文件]" 会出现重复的假文字。v1.2.0 起 file 块也不再添加占位符
+ * （旧客户端会少一行占位文本，属可接受降级）。
  * @param {unknown} blocks ContentBlock[]
  * @returns {string}
  */
@@ -196,10 +206,9 @@ export function messageText(blocks) {
     if (!block || typeof block !== "object") continue;
     if (block.type === "text" && typeof block.text === "string") {
       text += block.text;
-    } else if (block.type === "file") {
-      text += "[文件]";
     }
-    // image：单独渲染（§5.10），不占位；reasoning / tool-call 等：跳过
+    // image：单独渲染（§5.10）；file：单独渲染（§5.11.4）；
+    // reasoning / tool-call 等：跳过
   }
   return text;
 }
@@ -208,7 +217,8 @@ export function messageText(blocks) {
  * 契约 §5.2 `session.queue`：待执行消息的文本口径。
  *
  * 只取 content 里 `type==='text'` 的块拼接——与正文口径（messageText）刻意不同：
- * 正文会把 file 块渲染成 "[文件]" 占位符，而排队列表要的是**用户实际打的字**。
+ * 正文会把图片/文件块独立渲染（不占位），而排队列表要的是**用户实际打的字**
+ * （附件-only 消息没有文本，不进队列展示；消息本身照常投递）。
  * @param {unknown} content ContentBlock[]
  * @returns {string}
  */
@@ -257,6 +267,8 @@ export function reasoningText(blocks) {
  *   - v1.0.9（§5.10）：消息里有 image 块时，ChatMessage 追加 `images: ImageRef[]`
  *     （只带元数据，thumb 由上层 attachThumbs 补）；**纯图片消息（无正文）也要成条**，
  *     否则手机端永远看不到这张图；
+ *   - v1.2.0（§5.11.4）：消息里有 file 块时，ChatMessage 追加 `files: FileRef[]`
+ *     （fileId/name/bytes，手机端渲染文件卡片，不下载）；**纯文件消息也要成条**；
  *   - 没有任何内容的消息跳过（不产生空泡）；
  *   - 任何不认识的形态返回 []（跳过），绝不抛出。
  * @returns {object[]} ChatMessage[]
@@ -297,9 +309,12 @@ export function mapHistoryMessages(sessionId, record) {
   const text = messageText(content);
   // v1.0.9（§5.10）：图片单独成字段，**不带缩略图**（纯函数读不到附件字节）
   const images = imageBlocksOf(content).map((ref) => imageRefMeta(ref));
-  if (text.trim() !== "" || images.length > 0) {
+  // v1.2.0（§5.11.4）：文件块单独成字段（只有名称/大小，不需要读字节）
+  const files = fileRefsOfContent(content);
+  if (text.trim() !== "" || images.length > 0 || files.length > 0) {
     const message = { id: `${sessionId}:${seq}`, role, text, ts, seq };
     if (images.length > 0) message.images = images;
+    if (files.length > 0) message.files = files;
     out.push(message);
   }
   return out;
@@ -906,6 +921,8 @@ export class HostBridge {
   #deliveredThumbs = new Map();
   // v1.1.2（§5.1）：运行中的会话（api-session/status 维护）——「繁忙时的发送行为」只在忙时有意义
   #runningSessions = new Set();
+  // v1.2.0（§5.11）：手机端附件分块上传登记表（内存态；未提交缓冲 + 已提交 receipt）
+  #uploads = new UploadRegistry();
   #disposers = [];
   #hostName = "";
   #dshVersion = "";
@@ -1886,6 +1903,14 @@ export class HostBridge {
           return await this.#rSessionUnarchive(m);
         case "session.prompt":
           return await this.#rSessionPrompt(m);
+        case "attachment.upload.begin":
+          return await this.#rAttachmentUploadBegin(m);
+        case "attachment.upload.chunk":
+          return await this.#rAttachmentUploadChunk(m);
+        case "attachment.upload.commit":
+          return await this.#rAttachmentUploadCommit(m);
+        case "attachment.upload.abort":
+          return await this.#rAttachmentUploadAbort(m);
         case "session.cancel":
           return await this.#rSessionCancel(m);
         case "session.rename":
@@ -2292,6 +2317,11 @@ export class HostBridge {
     const parentSessionId = typeof p.parentSessionId === "string" ? p.parentSessionId : "";
     const childSessionId = typeof p.childSessionId === "string" ? p.childSessionId : "";
     const text = typeof p.text === "string" ? p.text : "";
+    // v1.2.0（§5.11.1）：附件只对根会话开放；subagent 的输入不接收 uploads（不静默丢）。
+    if (Array.isArray(p.uploads) && p.uploads.length > 0) {
+      this.#reply(m, errorOf(m, "attachment-unsupported", "subagent 不支持附件"));
+      return;
+    }
     if (parentSessionId === "" || childSessionId === "" || text === "") {
       this.#reply(m, errorOf(m, "bad-params", "parentSessionId/childSessionId/text required"));
       return;
@@ -2475,21 +2505,22 @@ export class HostBridge {
     const presets = await this.#loadAgentPresets();
     const permissions = await this.#loadPermissionPresets();
     const models = await this.#loadModelCatalog();
-    this.#reply(
-      m,
-      resultOf(m, {
-        presets: presets.presets,
-        permissions: permissions.permissions,
-        defaultPreset: presets.defaultPreset,
-        defaultPermission: permissions.defaultPermission,
-        models: models.models,
-        defaultModelId: models.defaultModelId,
-        archiveSupported: this.#archiveSupported(),
-        // v1.1.2：宿主「繁忙时的发送行为」设置（排队发送/插话发送）。
-        // 客户端**只读不选**——发消息走哪种行为由宿主的设置决定（用户明确要求）。
-        busyEnter: this.#busyEnterMode(),
-      }),
-    );
+    const capabilities = {
+      presets: presets.presets,
+      permissions: permissions.permissions,
+      defaultPreset: presets.defaultPreset,
+      defaultPermission: permissions.defaultPermission,
+      models: models.models,
+      defaultModelId: models.defaultModelId,
+      archiveSupported: this.#archiveSupported(),
+      // v1.1.2：宿主「繁忙时的发送行为」设置（排队发送/插话发送）。
+      // 客户端**只读不选**——发消息走哪种行为由宿主的设置决定（用户明确要求）。
+      busyEnter: this.#busyEnterMode(),
+    };
+    // v1.2.0（§5.11.1）：宿主具备附件服务（attachments + fileUploads）才声明附件能力；
+    // 否则**省略该字段**，客户端隐藏附件入口（旧插件也没有该字段）。
+    if (this.#attachmentHostReady()) capabilities.attachments = attachmentCapabilities();
+    this.#reply(m, resultOf(m, capabilities));
   }
 
   /**
@@ -2919,8 +2950,15 @@ export class HostBridge {
     const p = m.payload ?? {};
     const sessionId = typeof p.sessionId === "string" ? p.sessionId : "";
     const text = typeof p.text === "string" ? p.text : "";
-    if (sessionId === "" || text.trim() === "") {
-      this.#reply(m, errorOf(m, "bad-params", "sessionId and non-empty text required"));
+    const rawUploads = p.uploads;
+    // v1.2.0（§5.11.3）：text 与 uploads 至少一项非空——附件可以单独发送。
+    if (sessionId === "") {
+      this.#reply(m, errorOf(m, "bad-params", "sessionId required"));
+      return;
+    }
+    const hasUploads = Array.isArray(rawUploads) && rawUploads.length > 0;
+    if (text.trim() === "" && !hasUploads) {
+      this.#reply(m, errorOf(m, "bad-params", "text or uploads required"));
       return;
     }
     // v1.1.2（契约 §5.1）：**投递行为由宿主设置决定**，客户端不参与选择。
@@ -2929,19 +2967,38 @@ export class HostBridge {
     // 客户端若仍带 mode（旧客户端），**忽略**它，不报错也不改变行为。
     const mode = this.#resolvePromptMode(sessionId);
     const requestId = randomUUID();
+    // v1.2.0（§5.11.3）：把 uploadId 换成宿主 receipt（图片/文件都走 file receipt
+    // 通道；宿主在 prompt 准入时解成附件块）。未知/过期/跨会话/已消费 → 明确错误。
+    let content;
+    let uploadIds = [];
+    try {
+      const staged = this.#uploads.promptUploads(sessionId, rawUploads);
+      content = [];
+      if (text.trim() !== "") content.push({ type: "text", text });
+      for (const item of staged) content.push({ type: "file", receiptId: item.receiptId });
+      uploadIds = staged.map((item) => item.uploadId);
+    } catch (e) {
+      this.#replyAttachmentError(m, e);
+      return;
+    }
     const send = async (delivery) =>
       this.#sc().prompt(
         {
           requestId,
           sessionId,
           mode: delivery,
-          content: [{ type: "text", text }],
+          content,
         },
         this.#signal(30_000),
       );
     try {
       const value = await send(mode);
-      this.#reply(m, resultOf(m, { accepted: value?.accepted === true, mode }));
+      const accepted = value?.accepted === true;
+      // 宿主已接受 → 这批 receipt 被 bindPrompt 消费；墓碑保证同一 uploadId
+      // 不能被第二条消息复用（重复用自己的附件 → attachment-upload-consumed）。
+      // 未真正接受时不消费，让客户端可以重试。
+      if (accepted) this.#uploads.markConsumed(uploadIds);
+      this.#reply(m, resultOf(m, { accepted, mode }));
     } catch (e) {
       // 宿主拒绝插话（session/steer-unavailable：当前 turn 不再接受插入）时
       // **自动退回排队**——桌面端此时是把 steer 动作置灰，手机不能把用户的消息弄丢。
@@ -2950,7 +3007,9 @@ export class HostBridge {
         this.#log("warn", "steer unavailable, falling back to queue", { sessionId });
         try {
           const value = await send("queue");
-          this.#reply(m, resultOf(m, { accepted: value?.accepted === true, mode: "queue" }));
+          const accepted = value?.accepted === true;
+          if (accepted) this.#uploads.markConsumed(uploadIds);
+          this.#reply(m, resultOf(m, { accepted, mode: "queue" }));
           return;
         } catch (e2) {
           const err2 = hostErrorOf(e2, "prompt-failed");
@@ -2959,10 +3018,171 @@ export class HostBridge {
           return;
         }
       }
-      // 其余宿主错误**原样**回客户端（不得吞掉）
+      // 其余宿主错误**原样**回客户端（不得吞掉）——附件校验失败（如模型不支持
+      // 图片输入、单图超限）也走这里，客户端据此提示；uploadId 仍可重试。
       this.#log("warn", "prompt failed", { sessionId, mode, code: err.code });
       this.#reply(m, errorOf(m, err.code, err.message));
     }
+  }
+
+  // ---- v1.2.0（§5.11）：附件分块上传 ---------------------------------------
+
+  /** 附件服务的宿主能力判断：两个服务都在才支持（§5.11.1 supported）。 */
+  #attachmentHostReady() {
+    const fileUploads = this.#service("fileUploads");
+    if (!fileUploads) return false;
+    if (typeof fileUploads.uploadImageStream !== "function") return false;
+    if (typeof fileUploads.uploadStream !== "function") return false;
+    return this.#service("attachments") !== null;
+  }
+
+  /** 统一回附件错误（AttachmentWireError 用契约错误码；宿主错误原样透传）。 */
+  #replyAttachmentError(m, e) {
+    if (e instanceof AttachmentWireError) {
+      this.#reply(m, errorOf(m, e.code, e.message));
+      return;
+    }
+    const err = hostErrorOf(e, "attachment-upload-failed");
+    this.#log("warn", "attachment operation failed", { code: err.code });
+    this.#reply(m, errorOf(m, err.code, err.message));
+  }
+
+  async #rAttachmentUploadBegin(m) {
+    if (!this.#attachmentHostReady()) {
+      this.#reply(m, errorOf(m, "attachment-unsupported", "当前宿主未提供附件上传服务"));
+      return;
+    }
+    try {
+      const begun = this.#uploads.begin(m.payload ?? {});
+      this.#reply(m, resultOf(m, begun));
+    } catch (e) {
+      this.#replyAttachmentError(m, e);
+    }
+  }
+
+  async #rAttachmentUploadChunk(m) {
+    try {
+      const p = m.payload ?? {};
+      const result = this.#uploads.chunk(p);
+      this.#reply(m, resultOf(m, result));
+    } catch (e) {
+      this.#replyAttachmentError(m, e);
+    }
+  }
+
+  /**
+   * 提交：把内存缓冲写进宿主附件存储。
+   *
+   * 为什么走 `ctx.fileUploads`（而不是直接 `attachments.saveFile`）：
+   * 宿主 prompt 只认 receipt——`resolvePromptFileReceipts()` 会把 content 里的
+   * `{type:'file',receiptId}` 解回 staged 的图片/文件块；直接塞 attachment ref 会被
+   * 拒为 `FILE_NOT_STAGED`（附录 D）。图片与文件都用同一条 receipt 通道（桌面端
+   * composer 的图片上传也是这么做的：图片 receipt 在 prompt 里以 file part 提交）。
+   */
+  async #rAttachmentUploadCommit(m) {
+    const p = m.payload ?? {};
+    const uploadId = typeof p.uploadId === "string" ? p.uploadId : "";
+    let record;
+    try {
+      record = this.#uploads.beginCommit(uploadId);
+    } catch (e) {
+      this.#replyAttachmentError(m, e);
+      return;
+    }
+    const svc = this.#service("fileUploads");
+    if (!svc) {
+      this.#uploads.failCommit(uploadId);
+      this.#reply(m, errorOf(m, "attachment-unsupported", "当前宿主未提供附件上传服务"));
+      return;
+    }
+    const chunks = record.chunks;
+    const iterate = async function* () {
+      for (const chunk of chunks) yield new Uint8Array(chunk);
+    };
+    // 宿主归一化/落盘可能较慢（sharp 压缩大图），给 120s；**完成后必须清定时器**
+    // ——否则每个 commit 都会留下一个 2 分钟的空定时器（测试进程也被吊住）。
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 120_000);
+    try {
+      let result;
+      if (record.kind === ATTACHMENT_KIND_IMAGE) {
+        result = await svc.uploadImageStream({
+          sessionId: record.sessionId,
+          data: iterate(),
+          mediaType: record.mediaType,
+          ...(record.name !== "" ? { name: record.name } : {}),
+          signal: ac.signal,
+        });
+        if (!result || typeof result.receiptId !== "string" || !result.image) {
+          throw new Error("宿主未返回图片附件凭据");
+        }
+        this.#uploads.completeCommit(uploadId, {
+          receiptId: result.receiptId,
+          attachment: result.image,
+          kind: record.kind,
+          mediaType: record.mediaType,
+          requestedName: record.name,
+          bytes: record.bytes,
+        });
+        const attachment = uploadedAttachmentOf({
+          kind: record.kind,
+          mediaType: record.mediaType,
+          requestedName: record.name,
+          bytes: record.bytes,
+          attachment: result.image,
+        });
+        // 日志只打 kind/字节数/尺寸——**绝不**打文件名或字节内容
+        this.#log("info", "attachment committed", {
+          uploadId: uploadId.slice(0, 10),
+          kind: "image",
+          bytes: attachment.bytes,
+        });
+        this.#reply(m, resultOf(m, { uploadId, attachment }));
+        return;
+      }
+      result = await svc.uploadStream({
+        sessionId: record.sessionId,
+        data: iterate(),
+        ...(record.name !== "" ? { name: record.name } : {}),
+        signal: ac.signal,
+      });
+      if (!result || typeof result.receiptId !== "string" || !result.file) {
+        throw new Error("宿主未返回文件附件凭据");
+      }
+      this.#uploads.completeCommit(uploadId, {
+        receiptId: result.receiptId,
+        attachment: result.file,
+        kind: record.kind,
+        mediaType: record.mediaType,
+        requestedName: record.name,
+        bytes: record.bytes,
+      });
+      const attachment = uploadedAttachmentOf({
+        kind: record.kind,
+        requestedName: record.name,
+        bytes: record.bytes,
+        attachment: result.file,
+      });
+      this.#log("info", "attachment committed", {
+        uploadId: uploadId.slice(0, 10),
+        kind: "file",
+        bytes: attachment.bytes,
+      });
+      this.#reply(m, resultOf(m, { uploadId, attachment }));
+    } catch (e) {
+      // 宿主失败 → 退回 receiving（缓冲还在），客户端可重试 commit
+      this.#uploads.failCommit(uploadId);
+      this.#replyAttachmentError(m, e);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async #rAttachmentUploadAbort(m) {
+    const p = m.payload ?? {};
+    const uploadId = typeof p.uploadId === "string" ? p.uploadId : "";
+    const aborted = uploadId === "" ? false : this.#uploads.abort(uploadId);
+    this.#reply(m, resultOf(m, { aborted }));
   }
 
   async #rSessionCancel(m) {

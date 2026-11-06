@@ -1,15 +1,15 @@
 /*
  * Copyright (c) 2026 dukedsh.
- * dsh-remote-control-app 协议层：常量 / 消息类型 / KAT 向量（契约 v1.1.1）。
- * 契约来源（只读）：仓库根 docs/PROTOCOL.md（dsh-remote-control，v1.1.1）
+ * dsh-remote-control-app 协议层：常量 / 消息类型 / KAT 向量（契约 v1.2.0）。
+ * 契约来源（只读）：仓库根 docs/PROTOCOL.md（dsh-remote-control，v1.2.0）
  * 本文件只描述“协议长什么样”，不做任何 IO 与加密运算。
  */
 
 /** 协议版本（契约 §5.1 hello.proto）。 */
 export const PROTO_VERSION: number = 1;
 
-/** 协议契约文档版本（v1.1.1：§5.10.1/§5.10.2 交付物图片 + §5.2 session.queue 队列 + session.prompt 的 mode；关于页展示用）。 */
-export const CONTRACT_VERSION: string = 'v1.1.1';
+/** 协议契约文档版本（v1.2.0：§5.11 用户提示词附件——分块上传 + session.prompt uploads + ChatMessage.files；关于页展示用）。 */
+export const CONTRACT_VERSION: string = 'v1.2.0';
 
 /** 角色：host = PC 端 DSH 插件；client = 本 App。 */
 export const ROLE_HOST: string = 'host';
@@ -96,6 +96,10 @@ export const MSG_SESSION_SELECT_PERMISSION: string = 'session.selectPermission';
 export const MSG_SESSION_PERMISSION: string = 'session.permission'; // 查询会话当前权限
 export const MSG_IMAGE_FETCH: string = 'image.fetch'; // v1.0.9：拉取图片大图（§5.10）
 export const MSG_SESSION_QUEUE: string = 'session.queue'; // v1.1.1：拉取待执行消息快照（§5.2）
+export const MSG_UPLOAD_BEGIN: string = 'attachment.upload.begin'; // v1.2.0：开启附件分块上传（§5.11）
+export const MSG_UPLOAD_CHUNK: string = 'attachment.upload.chunk'; // v1.2.0：上传一个明文块
+export const MSG_UPLOAD_COMMIT: string = 'attachment.upload.commit'; // v1.2.0：提交附件（落宿主附件存储）
+export const MSG_UPLOAD_ABORT: string = 'attachment.upload.abort'; // v1.2.0：放弃上传（幂等，已提交不可撤回）
 export const MSG_SESSION_PROMPT: string = 'session.prompt';
 export const MSG_SESSION_CANCEL: string = 'session.cancel';
 export const MSG_SESSION_RENAME: string = 'session.rename';
@@ -195,6 +199,22 @@ export interface DshrcPayload {
   childSessionId?: string;
   // session.prompt（§5.1 v1.1.1）：发送模式（'queue' | 'steer'）——请求体必须**显式**带上
   mode?: DshrcPromptMode;
+  /**
+   * session.prompt（§5.1 v1.2.0）：已 `attachment.upload.commit` 的 uploadId 列表。
+   * 与 text 至少一项非空（附件可单独发送）；附件顺序与列表一致（§5.11.3）。
+   */
+  uploads?: string[];
+  // attachment.upload.*（§5.1 v1.2.0）
+  kind?: string; // begin：'image' | 'file'
+  name?: string; // begin：文件名（kind='file' 必填）
+  mediaType?: string; // begin：图片媒体类型（kind='image' 必填，§5.11.1 目录内）
+  bytes?: number; // begin：附件原始字节数
+  uploadId?: string; // begin/chunk/commit/abort
+  chunkBytes?: number; // begin 响应：单块明文上限
+  index?: number; // chunk：从 0 连续递增
+  received?: number; // chunk 响应：累计解码字节数
+  attachment?: DshrcUploadedAttachment; // commit 响应：宿主归一化后的附件元数据
+  aborted?: boolean; // abort 响应：是否真的丢弃了未提交缓冲
   // image.fetch（§5.1 v1.0.9：拉图片大图）
   imageId?: string;
   maxEdge?: number;
@@ -207,7 +227,12 @@ export interface DshrcPayload {
   freeText?: string;
   // event（§5.2）
   topic?: string;
-  data?: DshrcValue;
+  /**
+   * 事件载荷（§5.2）或 attachment.upload.chunk 的请求字段（§5.1 v1.2.0）——
+   * 两者共用 `data` 键：事件里是对象，分块请求里是**标准 base64 字符串**。
+   * 接收方读事件时必须先判类型（sessionstore.handleEvent 已按对象收窄）。
+   */
+  data?: DshrcValue | string;
   // ping
   pong?: number;
 }
@@ -282,6 +307,8 @@ export interface DshrcValue {
   archiveSupported?: boolean;
   // session.capabilities（§5.1 v1.1.2）：宿主「繁忙时的发送行为」（只读）
   busyEnter?: string;
+  // session.capabilities（§5.1 v1.2.0）：附件能力目录（缺省 = 宿主不支持）
+  attachments?: DshrcAttachmentCaps;
   // session.create（§5.1 v1.0.7）：模型选择与设置结果
   model?: DshrcModelSelection;
   modelError?: string;
@@ -301,6 +328,12 @@ export interface DshrcValue {
   image?: DshrcImageRef;
   // session.queue 事件（§5.2 v1.1.1）：该会话待执行的用户消息列表（空数组 = 没有待执行消息）
   items?: DshrcQueueItem[];
+  // attachment.upload.begin / chunk / commit / abort 响应（§5.1 v1.2.0）
+  uploadId?: string;
+  chunkBytes?: number;
+  received?: number;
+  attachment?: DshrcUploadedAttachment;
+  aborted?: boolean;
 }
 
 /**
@@ -324,6 +357,8 @@ export interface DshrcChatMessage {
   seq: number; // host 日志持久序号（去重键）
   /** v1.0.9：消息内图片（§5.10）——旧插件不返该字段时按空数组处理。 */
   images?: DshrcImageRef[];
+  /** v1.2.0：用户消息里的文件（§5.11.4）——旧插件不返该字段时按空数组处理。 */
+  files?: DshrcFileRef[];
 }
 
 /**
@@ -347,6 +382,49 @@ export interface DshrcImageRef {
    */
   source?: string;
   thumb: string; // 缩略图 data URI（可能为空串）
+}
+
+/**
+ * 用户消息里的文件引用（契约 §5.11.4 v1.2.0 `ChatMessage.files[]`）。
+ * 手机端 v1.2.0 **不提供下载**：只渲染成文件卡片（图标 + 文件名 + 大小）。
+ * 乐观上屏时 fileId 用 `local:<localId>`（宿主持久副本会给出真实 id 并替换）。
+ */
+export interface DshrcFileRef {
+  fileId: string;
+  name: string;
+  bytes: number;
+}
+
+/**
+ * 附件能力目录（契约 §5.11.1 v1.2.0 `session.capabilities.attachments`）。
+ * 旧插件**缺省该字段** → 客户端隐藏附件入口（不得报错）。
+ */
+export interface DshrcAttachmentCaps {
+  supported: boolean;
+  maxCount: number; // 单条 prompt 的 uploads 数量上限（当前 9）
+  maxItemBytes: number; // 单个附件原始字节上限（当前 20MiB）
+  maxMessageBytes: number; // 单条消息附件总字节上限（当前 40MiB）
+  chunkBytes: number; // 单块明文上限（当前 256KiB；客户端可更小）
+  imageMediaTypes: string[]; // 宿主接受的图片媒体类型
+}
+
+/** `attachment.upload.begin` 响应（契约 §5.1 v1.2.0）。 */
+export interface DshrcUploadBegin {
+  uploadId: string;
+  chunkBytes: number;
+}
+
+/**
+ * `attachment.upload.commit` 回包里的附件元数据（契约 §5.11.2 v1.2.0）。
+ * 图片字段是**宿主归一化存储后**的值；文件 bytes 为原始长度。
+ */
+export interface DshrcUploadedAttachment {
+  kind: string; // 'image' | 'file'
+  name?: string;
+  mediaType?: string;
+  bytes: number;
+  width?: number;
+  height?: number;
 }
 
 /** session.history 响应 value（契约 §5.1 v1.0.4）。 */
@@ -438,6 +516,11 @@ export interface DshrcCapabilities {
    * 手机端不提供切换；发消息走哪种行为由 DSH 设置决定（用户明确要求）。
    */
   busyEnter: string;
+  /**
+   * v1.2.0（§5.11.1）：用户提示词附件能力目录——**缺省 = 宿主不支持**，
+   * 客户端据此隐藏附件入口（旧插件没有该字段，不得报错）。
+   */
+  attachments?: DshrcAttachmentCaps;
 }
 
 /**

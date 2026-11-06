@@ -44,7 +44,7 @@ function jsonStr(s: string): string {
 /** 单个问题的选项块（单选 Radio / 多选 Checkbox）。 */
 @ComponentV2
 struct AskQuestionBlock {
-  @Require @Param q: DshrcQuestion;
+  @Require @Param cell: RepeatItem<DshrcQuestion>;
   @Require @Param picks: AskPickItem[];
   @Param multi: boolean = false;
   @Param group: string = '';
@@ -52,7 +52,7 @@ struct AskQuestionBlock {
   build() {
     Column() {
       Row() {
-        Text(this.q.question)
+        Text(this.cell.item.question)
           .fontSize(FS_BODY)
           .fontWeight(FontWeight.Medium)
           .fontColor($r('app.color.label_primary'))
@@ -116,7 +116,7 @@ struct AskQuestionBlock {
 
   /** 由选项 label 反查描述（选项来自契约 §5.4 options；无则空串）。 */
   private optionDesc(label: string): string {
-    const opts: DshrcQuestionOption[] = this.q.options !== undefined ? this.q.options : [];
+    const opts: DshrcQuestionOption[] = this.cell.item.options !== undefined ? this.cell.item.options : [];
     for (let i: number = 0; i < opts.length; i++) {
       if (opts[i].label === label) {
         const d: string | undefined = opts[i].description;
@@ -445,7 +445,7 @@ export struct QuestionCardView {
         .each((cell: RepeatItem<DshrcQuestion>): void => {
           Column() {
             AskQuestionBlock({
-              q: cell.item,
+              cell: cell,
               picks: cell.index < this.picksByQ.length ? this.picksByQ[cell.index] : [],
               multi: this.isMulti(cell.item),
               group: this.card.askId + '#' + cell.item.id
@@ -498,5 +498,27 @@ export struct QuestionCardView {
     .borderRadius(RADIUS_CARD)
     .border({ width: HAIRLINE, color: $r('app.color.border_l2') })
     .margin({ bottom: SP_3 })
+  }
+}
+
+/** 审批 Repeat 边界：整个 RepeatItem 入组件，复用时不会保留旧 card。 */
+@ComponentV2
+export struct ApprovalRepeatCard {
+  @Require @Param cell: RepeatItem<ApprovalCard>;
+  @Param sessionTitle: string = '';
+
+  build() {
+    ApprovalCardView({ card: this.cell.item, sessionTitle: this.sessionTitle })
+  }
+}
+
+/** 提问 Repeat 边界：整个 RepeatItem 入组件，复用时不会保留旧 card。 */
+@ComponentV2
+export struct QuestionRepeatCard {
+  @Require @Param cell: RepeatItem<QuestionCard>;
+  @Param sessionTitle: string = '';
+
+  build() {
+    QuestionCardView({ card: this.cell.item, sessionTitle: this.sessionTitle })
   }
 }

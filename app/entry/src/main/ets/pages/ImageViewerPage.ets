@@ -229,5 +229,6 @@ export struct ImageViewerPage {
     .width('100%')
     .height('100%')
     .backgroundColor($r('app.color.image_viewer_bg'))
+      .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
   }
 }

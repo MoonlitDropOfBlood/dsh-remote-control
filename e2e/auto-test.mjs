@@ -301,6 +301,148 @@ async function v106LoopbackCase() {
 }
 
 /**
+ * v1.2.0（契约 §5.11）：输入框附件——分块上传 + session.prompt uploads + 历史 files[]。
+ * 进程内回环 + mock host（不碰真实 channel/中继）。
+ */
+async function v120AttachmentLoopbackCase() {
+  console.log("");
+  console.log("--- v1.2.0 attachment case (loopback + mock host) ---");
+  const wire = { channel: "E2ELOOPBACKCHANL1", secret: "e2e-v120-loopback-secret-0123456789" };
+  let mock = null;
+  const { host, client } = createLoopbackPair({
+    channel: wire.channel,
+    secret: wire.secret,
+    onHostMessage: (m) => {
+      void mock.handle(m).catch((e) => console.error("[mock] handler error:", e));
+    },
+    onClientMessage: () => {},
+  });
+  mock = createMockHost({ link: host, log: () => {} });
+
+  const caps = await client.request("session.capabilities", {}, 5000);
+  check("capabilities 声明 attachments", caps?.attachments?.supported === true, JSON.stringify(caps?.attachments));
+  check("capabilities.attachments 上限字段", caps.attachments.maxCount === 9 && caps.attachments.chunkBytes === 262144 && Array.isArray(caps.attachments.imageMediaTypes), JSON.stringify(caps.attachments));
+
+  const created = await client.request("session.create", { title: "e2e-v120" }, 5000);
+  check("create 会话成功", typeof created?.sessionId === "string", JSON.stringify(created));
+  const sid = created.sessionId;
+
+  // ---- 图片上传（320×200 的 PNG 头）----
+  const png = Buffer.alloc(33);
+  png.writeUInt32BE(0x89504e47, 0);
+  png.writeUInt32BE(0x0d0a1a0a, 4);
+  png.write("IHDR", 12);
+  png.writeUInt32BE(320, 16);
+  png.writeUInt32BE(200, 20);
+  const begun = await client.request(
+    "attachment.upload.begin",
+    { sessionId: sid, kind: "image", name: "shot.png", mediaType: "image/png", bytes: png.length },
+    5000,
+  );
+  check("upload.begin 图片回 uploadId/chunkBytes", typeof begun?.uploadId === "string" && begun.chunkBytes === 262144, JSON.stringify(begun));
+  const imageUploadId = begun.uploadId;
+  const cut = 20;
+  const rc0 = await client.request(
+    "attachment.upload.chunk",
+    { uploadId: imageUploadId, index: 0, data: png.subarray(0, cut).toString("base64") },
+    5000,
+  );
+  check("upload.chunk 0 回 received", rc0?.received === cut, JSON.stringify(rc0));
+  const rc1 = await client.request(
+    "attachment.upload.chunk",
+    { uploadId: imageUploadId, index: 1, data: png.subarray(cut).toString("base64") },
+    5000,
+  );
+  check("upload.chunk 1 收满", rc1?.received === png.length, JSON.stringify(rc1));
+  const committed = await client.request("attachment.upload.commit", { uploadId: imageUploadId }, 5000);
+  check("upload.commit 图片回 UploadedAttachment", committed?.attachment?.kind === "image" && committed.attachment.bytes === png.length, JSON.stringify(committed));
+  check("upload.commit 图片带归一化尺寸", committed.attachment.width === 320 && committed.attachment.height === 200, JSON.stringify(committed.attachment));
+
+  // ---- 文件上传 ----
+  const fileBytes = Buffer.from("attachment body");
+  const fileBegun = await client.request(
+    "attachment.upload.begin",
+    { sessionId: sid, kind: "file", name: "说明.txt", bytes: fileBytes.length },
+    5000,
+  );
+  const fileUploadId = fileBegun.uploadId;
+  await client.request(
+    "attachment.upload.chunk",
+    { uploadId: fileUploadId, index: 0, data: fileBytes.toString("base64") },
+    5000,
+  );
+  const fileCommitted = await client.request("attachment.upload.commit", { uploadId: fileUploadId }, 5000);
+  check("upload.commit 文件回 kind/name/bytes", fileCommitted?.attachment?.kind === "file" && fileCommitted.attachment.name === "说明.txt" && fileCommitted.attachment.bytes === fileBytes.length, JSON.stringify(fileCommitted));
+
+  // ---- prompt 带图片 + 文件 ----
+  const promptRes = await client.request("session.prompt", { sessionId: sid, text: "看附件", uploads: [imageUploadId, fileUploadId] }, 5000);
+  check("session.prompt 带 uploads 被接受", promptRes?.accepted === true, JSON.stringify(promptRes));
+
+  let hist = null;
+  const deadline = Date.now() + 8000;
+  while (Date.now() < deadline) {
+    hist = await client.request("session.history", { sessionId: sid }, 5000);
+    const user = (hist?.messages ?? []).find((m) => m.role === "user" && (m.images ?? []).length > 0);
+    if (user !== undefined) break;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  const userMsg = (hist?.messages ?? []).find((m) => m.role === "user" && (m.images ?? []).length > 0);
+  check("history 用户消息带 images[]", userMsg !== undefined && userMsg.images[0].imageId === committed.attachment.attachmentId, JSON.stringify(userMsg));
+  check("history 用户消息带 files[]", (userMsg?.files ?? []).length === 1 && userMsg.files[0].name === "说明.txt", JSON.stringify(userMsg?.files));
+  check("history 用户消息正文不含占位符", userMsg?.text === "看附件", JSON.stringify(userMsg?.text));
+
+  // 同一 uploadId 复用 → attachment-upload-consumed
+  let reuseErr = null;
+  try {
+    await client.request("session.prompt", { sessionId: sid, text: "again", uploads: [imageUploadId] }, 5000);
+  } catch (e) {
+    reuseErr = e;
+  }
+  check("消费后的 uploadId 复用被拒", String(reuseErr).includes("已用于上一条消息"), String(reuseErr));
+
+  // 附件-only（正式协议允许 text 为空串）
+  const onlyBytes = Buffer.from("only");
+  const onlyBegun = await client.request(
+    "attachment.upload.begin",
+    { sessionId: sid, kind: "file", name: "only.txt", bytes: onlyBytes.length },
+    5000,
+  );
+  await client.request("attachment.upload.chunk", { uploadId: onlyBegun.uploadId, index: 0, data: onlyBytes.toString("base64") }, 5000);
+  await client.request("attachment.upload.commit", { uploadId: onlyBegun.uploadId }, 5000);
+  const onlyPrompt = await client.request("session.prompt", { sessionId: sid, text: "", uploads: [onlyBegun.uploadId] }, 5000);
+  check("附件-only prompt 被接受", onlyPrompt?.accepted === true, JSON.stringify(onlyPrompt));
+  const histDeadline = Date.now() + 8000;
+  let onlyMsg = undefined;
+  while (Date.now() < histDeadline) {
+    const h2 = await client.request("session.history", { sessionId: sid }, 5000);
+    onlyMsg = (h2?.messages ?? []).find((m) => m.role === "user" && m.text === "" && (m.files ?? []).some((f) => f.name === "only.txt"));
+    if (onlyMsg !== undefined) break;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  check("附件-only 用户消息进历史（纯附件成条）", onlyMsg !== undefined && onlyMsg.text === "", JSON.stringify(onlyMsg));
+
+  // abort 幂等
+  const abortBegun = await client.request("attachment.upload.begin", { sessionId: sid, kind: "file", name: "a.txt", bytes: 1 }, 5000);
+  const aborted = await client.request("attachment.upload.abort", { uploadId: abortBegun.uploadId }, 5000);
+  check("upload.abort 未提交上传回 aborted:true", aborted?.aborted === true, JSON.stringify(aborted));
+  const aborted2 = await client.request("attachment.upload.abort", { uploadId: abortBegun.uploadId }, 5000);
+  check("upload.abort 幂等 false", aborted2?.aborted === false, JSON.stringify(aborted2));
+
+  // text/uploads 同时为空 → bad-params
+  let emptyErr = null;
+  try {
+    await client.request("session.prompt", { sessionId: sid, text: "  " }, 5000);
+  } catch (e) {
+    emptyErr = e;
+  }
+  check("text/uploads 同时为空被拒", emptyErr !== null, String(emptyErr));
+
+  client.close();
+  host.close();
+  console.log("v1.2.0 attachment loopback case: PASS");
+}
+
+/**
  * B. 真实宿主探针：宿主插件若已升级到 v1.0.6，capabilities/history 应带上新字段；
  *    仍是旧 bundle 时跳过（提示需要 remove_bundle + install_bundle）。
  */
@@ -551,6 +693,7 @@ try {
   if (loopbackOnly) {
     // 只跑回环用例：手机在线也安全（不连真实中继、不占真实 channel）
     await v106LoopbackCase();
+    await v120AttachmentLoopbackCase();
     await v113ProofCase();
     await v113RelayCase();
     console.log("E2E RESULT: PASS (loopback only)");
@@ -594,6 +737,7 @@ try {
 
   // 5. v1.0.6+ 新链路：自测回环（恒跑）+ 真实宿主探针（尽力而为）
   await v106LoopbackCase();
+  await v120AttachmentLoopbackCase();
   await v113ProofCase();
   await v113RelayCase();
   await v106LiveProbe();

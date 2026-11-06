@@ -42,6 +42,8 @@ import {
   DshrcPromptResult,
   DshrcQueueItem,
   DshrcSubagentInfo,
+  DshrcUploadBegin,
+  DshrcUploadedAttachment,
   DshrcRelayFrame,
   DshrcRelayPeers,
   DshrcPeerProof,
@@ -71,6 +73,10 @@ import {
   MSG_SESSION_SELECT_PERMISSION,
   MSG_SESSION_PERMISSION,
   MSG_SESSION_QUEUE,
+  MSG_UPLOAD_BEGIN,
+  MSG_UPLOAD_CHUNK,
+  MSG_UPLOAD_COMMIT,
+  MSG_UPLOAD_ABORT,
   MSG_SESSION_PROMPT,
   MSG_SESSION_CANCEL,
   MSG_SESSION_RENAME,
@@ -1142,6 +1148,10 @@ export class DshrcLink {
         // v1.1.2：宿主「繁忙时的发送行为」（只读；旧插件无此字段 → queue）
         busyEnter: v.busyEnter === 'steer' ? 'steer' : 'queue'
       };
+      // v1.2.0（§5.11.1）：附件能力目录——旧插件**缺省**该字段（= 不支持，客户端隐藏入口）
+      if (v.attachments !== undefined) {
+        caps.attachments = v.attachments;
+      }
       return caps;
     });
   }
@@ -1301,9 +1311,16 @@ export class DshrcLink {
    *  请求**不带 mode**：投递行为由宿主设置决定，手机端只跟随
    *  （用户在 DSH 设置里改「繁忙时的发送行为」，手机端随之变化）。
    *  旧插件不回 mode → 按 'queue' 保守兜底（繁忙时不把消息乐观插进主时间线）。
+   *
+   * v1.2.0（§5.11.3）：`uploads` = 已 `attachment.upload.commit` 的 uploadId 列表，
+   * 按数组顺序拼成消息内容；`text` 与 `uploads` 至少一项非空（附件可单独发送）。
+   * 参数保持可选 → 旧调用点（纯文本）**签名兼容**。
    */
-  sessionPromptResult(sessionId: string, text: string): Promise<DshrcPromptResult> {
+  sessionPromptResult(sessionId: string, text: string, uploads?: string[]): Promise<DshrcPromptResult> {
     const p: DshrcPayload = { sessionId: sessionId, text: text };
+    if (uploads !== undefined && uploads.length > 0) {
+      p.uploads = uploads;
+    }
     return this.request(MSG_SESSION_PROMPT, p).then((v: DshrcValue): DshrcPromptResult => {
       const raw: DshrcPromptMode | undefined = v.mode;
       const mode: DshrcPromptMode = raw === 'steer' ? 'steer' : 'queue';
@@ -1319,6 +1336,71 @@ export class DshrcLink {
   sessionPrompt(sessionId: string, text: string): Promise<boolean> {
     return this.sessionPromptResult(sessionId, text).then((r: DshrcPromptResult): boolean => {
       return r.accepted;
+    });
+  }
+
+  /**
+   * attachment.upload.begin（§5.1 v1.2.0）：开启一次附件分块上传。
+   * `bytes` = 附件原始字节数；kind='image' 时 mediaType 必须在 §5.11.1 目录内，
+   * kind='file' 时 name 必填。返回 {uploadId, chunkBytes}（宿主单块明文上限）。
+   * 超上限回 attachment-too-large / attachment-too-many，**错误原文**透传。
+   */
+  attachmentUploadBegin(sessionId: string, kind: string, name: string, mediaType: string,
+    bytes: number): Promise<DshrcUploadBegin> {
+    const p: DshrcPayload = { sessionId: sessionId, kind: kind, bytes: bytes };
+    if (name.length > 0) {
+      p.name = name;
+    }
+    if (mediaType.length > 0) {
+      p.mediaType = mediaType;
+    }
+    return this.request(MSG_UPLOAD_BEGIN, p, 20000).then((v: DshrcValue): DshrcUploadBegin => {
+      const begun: DshrcUploadBegin = {
+        uploadId: v.uploadId !== undefined ? v.uploadId : '',
+        chunkBytes: v.chunkBytes !== undefined ? v.chunkBytes : 0
+      };
+      if (begun.uploadId.length === 0) {
+        throw new Error('主机未返回 uploadId');
+      }
+      return begun;
+    });
+  }
+
+  /**
+   * attachment.upload.chunk（§5.1 v1.2.0）：上传一个明文块。
+   * `index` 从 0 连续递增；`data` 是**标准 base64（canonical）**（调用方编码）。
+   * 返回截至目前累计解码字节数 received。
+   */
+  attachmentUploadChunk(uploadId: string, index: number, data: string): Promise<number> {
+    const p: DshrcPayload = { uploadId: uploadId, index: index, data: data };
+    return this.request(MSG_UPLOAD_CHUNK, p, 30000).then((v: DshrcValue): number => {
+      return v.received !== undefined ? v.received : 0;
+    });
+  }
+
+  /**
+   * attachment.upload.commit（§5.1 v1.2.0）：提交附件（插件写入宿主附件存储）。
+   * 图片回宿主归一化后的元数据；宿主校验失败原样回 `session/attachment-invalid`
+   * （reason 带宿主码，如 MODEL_DOES_NOT_SUPPORT_IMAGES / IMAGE_TYPE_MISMATCH）。
+   */
+  attachmentUploadCommit(uploadId: string): Promise<DshrcUploadedAttachment> {
+    const p: DshrcPayload = { uploadId: uploadId };
+    // 宿主归一化大图可能较慢（插件给宿主 120s 预算）；客户端留 150s 余量，
+    // 超时后不再误判成失败（否则用户重试会重复上传同一附件）。
+    return this.request(MSG_UPLOAD_COMMIT, p, 150000).then((v: DshrcValue): DshrcUploadedAttachment => {
+      const att: DshrcUploadedAttachment | undefined = v.attachment;
+      if (att === undefined) {
+        throw new Error('主机未返回附件信息');
+      }
+      return att;
+    });
+  }
+
+  /** attachment.upload.abort（§5.1 v1.2.0）：放弃未提交上传（幂等，已提交不可撤回）。 */
+  attachmentUploadAbort(uploadId: string): Promise<boolean> {
+    const p: DshrcPayload = { uploadId: uploadId };
+    return this.request(MSG_UPLOAD_ABORT, p, 15000).then((v: DshrcValue): boolean => {
+      return v.aborted === true;
     });
   }
 

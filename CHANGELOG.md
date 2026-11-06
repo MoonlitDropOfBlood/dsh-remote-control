@@ -3,6 +3,66 @@
 本仓库的版本说明。发版时（推 `v*` 标签）release workflow 会抽取对应版本段落作为
 GitHub Release 的正文——**bump 版本时必须同步补一段 `## [版本]`**，否则发布失败。
 
+## [1.2.0] - 2026-11-06
+
+手机端输入框补上**附件**能力（图片 + 任意文件），与 DSH 桌面端 composer 同源落库
+（契约 §5.11 v1.2.0）。此前插件已能把会话里的图片/交付物投到手机，但手机端只能发纯文本。
+
+### 协议（v1.2.0，中继/加密/帧格式不变）
+
+- 新增 `attachment.upload.begin/chunk/commit/abort` 四个请求：**分块上传**（明文块 256KiB，
+  密文帧 ≈460KB < 中继 1MiB 上限），`data` 必须是 canonical 标准 base64，序号连续；
+  未提交 5 分钟过期、已提交 60 分钟过期、单条消息最多 9 个附件、合计 40MiB。
+- `session.prompt` 新增可选 `uploads:[uploadId]`：`text` 可为空串（附件单独发送），
+  text 与 uploads 至少一项非空；附件按 uploadId 顺序拼在正文之后。
+- `session.capabilities` 新增只读 `attachments`（supported/maxCount/上限/chunkBytes/
+  imageMediaTypes）；宿主没有附件服务时**省略该字段**，客户端隐藏附件入口。
+- `ChatMessage` 新增可选 `files:FileRef[]`（`{fileId,name,bytes}`）；**正文不再为 file 块
+  写 `[文件]` 占位符**（与 v1.0.9 图片同口径）；用户消息的 `images[]` 复用既有图片通道
+  （缩略图内联 + `image.fetch` 大图）。附件只对**根会话**开放，subagent 不支持。
+
+### 插件（Host 侧）
+
+- `lib/attachments.mjs`（新）：上传登记表（状态机/校验/上限/TTL/并发上限/消费墓碑）+
+  文件块映射；`lib/host-bridge.mjs` 接线四个请求、`session.prompt` 的 uploads、
+  `capabilities.attachments` 与历史 `files[]`。
+- **落库走宿主 `ctx.fileUploads` receipt**：图片 `uploadImageStream`、文件 `uploadStream`，
+  prompt content 传 `{type:"file", receiptId}`（宿主在准入时解回附件块）。
+  直接塞 attachment ref 会被宿主拒为 `FILE_NOT_STAGED`。
+- 一次消费：宿主接受 prompt 后才 markConsumed；宿主拒绝（如模型不支持图片输入）
+  原样透传错误码、uploadId 仍可重试；重复使用回 `attachment-upload-consumed`。
+- 附件字节/文件名不进日志（只打 kind/字节数/uploadId 前缀）。
+
+### App（HarmonyOS）
+
+- 输入条新增「+」附件入口（图片/文件）与输入框上方的附件 chips：图片缩略图可删除、
+  文件卡显示名称/大小；`subagent`、one-shot 与不支持附件的主机不显示入口。
+- 图片选择用 `PhotoViewPicker`、文件用 `DocumentViewPicker`；图片先判定格式/大小，
+  `png/jpeg/webp/gif` 且不超限时直传原字节（保留 EXIF 交给宿主归一化），
+  HEIC/超限/超大像素才在手机端转码（透明→WebP，否则 JPEG，长边 2048）。
+- 发送时串行上传（begin→chunks→commit，显示进度），全部成功再带 `uploads` 发 prompt；
+  失败保留已上传项与草稿，可重试不重复上传；空闲时带本地缩略图**乐观上屏**，
+  历史权威副本到达后去重（新增纯函数对账规则）。
+- 时间线渲染用户消息的 `files[]` 文件卡，纯附件消息不画空气泡。
+- **时间线「工作步骤」改成 DSH 式过程分组**：思考块与工具调用归为一组，用
+  `ListItemGroup` + 独立 `ListItem` 聚合，组头是**动态标题**（运行中「正在运行命令 ·
+  细节」，结束后合成「已读取文件并搜索代码」），分类与文案逐字对齐桌面端
+  `@deepseek-ai/dsh-client-ui-chat` 的 `activity()` / `processTitle()`。
+- **修复插话后分组复用错乱**：过程分组抽成独立组件，Repeat 与自定义组件 / `@Builder`
+  混用时**整体传递 `RepeatItem`**（不再只传 `cell.item`），同一条规则覆盖时间线、
+  会话卡、子代理、审批/提问、附件 chip 等全部 Repeat 边界；旧过程组在遇到 message
+  边界时按 DSH 的 `ProcessGroup.closed` 立即关闭并切到完成态（**条目类型不翻转**，
+  否则工具/思考首项会被误渲染成消息气泡）。
+
+### e2e / 门禁
+
+- `e2e/mock-host.mjs` + `auto-test.mjs`：新增回环附件用例（上传→prompt→历史 files/images
+  →消费/abort/空消息拒绝），不碰真实 channel。
+- `plugin/scripts/verify-attachments.mjs`（新，129 项）：纯函数 + 上传状态机 +
+  HostBridge 真接线 + 源码级断言（失败分支不消费、日志不写文件名/字节）。
+- `verify-images`/`verify-steps` 的 `[文件]` 占位断言按新口径更新；App 新增
+  `attachment-contract-test.mjs`（纯函数 + 接线回归）。
+
 ## [1.1.9] - 2026-11-06
 
 修复手机端「历史消息加载不了」——DSH 宿主升级到 0.2.2-rc.1 后移除了插件依赖的

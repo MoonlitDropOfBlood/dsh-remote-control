@@ -18,7 +18,7 @@ import {
 } from '../model/theme';
 import { ApprovalCard, QuestionCard, SessionStore, sessionStore } from '../model/sessionstore';
 import { goBack } from '../model/routes';
-import { ApprovalCardView, QuestionCardView } from './AskCards';
+import { ApprovalRepeatCard, QuestionRepeatCard } from './AskCards';
 
 // hrouter 编译期扫描标记（注释形式：ArkTS 不允许 struct 上挂非框架装饰器）。
 // @Route({ name: 'approval_queue' })
@@ -90,16 +90,16 @@ export struct ApprovalQueuePage {
           }
           Repeat(this.store.pendingApprovals())
             .each((cell: RepeatItem<ApprovalCard>): void => {
-              ApprovalCardView({
-                card: cell.item,
+              ApprovalRepeatCard({
+                cell: cell,
                 sessionTitle: this.store.titleOf(cell.item.sessionId)
               })
             })
             .key((c: ApprovalCard): string => c.askId)
           Repeat(this.store.pendingQuestions())
             .each((cell: RepeatItem<QuestionCard>): void => {
-              QuestionCardView({
-                card: cell.item,
+              QuestionRepeatCard({
+                cell: cell,
                 sessionTitle: this.store.titleOf(cell.item.sessionId)
               })
             })
@@ -116,5 +116,6 @@ export struct ApprovalQueuePage {
     .width('100%')
     .height('100%')
     .backgroundColor($r('app.color.bg_base'))
+      .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
   }
 }

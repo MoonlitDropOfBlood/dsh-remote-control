@@ -12,20 +12,36 @@
  *  - v1.1.4：模型/强度显示与 PC composer 同口径（modelSelection 投影 + 默认强度回退）；
  *    markdown 代码块/表格复制接入系统剪贴板（此前报「未设置复制监听」）
  *  - v1.1.1：待执行消息列表（宿主 session.queue 事件）在输入区上方展示，只展示不猜测
+ *  - v1.2.0（契约 §5.11）：输入框附件——「+」菜单选图片/文件，chips 可删除，
+ *    发送时先串行分块上传（begin→chunk→commit）再带 uploads 发 prompt；
+ *    subagent / 宿主不支持（capabilities.attachments 缺省）时隐藏附件入口。
  */
 import { MarkdownController } from '@luvi/lv-markdown-in';
 import { pasteboard } from '@kit.BasicServicesKit';
+import { common } from '@kit.AbilityKit';
 import { promptAction } from '@kit.ArkUI';
 import { HRouter } from 'hrouter';
 import { dshrcLink } from '../model/link';
 import {
   DshrcEffortOption,
+  DshrcFileRef,
+  DshrcImageRef,
   DshrcModelOption,
   DshrcModelSelection,
   DshrcPermissionOption,
   DshrcPromptResult,
   DshrcQueueItem
 } from '../model/protocol';
+import {
+  AttachmentPickResult,
+  DraftAttachment,
+  checkNewAttachment,
+  pickFiles,
+  pickImages,
+  releaseAttachmentPayload,
+  uploadDraftAttachment
+} from '../model/attachments';
+import { AttachmentCaps, AttachmentCheck, formatAttachmentSize } from '../model/attachment-plan';
 import { SessionDetailParam, goBack, openSessionDetail } from '../model/routes';
 import {
   ApprovalCard,
@@ -33,6 +49,7 @@ import {
   SessionRow,
   SessionStore,
   SubagentRow,
+  TimelineEntry,
   TimelineItem,
   sessionStore
 } from '../model/sessionstore';
@@ -43,39 +60,41 @@ import {
   FS_SUBTITLE,
   HAIRLINE,
   RADIUS_CARD,
+  RADIUS_COMPOSER,
   RADIUS_CTRL,
   RADIUS_PILL,
   SP_1,
   SP_2,
   SP_3,
   SP_4,
+  SP_5,
   SP_6
 } from '../model/theme';
-import { ApprovalCardView, QuestionCardView } from './AskCards';
-import { MessageBubble, ReasoningCard, StepGroup, TimelineEntry, groupTimeline } from './TimelineView';
+import { ApprovalRepeatCard, QuestionRepeatCard } from './AskCards';
+import { ProcessGroup, TimelineMessage } from './TimelineView';
 
 
 /** 子代理目录 chip（契约 §5.6 v1.0.5；点击进入子代理详情）。 */
 @ComponentV2
 struct SubagentChip {
-  @Require @Param row: SubagentRow;
+  @Require @Param cell: RepeatItem<SubagentRow>;
   @Event onOpen: (sessionId: string) => void;
 
   build() {
     Row() {
-      if (this.row.running) {
+      if (this.cell.item.running) {
         Circle({ width: 6, height: 6 }).fill($r('app.color.brand_fill'))
       } else {
         Circle({ width: 6, height: 6 }).fill($r('app.color.label_tertiary'))
       }
-      Text(this.row.displayName())
+      Text(this.cell.item.displayName())
         .fontSize(FS_SMALL)
         .fontColor($r('app.color.label_primary'))
         .maxLines(1)
         .textOverflow({ overflow: TextOverflow.Ellipsis })
         .constraintSize({ maxWidth: 140 })
         .margin({ left: 5 })
-      if (this.row.isOneShot()) {
+      if (this.cell.item.isOneShot()) {
         Text('一次性')
           .fontSize(10)
           .fontColor($r('app.color.label_secondary'))
@@ -91,7 +110,7 @@ struct SubagentChip {
     .border({ width: HAIRLINE, color: $r('app.color.border_l1') })
     .alignItems(VerticalAlign.Center)
     .onClick((): void => {
-      this.onOpen(this.row.sessionId);
+      this.onOpen(this.cell.item.sessionId);
     })
   }
 }
@@ -122,6 +141,14 @@ export struct SessionDetailPage {
    * 面板内选中的思考强度 id（'' = 默认）。
    */
   @Local sheetEffortId: string = '';
+  /**
+   * v1.2.0（契约 §5.11）：待发送附件草稿（chips 展示；发送成功后清空）。
+   * 上限受 store.attachmentLimits()（宿主 session.capabilities.attachments）约束。
+   */
+  @Local attachments: DraftAttachment[] = [];
+  /** 上传中：send 按钮禁用 + 显示进度文案（如「正在上传附件 2/3…」）。 */
+  @Local uploading: boolean = false;
+  @Local uploadLabel: string = '';
   private scroller: Scroller = new Scroller();
   /** 首次进入是否已完成贴底（timeline 有缓存 / 历史异步到达两种都要滚到底）。 */
   private pendingInitialScroll: boolean = true;
@@ -282,6 +309,18 @@ export struct SessionDetailPage {
     }, 120);
   }
 
+  /**
+   * v1.2.0：页面销毁时释放未发送附件的本地字节。
+   * 附件原始字节存在 attachments.ets 的模块级 Map（不进 V2 状态树），
+   * 用户选了附件又不发送就退出时必须显式释放，否则大图/大文件会常驻内存。
+   */
+  aboutToDisappear(): void {
+    for (let i: number = 0; i < this.attachments.length; i++) {
+      releaseAttachmentPayload(this.attachments[i].localId);
+    }
+    this.attachments = [];
+  }
+
   /** 当前会话是否 subagent（父目录 mode 判断用）。 */
   private isSubagentView(): boolean {
     const row: SessionRow | undefined = this.store.rowOf(this.sessionId);
@@ -300,6 +339,244 @@ export struct SessionDetailPage {
     return cached.length > 0 ? cached : 'continuable';
   }
 
+  // ---- v1.2.0：输入框附件（契约 §5.11）------------------------------------
+
+  /** 附件入口是否可见：subagent（含 one-shot）一律不显示；宿主不支持（caps 缺省）也不显示。 */
+  private attachmentEntryVisible(): boolean {
+    if (this.isSubagentView()) {
+      return false;
+    }
+    return this.store.attachmentsSupported();
+  }
+
+  /** 宿主附件上限（缺字段按契约缺省值兜底；不支持时 supported=false）。 */
+  private attachmentLimits(): AttachmentCaps {
+    return this.store.attachmentLimits();
+  }
+
+  /** 还能再选几个附件（picker 的 maxSelectNumber = 剩余名额）。 */
+  private remainingSlots(): number {
+    const left: number = this.attachmentLimits().maxCount - this.attachments.length;
+    return left > 0 ? left : 0;
+  }
+
+  /** 统一 toast（附件流程的提示都走这里，文案直接给用户看）。 */
+  private toast(message: string): void {
+    promptAction.showToast({ message: message, duration: 2500 });
+  }
+
+  /** 「+」菜单：图片 / 文件（契约 §5.11：PhotoViewPicker / DocumentViewPicker）。 */
+  private plusMenuItems(): MenuElement[] {
+    const items: MenuElement[] = [
+      {
+        value: '图片',
+        action: (): void => {
+          this.chooseAttachments('image');
+        }
+      },
+      {
+        value: '文件',
+        action: (): void => {
+          this.chooseAttachments('file');
+        }
+      }
+    ];
+    return items;
+  }
+
+  /** 打开对应选择器（上传中/名额用尽时拒绝，不打断当前发送）。 */
+  private chooseAttachments(kind: string): void {
+    if (this.uploading) {
+      return;
+    }
+    if (!this.attachmentEntryVisible()) {
+      this.toast('当前会话不支持附件');
+      return;
+    }
+    const remaining: number = this.remainingSlots();
+    if (remaining <= 0) {
+      this.toast('附件数量已达上限');
+      return;
+    }
+    const ctx: common.Context = getContext(this) as common.Context;
+    const caps: AttachmentCaps = this.attachmentLimits();
+    const task: Promise<AttachmentPickResult> = kind === 'image' ?
+      pickImages(ctx, remaining, caps) : pickFiles(ctx, remaining, caps);
+    task.then((result: AttachmentPickResult): void => {
+      this.applyPicked(result);
+    }).catch((e: Error): void => {
+      this.toast('选择附件失败：' + e.message);
+    });
+  }
+
+  /** 选择结果入草稿：逐项过上限校验（超限 toast 拒绝并不加入），失败的字节立即释放。 */
+  private applyPicked(result: AttachmentPickResult): void {
+    const caps: AttachmentCaps = this.attachmentLimits();
+    let rejected: string = '';
+    for (let i: number = 0; i < result.items.length; i++) {
+      const item: DraftAttachment = result.items[i];
+      const check: AttachmentCheck = checkNewAttachment(this.attachments, item, caps);
+      if (!check.ok) {
+        rejected = check.message;
+        releaseAttachmentPayload(item.localId);
+        continue;
+      }
+      this.attachments = this.attachments.concat([item]);
+    }
+    if (rejected.length > 0) {
+      this.toast(rejected);
+    } else if (result.error.length > 0) {
+      this.toast(result.error);
+    }
+  }
+
+  /** 删除一个附件 chip（已 commit 的 uploadId 无法撤回——宿主附件不可删除）。 */
+  private removeAttachment(item: DraftAttachment): void {
+    if (this.uploading) {
+      return;
+    }
+    const next: DraftAttachment[] = [];
+    for (let i: number = 0; i < this.attachments.length; i++) {
+      if (this.attachments[i].localId !== item.localId) {
+        next.push(this.attachments[i]);
+      }
+    }
+    this.attachments = next;
+    releaseAttachmentPayload(item.localId);
+  }
+
+  /** 串行上传全部附件（契约 §5.11.2：同一 uploadId 只允许一条 chunk 流，必须串行）。 */
+  private async uploadAllAttachments(sid: string, items: DraftAttachment[],
+    caps: AttachmentCaps): Promise<string[]> {
+    const uploadIds: string[] = [];
+    for (let i: number = 0; i < items.length; i++) {
+      const item: DraftAttachment = items[i];
+      this.uploadLabel = '正在上传附件 ' + (i + 1).toString() + '/' + items.length.toString() + '…';
+      item.uploading = true;
+      item.progress = 0;
+      try {
+        const uploadId: string = await uploadDraftAttachment(sid, item, caps, (p: number): void => {
+          item.progress = p;
+        });
+        uploadIds.push(uploadId);
+      } finally {
+        item.uploading = false;
+      }
+    }
+    return uploadIds;
+  }
+
+  /**
+   * 带附件发送（契约 §5.11.3）：先逐项串行上传（begin→chunks→commit），
+   * 全部成功再 `sessionPromptResult(sid, text, uploadIds)`。
+   *
+   * - 任一步失败：toast 主机/网络原文；**保留**已成功 uploadId 与未上传附件
+   *   （重试时 uploadDraftAttachment 直接复用 uploadId，不重复上传）；
+   * - prompt 被成功接受后才清空草稿与附件；
+   * - 异步期间用户切走会话：按发送时捕获的 sid 继续，不把 UI 状态写到别的会话。
+   */
+  private sendWithAttachments(text: string): void {
+    const sid: string = this.sessionId;
+    if (sid.length === 0) {
+      return;
+    }
+    if (this.store.linkState !== 'online') {
+      this.toast('未连接，请先在配对页连接中继');
+      return;
+    }
+    if (this.isSubagentView()) {
+      this.toast('子代理会话不支持附件');
+      return;
+    }
+    const caps: AttachmentCaps = this.attachmentLimits();
+    if (!caps.supported) {
+      this.toast('当前主机不支持附件');
+      return;
+    }
+    const items: DraftAttachment[] = this.attachments.slice();
+    if (items.length === 0) {
+      return;
+    }
+    if (items.length > caps.maxCount) {
+      this.toast('附件数量超过上限');
+      return;
+    }
+    this.uploading = true;
+    this.uploadLabel = '正在上传附件…';
+    this.uploadAllAttachments(sid, items, caps).then((uploadIds: string[]): void => {
+      this.uploading = false;
+      this.uploadLabel = '';
+      this.dispatchAttachmentPrompt(sid, text, uploadIds, items);
+    }).catch((e: Error): void => {
+      this.uploading = false;
+      this.uploadLabel = '';
+      this.toast('上传附件失败：' + e.message);
+    });
+  }
+
+  /**
+   * 附件全部 commit 之后发 prompt（`uploads` 顺序 = chips 顺序）。
+   * 空闲分支在 accepted 之后才乐观上屏：prompt 失败时草稿/附件要保留重试，
+   * 先上屏会留下重复气泡（与纯文本分支的历史行为刻意不同，附件场景重试更频繁）。
+   */
+  private dispatchAttachmentPrompt(sid: string, text: string, uploadIds: string[],
+    items: DraftAttachment[]): void {
+    const running: boolean = this.store.runningOf(sid);
+    dshrcLink.sessionPromptResult(sid, text, uploadIds).then((res: DshrcPromptResult): void => {
+      if (!res.accepted) {
+        this.toast('主机未接受该提示词');
+        return;
+      }
+      const images: DshrcImageRef[] = [];
+      const files: DshrcFileRef[] = [];
+      for (let i: number = 0; i < items.length; i++) {
+        if (items[i].isImage()) {
+          images.push(items[i].toImageRef());
+        } else {
+          files.push(items[i].toFileRef());
+        }
+      }
+      if (!running) {
+        this.store.pushLocalUser(sid, text, images, files);
+        // 乐观气泡是异步到达的：这里再贴一次底（上面的同步贴底发生在 bubble 之前）
+        this.followBottom = true;
+        this.scrollToBottom();
+      }
+      // 成功接受才清空草稿/附件（此时 uploadIds 已被宿主消费）。
+      // 只清「本会话 + 草稿没被用户改过」的 UI，避免上传期间新输入的文字被抹掉。
+      if (this.sessionId === sid) {
+        if (this.draft.trim() === text) {
+          this.draft = '';
+        }
+        this.attachments = [];
+      }
+      for (let j: number = 0; j < items.length; j++) {
+        releaseAttachmentPayload(items[j].localId);
+      }
+      if (!running) {
+        this.toast('已发送');
+      } else if (res.mode === 'steer') {
+        this.toast('已插话发送');
+      } else {
+        this.toast('已排队发送');
+      }
+    }).catch((e: Error): void => {
+      // 失败：草稿与附件保留（已 commit 的 uploadId 在草稿上，重试不重复上传）。
+      // 凭据已失效（插件重启/60min TTL/被消费）→ 清掉 uploadId，下次重试重新上传；
+      // 本地字节在 prompt accepted 之前一直保留（见 uploadDraftAttachment 注释）。
+      const message: string = e.message;
+      if (message.indexOf('附件上传记录不存在或已过期') >= 0 ||
+        message.indexOf('已用于上一条消息') >= 0) {
+        for (let i: number = 0; i < items.length; i++) {
+          items[i].uploadId = '';
+        }
+      }
+      this.toast('发送失败：' + message);
+    });
+    this.followBottom = true;
+    this.scrollToBottom();
+  }
+
   /** 从 hrouter 路由上下文读取 sessionId（幂等）。 */
   private readRouteParams(): void {
     const params: SessionDetailParam | undefined = HRouter.getParams<SessionDetailParam>(this);
@@ -309,8 +586,11 @@ export struct SessionDetailPage {
   }
 
   /** 时间线分组视图（List 的数据源：一项 = 一个 ListItem）。 */
-  private timelineEntries(): TimelineEntry[] {
-    return groupTimeline(this.store.timeline);
+  @Computed
+  get timelineEntries(): TimelineEntry[] {
+    // 分组投影在**数据侧**算好（store.processGroups）：条目实例稳定、
+    // 成员变化时原地更新 → Repeat 同 key 复用节点也能收到 @Trace 更新。
+    return this.store.processGroups;
   }
 
   /**
@@ -320,7 +600,7 @@ export struct SessionDetailPage {
    * scrollEdge（List 无动画）一帧完成。
    */
   private initialListIndex(): number {
-    return this.timelineEntries().length;
+    return this.timelineEntries.length;
   }
 
   /**
@@ -1074,9 +1354,31 @@ export struct SessionDetailPage {
    * 文案沿用桌面端（dsh-client-ui-conversation：「排队发送」/「插话发送」）。
    * 手机端**不提供切换**——用户明确要求「不应该手机上设置，应该跟随 DSH 的设置」。
    */
-  private busyEnterLabel(): string {
-    const mode: string = this.store.busyEnter;
-    return mode === 'steer' ? '繁忙时：插话发送（跟随 DSH 设置）' : '繁忙时：排队发送（跟随 DSH 设置）';
+  /**
+   * 顶栏「运行中」胶囊文案：顺带带上繁忙时的发送模式（插话 / 排队）。
+   * v1.2.1：原来单独一行「繁忙时插话发送」飘在输入区上方、很丑（用户反馈），
+   * 收进状态胶囊；行为仍**只读跟随 DSH 设置**（手机端不提供切换）。
+   */
+  private runningPillText(): string {
+    if (this.isSubagentView()) {
+      return '运行中';
+    }
+    return this.store.busyEnter === 'steer' ? '运行中 · 插话' : '运行中 · 排队';
+  }
+
+  /** 输入区是否有内容（文字或附件）：决定聚合按钮显示「发送」还是「停止」。 */
+  private hasComposerContent(): boolean {
+    return this.draft.trim().length > 0 || this.attachments.length > 0;
+  }
+
+  /**
+   * 发送按钮是否可用：附件-only 也算有内容；上传中 / 未连接 / 空内容都禁用。
+   * 圆形图标按钮没有文字，禁用态要自己配色（灰底 + 灰图标）。
+   */
+  private canSend(): boolean {
+    return !this.uploading &&
+      (this.draft.trim().length > 0 || this.attachments.length > 0) &&
+      this.store.linkState === 'online';
   }
 
   /**
@@ -1124,6 +1426,120 @@ export struct SessionDetailPage {
   }
 
   /**
+   * 附件 chips（契约 §5.11.4 v1.2.0）：输入框上方、**自动换行**（最多 9 个，横向滚动
+   * 在大屏/窄屏都容易只露出半截，换行更整齐）。
+   * 图片 = 60vp 圆角缩略图 + 右上角 xmark；文件 = 图标托 + 文件名 + 大小 + xmark。
+   * 上传中显示该项进度（百分比），避免大文件时「卡住没反馈」。
+   */
+  @Builder
+  attachmentChips() {
+    Flex({ wrap: FlexWrap.Wrap, justifyContent: FlexAlign.Start, alignItems: ItemAlign.Start }) {
+      Repeat(this.attachments)
+        .each((cell: RepeatItem<DraftAttachment>): void => {
+          this.attachmentChip(cell)
+        })
+        .key((item: DraftAttachment): string => item.localId)
+    }
+    .width('100%')
+    .padding({ left: SP_3, right: SP_2, top: SP_2 })
+  }
+
+  /** 单个附件 chip（60vp 高；xmark 用半透明深色圆 + 白字，浮在右上角）。 */
+  @Builder
+  attachmentChip(cell: RepeatItem<DraftAttachment>) {
+    Stack({ alignContent: Alignment.TopEnd }) {
+      if (cell.item.isImage()) {
+        Stack({ alignContent: Alignment.Center }) {
+          Image(cell.item.thumb)
+            .width(60)
+            .height(60)
+            .objectFit(ImageFit.Cover)
+            .borderRadius(RADIUS_CARD)
+            .backgroundColor($r('app.color.bg_layer_2'))
+            .border({ width: HAIRLINE, color: $r('app.color.border_l1') })
+          if (cell.item.uploading) {
+            Column() {
+              Text(this.progressText(cell.item))
+                .fontSize(FS_CAPTION)
+                .fontColor($r('app.color.label_on_brand'))
+            }
+            .width(60)
+            .height(60)
+            .justifyContent(FlexAlign.Center)
+            .alignItems(HorizontalAlign.Center)
+            .borderRadius(RADIUS_CARD)
+            .backgroundColor($r('app.color.scrim'))
+          }
+        }
+        .width(60)
+        .height(60)
+      } else {
+        Row({ space: SP_2 }) {
+          Stack({ alignContent: Alignment.Center }) {
+            SymbolGlyph($r('sys.symbol.doc_plaintext_fill_1'))
+              .fontSize(18)
+              .fontColor([$r('app.color.label_secondary')])
+              .width(18)
+              .height(18)
+          }
+          .width(32)
+          .height(32)
+          .backgroundColor($r('app.color.bg_layer_1'))
+          .border({ width: HAIRLINE, color: $r('app.color.border_l1') })
+          .borderRadius(RADIUS_CTRL)
+
+          Column({ space: 2 }) {
+            Text(cell.item.name.length > 0 ? cell.item.name : '附件')
+              .fontSize(FS_SMALL)
+              .fontWeight(FontWeight.Medium)
+              .fontColor($r('app.color.label_primary'))
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+            Text(cell.item.uploading ? this.progressText(cell.item) : formatAttachmentSize(cell.item.bytes))
+              .fontSize(FS_CAPTION)
+              .fontColor($r('app.color.label_tertiary'))
+              .maxLines(1)
+          }
+          .alignItems(HorizontalAlign.Start)
+          .constraintSize({ maxWidth: 150 })
+        }
+        .padding({ left: SP_2, right: SP_5, top: SP_2, bottom: SP_2 })
+        .height(60)
+        .alignItems(VerticalAlign.Center)
+        .backgroundColor($r('app.color.bg_layer_2'))
+        .border({ width: HAIRLINE, color: $r('app.color.border_l1') })
+        .borderRadius(RADIUS_CARD)
+      }
+      // 右上角删除按钮（半透明深色圆 + 白 xmark，带 1px 底色描边保证任何缩略图上都看得清）
+      Button() {
+        SymbolGlyph($r('sys.symbol.xmark'))
+          .fontSize(11)
+          .fontColor([$r('app.color.label_on_brand')])
+          .width(11)
+          .height(11)
+      }
+      .type(ButtonType.Circle)
+      .width(20)
+      .height(20)
+      .backgroundColor($r('app.color.scrim'))
+      .border({ width: 1, color: $r('app.color.bg_layer_1') })
+      .margin({ top: 2, right: 2 })
+      .enabled(!this.uploading)
+      .onClick((): void => {
+        this.removeAttachment(cell.item);
+      })
+    }
+    .margin({ right: SP_2, bottom: SP_2 })
+  }
+
+  /** 进度文案（0~100%）。 */
+  private progressText(item: DraftAttachment): string {
+    const pct: number = Math.round(item.progress * 100);
+    const clamped: number = pct < 0 ? 0 : (pct > 100 ? 100 : pct);
+    return clamped.toString() + '%';
+  }
+
+  /**
    * 发送提示词（根会话走 session.prompt，subagent 走 session.subagentPrompt §5.1 v1.0.5）。
    *
    * 上屏策略（消息顺序修复「繁忙排队时用户消息被插进当前回复中间」）：
@@ -1140,7 +1556,19 @@ export struct SessionDetailPage {
    */
   private send(): void {
     const text: string = this.draft.trim();
-    if (text.length === 0 || this.sessionId.length === 0) {
+    if (this.sessionId.length === 0) {
+      return;
+    }
+    // v1.2.0（契约 §5.11）：有附件 → 先串行上传再带 uploads 发 prompt。
+    // 附件-only（text 为空）也合法；上传中禁止重复提交。
+    if (this.attachments.length > 0) {
+      if (this.uploading) {
+        return;
+      }
+      this.sendWithAttachments(text);
+      return;
+    }
+    if (text.length === 0) {
       return;
     }
     if (this.store.linkState !== 'online') {
@@ -1231,64 +1659,79 @@ export struct SessionDetailPage {
     });
   }
 
+  /**
+   * 顶栏（沉浸式 v1.2.1）：
+   *  - 页面根容器背景铺满整屏（状态栏区域透出同一背景色），标题行按状态栏避让区内缩；
+   *  - 返回键用系统 `chevron_left` 符号（文字 '‹' 的基线在不同字体下会飘）；
+   *  - 底部一条 hairline 分隔线：标题栏与消息列表之间有明确层次，不再糊成一片；
+   *  - 状态徽标（运行中 / 空闲）收成小胶囊，靠右。
+   */
   @Builder
   topBar() {
-    Row() {
-      Button() {
-        Text('‹')
-          .fontSize(26)
-          .fontColor($r('app.color.label_primary'))
-      }
-      .type(ButtonType.Normal)
-      .width(36)
-      .height(36)
-      .backgroundColor($r('app.color.bg_layer_2'))
-      .borderRadius(RADIUS_CTRL)
-      .onClick((): void => {
-        goBack();
-      })
-      Column() {
-        Text(this.store.titleOf(this.sessionId))
-          .fontSize(FS_SUBTITLE)
-          .fontWeight(FontWeight.Bold)
-          .fontColor($r('app.color.label_primary'))
-          .maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-          .width('100%')
-        Text(this.store.hostOnline ? '主机在线 · 会话已就绪' : '主机离线 · 事件将在重连后补发')
-          .fontSize(FS_CAPTION)
-          .fontColor(this.store.hostOnline ? $r('app.color.state_success') :
-            $r('app.color.label_tertiary'))
-          .maxLines(1)
-          .width('100%')
-      }
-      .alignItems(HorizontalAlign.Start)
-      .margin({ left: SP_3 })
-      .layoutWeight(1)
-      if (this.store.runningOf(this.sessionId)) {
-        Row() {
-          Circle({ width: 6, height: 6 }).fill($r('app.color.brand_fill'))
-          Text('运行中')
-            .fontSize(FS_CAPTION)
-            .fontColor($r('app.color.brand_label'))
-            .margin({ left: 4 })
+    Column() {
+      Row() {
+        Button() {
+          SymbolGlyph($r('sys.symbol.chevron_left'))
+            .fontSize(22)
+            .fontColor([$r('app.color.label_primary')])
+            .width(22)
+            .height(22)
         }
-        .padding({ left: 8, right: 8, top: 3, bottom: 3 })
-        .borderRadius(RADIUS_PILL)
-        .backgroundColor($r('app.color.brand_tint'))
-        .alignItems(VerticalAlign.Center)
-      } else {
-        Text('空闲')
-          .fontSize(FS_CAPTION)
-          .fontColor($r('app.color.label_secondary'))
-          .padding({ left: 8, right: 8, top: 3, bottom: 3 })
+        .type(ButtonType.Circle)
+        .width(36)
+        .height(36)
+        .backgroundColor($r('app.color.bg_layer_2'))
+        .onClick((): void => {
+          goBack();
+        })
+
+        Column({ space: 2 }) {
+          Text(this.store.titleOf(this.sessionId))
+            .fontSize(FS_SUBTITLE)
+            .fontWeight(FontWeight.Bold)
+            .fontColor($r('app.color.label_primary'))
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .width('100%')
+          Text(this.store.hostOnline ? '主机在线 · 会话已就绪' : '主机离线 · 事件将在重连后补发')
+            .fontSize(FS_CAPTION)
+            .fontColor(this.store.hostOnline ? $r('app.color.state_success') :
+              $r('app.color.label_tertiary'))
+            .maxLines(1)
+            .width('100%')
+        }
+        .alignItems(HorizontalAlign.Start)
+        .margin({ left: SP_3 })
+        .layoutWeight(1)
+
+        if (this.store.runningOf(this.sessionId)) {
+          Row() {
+            Circle({ width: 6, height: 6 }).fill($r('app.color.brand_fill'))
+            Text(this.runningPillText())
+              .fontSize(FS_CAPTION)
+              .fontColor($r('app.color.brand_label'))
+              .margin({ left: 5 })
+          }
+          .padding({ left: 9, right: 9, top: 4, bottom: 4 })
           .borderRadius(RADIUS_PILL)
-          .backgroundColor($r('app.color.bg_layer_2'))
+          .backgroundColor($r('app.color.brand_tint'))
+          .alignItems(VerticalAlign.Center)
+        } else {
+          Text('空闲')
+            .fontSize(FS_CAPTION)
+            .fontColor($r('app.color.label_secondary'))
+            .padding({ left: 9, right: 9, top: 4, bottom: 4 })
+            .borderRadius(RADIUS_PILL)
+            .backgroundColor($r('app.color.bg_layer_2'))
+        }
       }
+      .width('100%')
+      .alignItems(VerticalAlign.Center)
+      .padding({ left: SP_4, right: SP_4, top: SP_2, bottom: SP_2 })
     }
     .width('100%')
-    .alignItems(VerticalAlign.Center)
-    .padding({ left: SP_4, right: SP_4, top: SP_2, bottom: SP_3 })
+    .backgroundColor($r('app.color.bg_base'))
+    .border({ width: { bottom: HAIRLINE }, color: $r('app.color.border_l1') })
   }
 
   @Builder
@@ -1337,7 +1780,7 @@ export struct SessionDetailPage {
         Repeat(this.store.activeSubagents)
           .each((cell: RepeatItem<SubagentRow>): void => {
             SubagentChip({
-              row: cell.item,
+              cell: cell,
               onOpen: (sid: string): void => {
                 openSessionDetail(sid);
               }
@@ -1346,6 +1789,9 @@ export struct SessionDetailPage {
           .key((r: SubagentRow): string => r.sessionId)
       }
       .alignItems(VerticalAlign.Center)
+      // Scroll 会把「比视口窄」的子节点默认居中（真机实测：子代理整行飘到中间）。
+      // 用 minWidth=100% 让 Row 至少铺满视口 → 从左侧开始；内容更宽时照常横向滚动。
+      .constraintSize({ minWidth: '100%' })
     }
     .scrollable(ScrollDirection.Horizontal)
     .scrollBar(BarState.Off)
@@ -1417,38 +1863,33 @@ export struct SessionDetailPage {
               ListItem() {
                 this.historyBar()
               }
-              Repeat(this.timelineEntries())
+              Repeat(this.timelineEntries)
                 // 兜底 builder（官方 FAQ faqs-arkui-606：Repeat 必须有 item builder，
                 // .each() 等价于 template type 为空字符串的 .template()）。
                 // templateId 恒返回非空串，正常不会命中它，但缺了会报
                 // 「__Repeat item builder function unspecified」直接崩（真机实测）。
                 .each((cell: RepeatItem<TimelineEntry>): void => {
                   ListItem() {
-                    MessageBubble({ item: cell.item.head, mdController: this.mdCtrl })
+                    TimelineMessage({ cell: cell, mdController: this.mdCtrl })
                   }
                 })
-                .key((e: TimelineEntry): string => e.key)
-                .virtualScroll()
+                .key((e: TimelineEntry): string => e.key + e.isProcess)
+                .virtualScroll({totalCount:this.timelineEntries.length})
                 .templateId((e: TimelineEntry): string => {
-                  if (e.isGroup) {
-                    return 'group';
-                  }
-                  return e.head.isReasoning() ? 'reasoning' : 'message';
+                  return e.isProcess ? 'process' : 'message';
                 })
                 .template('message', (cell: RepeatItem<TimelineEntry>): void => {
                   ListItem() {
-                    MessageBubble({ item: cell.item.head, mdController: this.mdCtrl })
+                    TimelineMessage({ cell: cell, mdController: this.mdCtrl })
                   }
                 }, { cachedCount: 4 })
-                .template('reasoning', (cell: RepeatItem<TimelineEntry>): void => {
-                  ListItem() {
-                    ReasoningCard({ item: cell.item.head, mdController: this.mdCtrlReasoning })
-                  }
-                }, { cachedCount: 4 })
-                .template('group', (cell: RepeatItem<TimelineEntry>): void => {
-                  ListItem() {
-                    StepGroup({ steps: cell.item.steps })
-                  }
+                .template('process', (cell: RepeatItem<TimelineEntry>): void => {
+                  // 传完整 RepeatItem：复用时框架更新 cell.item，ProcessGroup 才会切到新分组。
+                  ProcessGroup({
+                    cell: cell,
+                    sessionId: this.sessionId,
+                    mdController: this.mdCtrlReasoning
+                  })
                 }, { cachedCount: 4 })
             }
             .width('100%')
@@ -1524,12 +1965,12 @@ export struct SessionDetailPage {
           Column() {
             Repeat(this.store.approvalsFor(this.sessionId))
               .each((cell: RepeatItem<ApprovalCard>): void => {
-                ApprovalCardView({ card: cell.item, sessionTitle: '' })
+                ApprovalRepeatCard({ cell: cell, sessionTitle: '' })
               })
               .key((c: ApprovalCard): string => c.askId)
             Repeat(this.store.questionsFor(this.sessionId))
               .each((cell: RepeatItem<QuestionCard>): void => {
-                QuestionCardView({ card: cell.item, sessionTitle: '' })
+                QuestionRepeatCard({ cell: cell, sessionTitle: '' })
               })
               .key((c: QuestionCard): string => c.askId)
           }
@@ -1542,6 +1983,8 @@ export struct SessionDetailPage {
       }
 
       // 模型 / 强度 / 权限：所有会话可见；subagent 全部只读，一次性也不随输入条隐藏。
+      // 右侧顺带放「繁忙时：插话/排队发送」只读提示（v1.1.2，跟随 DSH 设置，手机端不提供切换），
+      // 不再挤在输入框正上方——输入区只留「附件 + 输入 + 发送」，干净。
       Row({ space: SP_2 }) {
         this.modelCapsule()
         this.permissionCapsule()
@@ -1570,13 +2013,20 @@ export struct SessionDetailPage {
           if (this.pendingQueue().length > 0) {
             this.pendingQueueBar()
           }
-          // 繁忙时的发送行为：**只读**（v1.1.2）——行为由 DSH 设置决定
-          // （「繁忙时的发送行为：排队发送/插话发送」），手机端不提供切换。
-          if (this.agentRunning()) {
-            Row() {
-              Text(this.busyEnterLabel())
+          // v1.2.0（契约 §5.11）：已选附件 chips（输入框上方横向滚动；空 → 整块不渲染）
+          if (this.attachments.length > 0) {
+            this.attachmentChips()
+          }
+          // 上传进度（附件串行上传中；send 按钮同时禁用，防重复提交）
+          if (this.uploading) {
+            Row({ space: SP_2 }) {
+              LoadingProgress()
+                .width(16)
+                .height(16)
+                .color($r('app.color.brand_fill'))
+              Text(this.uploadLabel.length > 0 ? this.uploadLabel : '正在上传附件…')
                 .fontSize(FS_CAPTION)
-                .fontColor($r('app.color.label_tertiary'))
+                .fontColor($r('app.color.label_secondary'))
                 .maxLines(1)
                 .textOverflow({ overflow: TextOverflow.Ellipsis })
               Blank()
@@ -1586,61 +2036,103 @@ export struct SessionDetailPage {
             .padding({ left: SP_3, right: SP_3, bottom: SP_1 })
           }
 
-          Row() {
-            TextArea({ text: this.draft, placeholder: '输入提示词，Enter 发送…' })
+          // composer 卡片：一张白色圆角面板里放「附件 / 输入 / 停止 / 发送」。
+          //  - 发送改成圆形图标按钮（纸飞机），不可发时变灰——不再是一块笨重的大按钮；
+          //  - 「取消」改成圆形停止按钮（仅运行中出现），与发送并排；
+          //  - 输入框去掉自身描边（面板已经是容器），避免「框中框」。
+          // 内缩必须加在**外层容器**的 padding 上：Row 自己 width(100%) 时，
+          // margin 不会把它往内挤（真机实测：卡片贴到屏幕两侧）。
+          Column() {
+            Row() {
+            // v1.2.0：附件入口（「+」菜单：图片 / 文件）。subagent / 不支持的主机不显示。
+            if (this.attachmentEntryVisible()) {
+              Button() {
+                SymbolGlyph($r('sys.symbol.plus'))
+                  .fontSize(19)
+                  .fontColor([$r('app.color.label_secondary')])
+                  .width(21)
+                  .height(21)
+              }
+              .type(ButtonType.Circle)
+              .width(36)
+              .height(36)
+              .margin({ right: SP_2 })
+              .backgroundColor($r('app.color.bg_layer_2'))
+              .enabled(!this.uploading)
+              .bindMenu(this.plusMenuItems())
+            }
+            TextArea({ text: this.draft, placeholder: '输入提示词…' })
               .onChange((v: string): void => {
                 this.draft = v;
               })
               .layoutWeight(1)
-              .height(44)
-              .padding({ left: SP_3, right: SP_3, top: 8, bottom: 8 })
-              .backgroundColor($r('app.color.bg_layer_2'))
-              .borderRadius(RADIUS_CARD)
-              .border({ width: HAIRLINE, color: $r('app.color.border_l1') })
+              .height(40)
+              .padding({ left: SP_2, right: SP_2, top: 9, bottom: 9 })
+              .backgroundColor($r('app.color.bg_layer_1'))
               .fontSize(FS_BODY)
               .fontColor($r('app.color.label_primary'))
               .placeholderColor($r('app.color.label_tertiary'))
               .caretColor($r('app.color.brand_fill'))
-            if (this.store.runningOf(this.sessionId)) {
-              Button('取消')
-                .height(44)
-                .margin({ left: SP_2 })
-                .padding({ left: SP_3, right: SP_3 })
-                .fontSize(FS_BODY)
-                .fontColor($r('app.color.state_error'))
-                .backgroundColor($r('app.color.bg_layer_1'))
-                .border({ width: HAIRLINE, color: $r('app.color.state_error') })
-                .borderRadius(RADIUS_CTRL)
-                .onClick((): void => {
-                  this.cancelTurn();
-                })
-            }
-            Button('发送')
-              .height(44)
+            // 发送 / 停止 **聚合成同一个按钮**（与 DSH composer 一致）：
+            //  - 输入区有内容（文字或附件）→ 永远显示「发送」（运行中也发，走插话/排队）
+            //  - 输入区为空且 agent 运行中 → 显示「停止」（取消当前 turn）
+            //  - 输入区为空且空闲 → 发送置灰（disabled）
+            if (this.store.runningOf(this.sessionId) && !this.hasComposerContent()) {
+              Button() {
+                SymbolGlyph($r('sys.symbol.stop_circle_fill'))
+                  .fontSize(18)
+                  .fontColor([$r('app.color.state_error')])
+                  .width(20)
+                  .height(20)
+              }
+              .type(ButtonType.Circle)
+              .width(40)
+              .height(40)
               .margin({ left: SP_2 })
-              .padding({ left: SP_4, right: SP_4 })
-              .fontSize(FS_BODY)
-              .fontWeight(FontWeight.Medium)
-              .fontColor($r('app.color.label_on_brand'))
-              .backgroundColor($r('app.color.brand_fill'))
-              .borderRadius(RADIUS_CTRL)
-              .enabled(this.draft.trim().length > 0 && this.store.linkState === 'online')
+              .backgroundColor($r('app.color.state_error_tint'))
+              .onClick((): void => {
+                this.cancelTurn();
+              })
+            } else {
+              Button() {
+                SymbolGlyph($r('sys.symbol.paperplane_fill'))
+                  .fontSize(17)
+                  .fontColor([this.canSend() ? $r('app.color.label_on_brand') :
+                    $r('app.color.label_tertiary')])
+                  .width(19)
+                  .height(19)
+              }
+              .type(ButtonType.Circle)
+              .width(40)
+              .height(40)
+              .margin({ left: SP_2 })
+              .backgroundColor(this.canSend() ? $r('app.color.brand_fill') :
+                $r('app.color.bg_layer_2'))
+              .enabled(this.canSend())
               .onClick((): void => {
                 this.send();
               })
+            }
+          }
+            .width('100%')
+            .alignItems(VerticalAlign.Center)
+            .padding({ left: SP_2, right: SP_2, top: SP_2, bottom: SP_2 })
+            .backgroundColor($r('app.color.bg_layer_1'))
+            .border({ width: HAIRLINE, color: $r('app.color.border_l1') })
+            .borderRadius(RADIUS_COMPOSER)
           }
           .width('100%')
-          .alignItems(VerticalAlign.Center)
-          .padding({ left: SP_3, right: SP_3, top: SP_1, bottom: SP_4 })
+          .padding({ left: SP_3, right: SP_3, top: SP_1, bottom: SP_3 })
         }
         .width('100%')
-        .backgroundColor($r('app.color.bg_layer_1'))
-        .border({ width: HAIRLINE, color: $r('app.color.border_l1') })
+        .backgroundColor($r('app.color.bg_base'))
+        .border({ width: { top: HAIRLINE }, color: $r('app.color.border_l1') })
       }
     }
     .width('100%')
     .height('100%')
     .backgroundColor($r('app.color.bg_base'))
+      .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
     // v1.0.8：模型 / 思考强度选择面板（bindSheet；用户关闭时 onDisappear 回写开关）
     .bindSheet(this.modelSheetOpen, this.modelSheet(), {
       height: SheetSize.FIT_CONTENT,

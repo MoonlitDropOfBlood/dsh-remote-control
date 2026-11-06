@@ -1670,8 +1670,9 @@ function eventsOf(sent, topic) {
   );
   check("ImageRef：附件引用不进 wire JSON", !JSON.stringify(imgMsgs[1]).includes("attachmentId"), JSON.stringify(imgMsgs[1]));
   check("mapHistoryMessages：正文不再出现 [图片] 占位符", !imgMsgs[1]?.text?.includes("[图片]"), JSON.stringify(imgMsgs[1]?.text));
-  check("mapHistoryMessages：正文保留 file 占位符", imgMsgs[1]?.text === "看图[文件]", JSON.stringify(imgMsgs[1]?.text));
-  check("messageText：图片块不占位", messageText(mixedContent) === "看图[文件]", messageText(mixedContent));
+  check("mapHistoryMessages：正文与文件块都不占位（v1.2.0）", imgMsgs[1]?.text === "看图", JSON.stringify(imgMsgs[1]?.text));
+  check("mapHistoryMessages：文件块进 files[]", Array.isArray(imgMsgs[1]?.files) && imgMsgs[1].files.length === 1 && imgMsgs[1].files[0].name === "a.txt", JSON.stringify(imgMsgs[1]?.files));
+  check("messageText：图片/文件块都不占位", messageText(mixedContent) === "看图", messageText(mixedContent));
   check("contentText：工具结果口径仍给图片占位符（§5.7 不变）", contentText([{ type: "image" }]) === "[图片]", contentText([{ type: "image" }]));
 
   // 纯图片消息（无正文）也要成条，否则手机端看不到这张图

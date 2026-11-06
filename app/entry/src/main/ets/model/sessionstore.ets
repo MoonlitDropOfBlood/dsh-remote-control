@@ -24,7 +24,15 @@ import {
   postQuestionResolved
 } from './events';
 import { DshrcLink, DshrcHostInfo, LinkPeers, LinkState, dshrcLink } from './link';
-import { collectCoveredLiveTextIds, DshrcDurableText, DshrcLiveText } from './timeline-reconcile';
+import {
+  collectCoveredLiveAttachmentIds,
+  collectCoveredLiveTextIds,
+  DshrcDurableAttachments,
+  DshrcDurableText,
+  DshrcLiveAttachments,
+  DshrcLiveText
+} from './timeline-reconcile';
+import { AttachmentCaps, normalizeAttachmentCaps } from './attachment-plan';
 import {
   DshrcMsg,
   DshrcPayload,
@@ -35,6 +43,8 @@ import {
   DshrcChatMessage,
   DshrcHistoryPage,
   DshrcCapabilities,
+  DshrcAttachmentCaps,
+  DshrcFileRef,
   DshrcImageRef,
   DshrcModeOption,
   DshrcModelOption,
@@ -210,12 +220,20 @@ export class TimelineItem {
   @Trace step: number = 0;
   /** v1.0.9：消息内图片（契约 §5.10）——空数组 = 该消息没有图片。 */
   @Trace images: DshrcImageRef[] = [];
+  /** v1.2.0：消息内文件（契约 §5.11.4）——空数组 = 该消息没有文件。 */
+  @Trace files: DshrcFileRef[] = [];
   /**
    * 折叠态（步骤分组 / 思考块共用）：状态**放在数据里**而不是组件 @Local——
    * 时间线是 List 懒加载 + 节点复用，组件内状态在复用时会串台/丢失；
    * 挂在 item 上随 @Param 绑定，复用/重建后展开状态天然恢复。
    */
   @Trace expanded: boolean = false;
+  /**
+   * 过程分组的折叠态（v1.2.1：思考 + 工作步骤合成一个「工作步骤」分组）。
+   * 与 `expanded` 分开：分组头挂在组内**第一个**条目上，而那个条目自己可能
+   * 也是一个可独立展开的思考块（两者不能共用同一个开关）。
+   */
+  @Trace groupExpanded: boolean = false;
 
   constructor(id: string, kind: string, ts: number) {
     this.id = id;
@@ -237,6 +255,133 @@ export class TimelineItem {
   isReasoning(): boolean {
     return this.kind === 'reasoning';
   }
+
+  /**
+   * 是否「纯附件消息」（契约 §5.11.4 v1.2.0）：正文为空但有图片/文件。
+   * 这种消息**不画空气泡**（否则会留一个空的药丸）；图片在前、文件在后渲染。
+   */
+  isAttachmentOnly(): boolean {
+    return this.text.trim().length === 0 && (this.images.length > 0 || this.files.length > 0);
+  }
+}
+
+/**
+ * 过程分组条目（v1.2.2）：**思考块 + 工作步骤**合成一个「工作步骤」分组
+ * （桌面端 DSH 的 process group：同一段回复里的思考与工具调用属于一组）。
+ *
+ * ⚠️ **实例必须稳定**：Repeat 按 key 复用节点、**不重跑 item builder**，
+ * 同 key 换新实例 → 屏幕绑旧实例、@Trace 更新永远到不了 UI（AGENTS 硬规则）。
+ * 所以分组条目由 `groupTimeline()` **复用同一实例**、成员变化时**原地更新**。
+ */
+@ObservedV2
+export class TimelineEntry {
+  /** Repeat 的稳定 key（分组用首条目 id 前缀；消息用自身 id）。 */
+  @Trace key: string = '';
+  /** 是否过程分组（思考 + 工作步骤）。这是条目类型，生命周期内不翻转。 */
+  @Trace isProcess: boolean = false;
+  /** DSH ProcessGroup.closed：遇到后续 message 时旧组立即关闭并显示完成态。 */
+  @Trace closed: boolean = false;
+  /** 单项渲染时=该条目；分组渲染时=组内首个条目（分组折叠态挂在它身上）。 */
+  @Trace head: TimelineItem = new TimelineItem('', 'message', 0);
+  /** 分组内的条目（思考块 / 工作步骤，按时间顺序）；非分组为空数组。 */
+  @Trace members: TimelineItem[] = [];
+  /**
+   * 分组折叠态（v1.2.2）：挂**分组自己**，不借用首条目——
+   * 首条目可能还是可独立展开的思考块，两者不能共用一个开关。
+   */
+  @Trace groupExpanded: boolean = false;
+
+  constructor(key: string, isProcess: boolean, head: TimelineItem, members: TimelineItem[]) {
+    this.key = key;
+    this.isProcess = isProcess;
+    this.head = head;
+    this.members = members;
+  }
+}
+
+/** 分组实例缓存（key → TimelineEntry）：同 key 永远复用同一实例。 */
+const PROCESS_GROUP_ENTRIES: Map<string, TimelineEntry> = new Map();
+
+/** 成员数组是否等价（长度 + 顺序 + id 相同）——等价就不重新赋值，避免多余刷新。 */
+function sameMembers(a: TimelineItem[], b: TimelineItem[]): boolean {
+  if (a.length !== b.length) {
+    return false;
+  }
+  for (let i: number = 0; i < a.length; i++) {
+    if (a[i].id !== b[i].id) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * 把连续的**思考块 + 工作步骤**归为一个过程分组；对话消息按单项渲染。
+ * 分组边界 = 一条消息（DSH：分组在两次独立回复之间）。
+ *
+ * 返回的条目**实例稳定**：同 key 复用旧实例并原地更新 head/members，
+ * 让 Repeat 的同 key 复用节点能收到 @Trace 更新（否则「运行中分组不刷新」）。
+ */
+export function groupTimeline(items: TimelineItem[]): TimelineEntry[] {
+  const out: TimelineEntry[] = [];
+  const used: Set<string> = new Set();
+  let pendingGroup: TimelineEntry | undefined = undefined;
+  let i: number = 0;
+  while (i < items.length) {
+    const it: TimelineItem = items[i];
+    const isMember: boolean = it.isStep() || it.isReasoning();
+    if (isMember) {
+      const members: TimelineItem[] = [];
+      while (i < items.length && (items[i].isStep() || items[i].isReasoning())) {
+        members.push(items[i]);
+        i = i + 1;
+      }
+      const head: TimelineItem = members[0];
+      const key: string = 'p:' + head.id;
+      used.add(key);
+      let entry: TimelineEntry | undefined = PROCESS_GROUP_ENTRIES.get(key);
+      if (entry === undefined) {
+        entry = new TimelineEntry(key, true, head, members);
+        PROCESS_GROUP_ENTRIES.set(key, entry);
+      } else {
+        entry.head = head;
+        if (!sameMembers(entry.members, members)) {
+          entry.members = members;
+        }
+      }
+      out.push(entry);
+      pendingGroup = entry;
+    } else {
+      // DSH flush(true)：message 是过程组的硬边界。旧组仍是 process 类型，
+      // 但必须立即 closed，不能等下一次插话或 turn.end 才从运行态切到完成态。
+      if (pendingGroup !== undefined) {
+        pendingGroup.closed = true;
+        pendingGroup = undefined;
+      }
+      const key: string = it.id;
+      used.add(key);
+      let entry: TimelineEntry | undefined = PROCESS_GROUP_ENTRIES.get(key);
+      if (entry === undefined) {
+        entry = new TimelineEntry(key, false, it, []);
+        PROCESS_GROUP_ENTRIES.set(key, entry);
+      } else {
+        entry.head = it;
+      }
+      out.push(entry);
+      i = i + 1;
+    }
+  }
+  // 清理本轮不存在的分组（切会话 / 历史重载）
+  const stale: string[] = [];
+  PROCESS_GROUP_ENTRIES.forEach((_v: TimelineEntry, k: string): void => {
+    if (!used.has(k)) {
+      stale.push(k);
+    }
+  });
+  for (let j: number = 0; j < stale.length; j++) {
+    PROCESS_GROUP_ENTRIES.delete(stale[j]);
+  }
+  return out;
 }
 
 /** 一张待审批卡片（契约 §5.2 approval.request）。 */
@@ -349,6 +494,12 @@ export class SessionStore {
   @Trace activeId: string = '';
   /** 会话时间线（契约 §5.7 v1.0.6）：消息 + 工作步骤 + 系统消息，按 seq 升序、直播项在末尾。 */
   @Trace timeline: TimelineItem[] = [];
+  /**
+   * 过程分组投影（v1.2.2）：思考 + 工作步骤聚合成组。
+   * **条目实例稳定**（groupTimeline 复用实例 + 原地更新 members），
+   * 这样 Repeat 同 key 复用节点时能收到 @Trace 更新（否则运行中分组不刷新）。
+   */
+  @Trace processGroups: TimelineEntry[] = [];
   // ---- 历史消息（契约 §5.1 session.history，v1.0.4；活动会话投影）----
   @Trace historyLoading: boolean = false;
   /** 历史请求在途时被合并的尾随刷新：sid → 是否向前翻页（最新页优先）。 */
@@ -398,6 +549,11 @@ export class SessionStore {
    * 手机端不提供切换：发消息走哪种行为由 DSH 设置决定（用户明确要求）。
    */
   @Trace busyEnter: string = 'queue';
+  /**
+   * v1.2.0（契约 §5.11.1）：宿主附件能力目录。
+   * null = 宿主不支持 / 尚未拉到（旧插件缺省该字段）→ 客户端**隐藏附件入口**。
+   */
+  @Trace attachmentCaps: DshrcAttachmentCaps | null = null;
   /** v1.0.8：当前活动会话的模型/思考强度（null = 未知，UI 回退目录默认）。 */
   @Trace sessionModel: DshrcModelSelection | null = null;
   /** 当前活动会话权限；custom 是 Host 派生状态，只展示、不能作为预设提交。 */
@@ -481,7 +637,7 @@ export class SessionStore {
       this.pendingHistory.clear();
       // 断开/切换远程：清掉当前会话的投影，避免展示上一台主机的时间线
       this.activeId = '';
-      this.timeline = [];
+      this.applyTimeline([]);
       this.hostName = '';
       this.hostVersion = '';
       this.pluginVersion = '';
@@ -491,6 +647,7 @@ export class SessionStore {
       this.defaultModelId = '';
       this.archiveSupported = false;
       this.capabilitiesLoaded = false;
+      this.attachmentCaps = null; // v1.2.0：断开/切远程后不留上一台主机的附件能力
       this.sessionModel = null;
       this.modelCache.clear();
       this.sessionPermission = null;
@@ -744,7 +901,7 @@ export class SessionStore {
     const knownPermission: string | undefined = this.permissionCache.get(sid);
     this.sessionPermission = knownPermission !== undefined ? knownPermission : null;
     if (sid.length === 0) {
-      this.timeline = [];
+      this.applyTimeline([]);
       this.historyHasMore = false;
       this.historyLoaded = false;
       return;
@@ -753,7 +910,7 @@ export class SessionStore {
       this.cache.set(sid, []);
     }
     const items: TimelineItem[] | undefined = this.cache.get(sid);
-    this.timeline = items !== undefined ? items.slice() : [];
+    this.applyTimeline(items !== undefined ? items.slice() : []);
     // 投影本会话的历史翻页状态（详情页据此渲染「加载更早消息」）
     const meta: HistMeta | undefined = this.histMeta.get(sid);
     this.historyLoaded = meta !== undefined && meta.loaded;
@@ -780,6 +937,8 @@ export class SessionStore {
       this.archiveSupported = caps.archiveSupported;
       // v1.1.2：宿主「繁忙时的发送行为」（只读跟随，手机端不提供切换）
       this.busyEnter = caps.busyEnter === 'steer' ? 'steer' : 'queue';
+      // v1.2.0（§5.11.1）：附件能力目录；旧插件缺省该字段 → null（隐藏附件入口）
+      this.attachmentCaps = caps.attachments !== undefined ? caps.attachments : null;
       this.capabilitiesLoaded = true;
     }).catch((e: Error): void => {
       // 旧插件无此请求 → 能力目录为空（客户端隐藏选择区，不报错）
@@ -789,9 +948,24 @@ export class SessionStore {
       this.defaultModelId = '';
       this.archiveSupported = false;
       this.busyEnter = 'queue';
+      this.attachmentCaps = null;
       this.capabilitiesLoaded = true;
       logDshrc(TAG, 'info', 'session.capabilities unavailable: ' + e.message);
     });
+  }
+
+  /**
+   * v1.2.0（§5.11.1）：规范化后的附件上限（缺字段按契约缺省值兜底）。
+   * 宿主不支持时返回 supported=false 的目录——调用方据此隐藏/拒绝附件动作。
+   */
+  attachmentLimits(): AttachmentCaps {
+    return normalizeAttachmentCaps(this.attachmentCaps);
+  }
+
+  /** v1.2.0：附件入口是否可见（宿主明确 supported=true 且还有名额）。 */
+  attachmentsSupported(): boolean {
+    const caps: AttachmentCaps = this.attachmentLimits();
+    return caps.supported && caps.maxCount > 0;
   }
 
   /**
@@ -1070,8 +1244,11 @@ export class SessionStore {
     // 覆盖判定只认「本页中相对旧缓存**新增**的 durable 项」，且与直播项**一一对应**
     // （一条 durable 最多覆盖一个直播副本）——旧副本不参与配对。
     let coveredLive: Set<string> = new Set<string>();
+    // v1.2.0（§5.11.4）：附件-only 乐观消息的覆盖集（正文为空，文本对账覆盖不到）
+    let coveredAttachments: Set<string> = new Set<string>();
     if (!prepend) {
       coveredLive = this.coveredLiveIds(items, messages, !this.runningOf(sid));
+      coveredAttachments = this.coveredLiveAttachmentIds(items, messages);
     }
     for (let k: number = 0; k < items.length; k++) {
       const it: TimelineItem = items[k];
@@ -1085,6 +1262,10 @@ export class SessionStore {
       if (!prepend && (it.isMessage() || it.isReasoning()) && it.text.length > 0 &&
         coveredLive.has(it.id)) {
         continue; // 直播副本已被**新增**的 durable 历史覆盖，同一句话不显示两遍
+      }
+      if (!prepend && it.isMessage() && it.text.trim().length === 0 &&
+        (it.images.length > 0 || it.files.length > 0) && coveredAttachments.has(it.id)) {
+        continue; // v1.2.0：附件-only 乐观消息已被本页 durable 副本覆盖（role+附件数量一一消费）
       }
       if (!prepend && it.isMessage() && it.text.length === 0 && it.images.length > 0 &&
         this.imagesCoveredByPage(messages, it)) {
@@ -1120,6 +1301,8 @@ export class SessionStore {
       mi.seq = msg.seq;
       // v1.0.9：历史消息里的图片（旧插件不返该字段 → 空数组）
       mi.images = msg.images !== undefined ? msg.images : [];
+      // v1.2.0（§5.11.4）：历史消息里的文件（旧插件不返该字段 → 空数组）
+      mi.files = msg.files !== undefined ? msg.files : [];
       const priorM: TimelineItem | undefined = oldById.get(mi.id);
       if (priorM !== undefined) {
         this.transferTimelineFields(priorM, mi);
@@ -1203,6 +1386,7 @@ export class SessionStore {
     dst.turn = src.turn;
     dst.step = src.step;
     dst.images = src.images;
+    dst.files = src.files;
   }
 
   /** 静默清掉残留的流式标志（不自增 ts / 不加错误文案——只是光标回收）。 */
@@ -1285,6 +1469,47 @@ export class SessionStore {
     return collectCoveredLiveTextIds(durable, live, dropFinalized);
   }
 
+  /**
+   * 计算被持久历史覆盖的**附件-only 乐观消息** id（契约 §5.11.4 v1.2.0）。
+   *
+   * 只认本页「相对旧缓存新增」的 durable（同 coveredLiveIds），按
+   * role=user + 正文为空 + 图片/文件数量完全一致一一消费。
+   * 文本对账（collectCoveredLiveTextIds）不处理空文本，这条规则补齐附件-only 场景；
+   * 交付物图片（assistant + imageId 稳定）仍走 imagesCoveredByPage，互不干扰。
+   */
+  private coveredLiveAttachmentIds(oldItems: TimelineItem[], page: DshrcChatMessage[]): Set<string> {
+    const candidates: DshrcChatMessage[] = this.newDurableCandidates(oldItems, page);
+    const ordered: DshrcChatMessage[] = candidates.slice();
+    ordered.sort((a: DshrcChatMessage, b: DshrcChatMessage): number => a.seq - b.seq);
+    const durable: DshrcDurableAttachments[] = [];
+    for (let i: number = 0; i < ordered.length; i++) {
+      const msg: DshrcChatMessage = ordered[i];
+      const imageCount: number = msg.images !== undefined ? msg.images.length : 0;
+      const fileCount: number = msg.files !== undefined ? msg.files.length : 0;
+      durable.push({
+        role: msg.role,
+        text: msg.text,
+        imageCount: imageCount,
+        fileCount: fileCount
+      });
+    }
+    const live: DshrcLiveAttachments[] = [];
+    for (let i: number = 0; i < oldItems.length; i++) {
+      const it: TimelineItem = oldItems[i];
+      if (it.seq < 0 && it.isMessage() && it.role === 'user' &&
+        (it.images.length > 0 || it.files.length > 0)) {
+        live.push({
+          itemId: it.id,
+          role: it.role,
+          text: it.text,
+          imageCount: it.images.length,
+          fileCount: it.files.length
+        });
+      }
+    }
+    return collectCoveredLiveAttachmentIds(durable, live);
+  }
+
   /** 直播步骤是否已被本页持久步骤覆盖（同 callId）。 */
   private stepCoveredByPage(steps: DshrcStepRecord[], it: TimelineItem): boolean {
     for (let i: number = 0; i < steps.length; i++) {
@@ -1325,7 +1550,16 @@ export class SessionStore {
   }
 
   /** 本地乐观追加一条用户消息（发送即上屏）。 */
-  pushLocalUser(sid: string, text: string): void {
+  /**
+   * 本地乐观追加一条用户消息（发送即上屏）。
+   *
+   * v1.2.0（§5.11.4）：支持附件——`images` 用本地缩略图（imageId='local:<id>'，
+   * source='local'，见 attachments.ets 的 DraftAttachment.toImageRef），
+   * `files` 用本地文件名（fileId='local:<id>'）。宿主持久副本到达后由
+   * mergeHistory 的 coveredLiveAttachmentIds / imagesCoveredByPage 摘掉本地副本，
+   * 不会出现重复气泡。附件-only（text 为空）也合法（页面不画空气泡）。
+   */
+  pushLocalUser(sid: string, text: string, images?: DshrcImageRef[], files?: DshrcFileRef[]): void {
     if (sid.length === 0) {
       return;
     }
@@ -1334,6 +1568,8 @@ export class SessionStore {
     const mi: TimelineItem = new TimelineItem('u' + this.chatSeq.toString(), 'message', Date.now());
     mi.role = 'user';
     mi.text = text;
+    mi.images = images !== undefined ? images : [];
+    mi.files = files !== undefined ? files : [];
     items.push(mi);
     this.notifyActive(sid);
   }
@@ -1586,7 +1822,17 @@ export class SessionStore {
       return;
     }
     const items: TimelineItem[] | undefined = this.cache.get(sid);
-    this.timeline = items !== undefined ? items.slice() : [];
+    this.applyTimeline(items !== undefined ? items.slice() : []);
+  }
+
+  /**
+   * 时间线整体替换 + 同步过程分组投影（v1.2.2）。
+   * 分组必须在**数据侧**算好：页面 build 里现算会拿到新实例，
+   * 而 Repeat 同 key 不重跑 item builder → 屏幕绑旧实例 → 不刷新。
+   */
+  private applyTimeline(items: TimelineItem[]): void {
+    this.timeline = items;
+    this.processGroups = groupTimeline(items);
   }
 
   /** 会话被移除后清缓存；活动会话被删则退回空。 */
@@ -1610,7 +1856,7 @@ export class SessionStore {
     }
     if (this.activeId.length > 0 && !alive.has(this.activeId)) {
       this.activeId = '';
-      this.timeline = [];
+      this.applyTimeline([]);
     }
   }
 
@@ -1772,7 +2018,10 @@ export class SessionStore {
     }
     const topic: string = m.payload.topic !== undefined ? m.payload.topic : '';
     const empty: DshrcValue = JSON.parse('{}') as DshrcValue;
-    const data: DshrcValue = m.payload.data !== undefined && m.payload.data !== null ? m.payload.data : empty;
+    // v1.2.0：payload.data 在「事件」里是对象，在 attachment.upload.chunk 请求里是
+    // base64 字符串——事件侧只认对象（字符串直接当空对象，事件永远不该是字符串）。
+    const rawData: DshrcValue | string | undefined = m.payload.data;
+    const data: DshrcValue = typeof rawData === 'object' && rawData !== null ? rawData as DshrcValue : empty;
     switch (topic) {
       case TOPIC_SESSION_ADDED: {
         // 契约 §5.2：session.added 的 data = {session: SessionSummary}（嵌套一层）

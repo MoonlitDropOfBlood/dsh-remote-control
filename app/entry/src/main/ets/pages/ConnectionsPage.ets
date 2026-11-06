@@ -433,17 +433,17 @@ export struct ConnectionsPage {
 
   /** 单个远程行：名称 / relay / channel + 使用中徽标 + 编辑 / 删除。 */
   @Builder
-  remoteRow(p: RemoteProfile) {
+  remoteRow(cell: RepeatItem<RemoteProfile>) {
     Row() {
       Column() {
         Row() {
-          Text(p.displayName())
+          Text(cell.item.displayName())
             .fontSize(FS_BODY)
             .fontWeight(FontWeight.Medium)
             .fontColor($r('app.color.label_primary'))
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
-          if (p.id === this.conn.activeId) {
+          if (cell.item.id === this.conn.activeId) {
             Text('使用中')
               .fontSize(FS_CAPTION)
               .fontColor($r('app.color.brand_label'))
@@ -456,7 +456,7 @@ export struct ConnectionsPage {
         .width('100%')
         .alignItems(VerticalAlign.Center)
 
-        Text(p.relayUrl)
+        Text(cell.item.relayUrl)
           .fontSize(FS_CAPTION)
           .fontColor($r('app.color.label_secondary'))
           .width('100%')
@@ -464,7 +464,7 @@ export struct ConnectionsPage {
           .textOverflow({ overflow: TextOverflow.Ellipsis })
           .margin({ top: SP_1 })
 
-        Text('channel ' + p.channel)
+        Text('channel ' + cell.item.channel)
           .fontSize(FS_CAPTION)
           .fontColor($r('app.color.label_tertiary'))
           .width('100%')
@@ -475,7 +475,7 @@ export struct ConnectionsPage {
       .alignItems(HorizontalAlign.Start)
       .layoutWeight(1)
       .onClick((): void => {
-        this.switchTo(p.id);
+        this.switchTo(cell.item.id);
       })
 
       Button('编辑')
@@ -488,7 +488,7 @@ export struct ConnectionsPage {
         .borderRadius(RADIUS_CTRL)
         .margin({ left: SP_2 })
         .onClick((): void => {
-          this.onEditClick(p);
+          this.onEditClick(cell.item);
         })
 
       Button('删除')
@@ -501,7 +501,7 @@ export struct ConnectionsPage {
         .borderRadius(RADIUS_CTRL)
         .margin({ left: SP_1 })
         .onClick((): void => {
-          this.onDeleteClick(p);
+          this.onDeleteClick(cell.item);
         })
     }
     .width('100%')
@@ -543,7 +543,7 @@ export struct ConnectionsPage {
     } else {
       Repeat(this.conn.profiles)
         .each((cell: RepeatItem<RemoteProfile>): void => {
-          this.remoteRow(cell.item)
+          this.remoteRow(cell)
         })
         .key((p: RemoteProfile): string => p.id)
     }
@@ -766,5 +766,6 @@ export struct ConnectionsPage {
     .width('100%')
     .height('100%')
     .backgroundColor($r('app.color.bg_base'))
+      .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
   }
 }

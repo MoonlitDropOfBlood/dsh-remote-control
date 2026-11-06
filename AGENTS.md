@@ -24,7 +24,7 @@
 | [relay/](relay/AGENTS.md) | Node.js | 中继服务器：hello 校验、转发、离线缓存、限速、心跳 | `npm test`（16 用例） |
 | [app/](app/AGENTS.md) | ArkTS | HarmonyOS 手机 App（DevEco 工程） | `devecocli build` + linter-cli 0 ERROR |
 | [e2e/](e2e/AGENTS.md) | Node.js | 协议参考实现 + mock 两端 + 自动化联调 | `node auto-test.mjs` |
-| [docs/PROTOCOL.md](docs/PROTOCOL.md) | — | **线协议契约 v1.1.7（唯一事实源，三方共同合同）** | 改协议必须先改它 |
+| [docs/PROTOCOL.md](docs/PROTOCOL.md) | — | **线协议契约 v1.2.0（唯一事实源，三方共同合同）** | 改协议必须先改它 |
 
 ## 快速开始
 
@@ -68,7 +68,7 @@ cd relay && npm install && node server.js            # 中继（默认 8787；�
 
 ## 全局约定
 
-1. **协议以 docs/PROTOCOL.md 为准**（**v1.1.4**：v1.0.9 会话消息里的图片（§5.10「缩略图内联 +
+1. **协议以 docs/PROTOCOL.md 为准**（**v1.2.0**：v1.0.9 会话消息里的图片（§5.10「缩略图内联 +
    大图按需拉取」）→ v1.1.0 present 投递的文件也上手机（§5.10.1）→ v1.1.2 交付物图片进历史
    （§5.10.2）+ 排队事件 session.queue（§5.1/§5.2）→ **v1.1.3 抗重放的会话纪元**
    （§3.4.1 hello 证明 v2 + AAD 绑定 sid + 纪元单调性；§3.4.2 中继原生 TLS）
@@ -78,7 +78,10 @@ cd relay && npm install && node server.js            # 中继（默认 8787；�
    工具/图片事件不越过未冲刷文本（§5.2 末注）；`session.create` 空 `cwd` 默认
    `~/.dsh/remote`（解析 + 建目录 + 按 v1.1.4 ③ 归组）
    → **v1.1.7 权限切换 + 收发闭环**：会话权限查询/选择/变更事件；App 按 WS 到达序串行
-   解密+分发、按 seq 串行加密+发送，旧连接代次回调失效）。
+   解密+分发、按 seq 串行加密+发送，旧连接代次回调失效
+   → **v1.2.0 输入框附件**（§5.11）：`attachment.upload.begin/chunk/commit/abort` 分块上传
+   （256KiB/块，密文帧 ≈460KB < 1MiB）+ `session.prompt.uploads[]` + `capabilities.attachments`
+   + `ChatMessage.files[]`；附件经宿主 `fileUploads` receipt 落成 prompt 内容块，中继/加密不变。
    改任何一端的 wire 行为必须先改契约，三方同步。
 2. **KAT 是硬验收**：契约 §7 测试向量（key/iv/ct/tag/hmac）在 plugin 与 app 各有一份自测，
    连接建立前执行，失败禁连。加密链路每一环（HKDF/AES/HMAC）都必须进 KAT。

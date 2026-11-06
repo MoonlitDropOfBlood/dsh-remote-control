@@ -8,6 +8,7 @@ DSH Pocket（DSH 遥控器；ArkTS / ArkUI，DevEco 工程，bundleName=com.duke
 ```
 entry/src/main/ets/model/    protocol(KAT向量) / crypto(HKDF+AES-GCM+HMAC) / link(WS链路)
                              store(Preferences) / connections(多远程配置) / sessionstore(事件仓)
+                             attachments(输入框附件：选择/转码/分块上传) / attachment-plan(纯 TS 上限与分块)
                              push / theme / pairqr / logger(@duke/logan-ext 双写日志)
                              events(eventpost 事件契约) / routes(hrouter 统一跳转)
 entry/src/main/ets/pages/    Index(会话列表=**首页**) / ConnectionsPage(多远程连接管理)
@@ -275,3 +276,150 @@ grep -rnE "@State|@Prop|@Link|@ObjectLink|@Observed[^V]|@Provide|@Consume|@Watch
 
 - `HRouter.registerLifecycle` 的 `onShown` **会再次触发** → 回到会话时要补拉
   历史与模型；`onAppear` 兜底重读参数（真机时序差异）。
+
+
+## v1.2.0：输入框附件（2026-11-06，契约 §5.11）
+
+与 DSH 桌面端 composer 同能力：图片（png/jpeg/webp/gif）与任意文件。wire 走
+`attachment.upload.begin/chunk/commit/abort` + `session.prompt.uploads[]`（契约 §5.11），
+**不是**把 base64 塞进 prompt（中继单帧 1MiB）。只对**根会话**开放；subagent / one-shot /
+宿主没有 `capabilities.attachments` 时**不显示附件入口**。
+
+### 文件分工
+
+| 文件 | 职责 |
+|---|---|
+| `model/attachment-plan.ts` | **纯 TS**（node 回归共用）：`planChunks` / `clampChunkBytes`（≤256KiB）/ `attachmentFileName` / `formatAttachmentSize` / `normalizeAttachmentCaps` / `checkAttachmentDraft`（数量/单项/合计上限） |
+| `model/attachments.ets` | `DraftAttachment`（@ObservedV2/@Trace，字节放模块级 Map 不进状态树）；`PhotoViewPicker`/`DocumentViewPicker`；OOM 防线（先 stat 后读，单项 maxItemBytes + 256MiB 硬顶，固定 1MiB 临时块）；图片直传判定（宿主类型 + ≤8MiB + ≤6400 万像素 + 宽高 ≤65535）否则转码（透明→webp、否则 jpeg、长边 2048、q85，ORIENTATION 6/3/8→rotate）；缩略图 240 JPEG q70 data URI；`uploadDraftAttachment` 串行 begin→chunk→commit |
+| `model/protocol.ets` | `CONTRACT_VERSION='v1.2.0'`；4 个 `MSG_UPLOAD_*`；`DshrcAttachmentCaps/DshrcUploadBegin/DshrcUploadedAttachment/DshrcFileRef`；capabilities.attachments?；ChatMessage.files?；`payload.data` 是「事件对象 / 分块 base64 字符串」联合类型 |
+| `model/link.ets` | 4 个上传请求（20s/30s/150s/15s）+ `sessionPromptResult(sid,text,uploads?)`（旧调用兼容） |
+| `model/sessionstore.ets` | `@Trace attachmentCaps`（断线/切远程清空）、`attachmentLimits()/attachmentsSupported()`、`TimelineItem.files`、`mergeHistory` 映射 files、`pushLocalUser` 附件参数、附件-only 乐观消息去重 |
+| `model/timeline-reconcile.ts` | `collectCoveredLiveAttachmentIds`：role=user + 正文空 + imageCount/fileCount 完全一致，一条 durable 只消费一条 live（assistant 交付物仍按 imageId 走 `imagesCoveredByPage`） |
+| `pages/SessionDetailPage.ets` | 「+」bindMenu（图片/文件）、附件 chips（图片 56vp 缩略图 / 文件卡 + xmark）、上传进度、send 串行上传后再带 uploads 发 prompt；失败保留草稿与已 commit 的 uploadId（重试不重复上传）；只有 prompt accepted 才清空 |
+| `pages/TimelineView.ets` | `MessageFiles` 文件卡（doc 符号+名称+大小）、图片在前文件在后、纯附件不画空气泡、`local:` 乐观图片不响应点大图（`image.fetch` 必失败） |
+
+### 行为口径 / 坑
+
+- **乐观上屏在 prompt accepted 之后**（不是上传前）：附件场景 prompt 失败要保留草稿重试，
+  先上屏会留下重复气泡；附件-only（text 空）也合法，`MessageBubble` 不画空气泡。
+- **uploadId 复用**：commit 成功即写回 `DraftAttachment.uploadId`；prompt 失败后重试
+  直接复用（插件 receipt 未消费可重试）。宿主 `accepted:false` 同理。
+- **分块必须先上传成功再发 prompt**：`session.prompt.uploads` 只能带已完成 commit 的 id；
+  同一 uploadId 只能被一条 prompt 成功消费（插件回 `attachment-upload-consumed`）。
+- **上传期间禁用发送与附件菜单**；删除 chip 只释放本地字节（宿主已 commit 的附件不可撤回）。
+- **`user/message` 历史里的图片**（PC 端发的）与手机发的都走 `images[]`；文件走 `files[]`；
+  旧插件不返 `files` 时按空数组。
+- **真机待验证**：picker URI 直接 `fs.openSync`、`ImageSource` EXIF 方向是否已被解码器应用
+  （代码注释里标了「双重旋转」开关）、HEIC→JPEG / 透明 PNG→WebP 转码。
+  无真机时只能 build+linter 级验证。
+- 附件字节/文件名**不进日志**（`logDshrc` 只打 kind/chunks/uploadId 前缀）。
+- 回归：`node attachment-contract-test.mjs`（纯函数 + 接线 grep）；
+  `node live-order-node-test.mjs` / `node session-detail-contract-test.mjs` 不得回归。
+
+## v1.2.1：沉浸式 + 详情页顶栏/输入区改版（2026-11-06，真机 + 模拟器实测）
+
+用户反馈「底部/顶部不好看」后的 UI 改版，**协议不变**（v1.2.0 契约照旧）。
+
+### 沉浸式（组件级，不用窗口级全屏）
+
+- **不要用 `window.setWindowLayoutFullScreen(true)`**：真机/模拟器实测，它和软键盘避让
+  冲突——键盘收起后页面停在「键盘高度」，下半屏露黑（`setKeyboardAvoidMode` 两种模式都复现）。
+  改成**组件级**：每个页面根容器加
+  `.expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])`，
+  只扩绘制区域、不重排子节点 → 背景铺到状态栏/导航条，内容仍由系统安全区避让。
+  配合 `EntryAbility.applyImmersiveBars()` 把系统栏底色设为透明（`SYSTEM_BAR_TRANSPARENT`，
+  平台 API 只吃字符串色值，故在 theme.ets 里落成具名常量）。
+- 页面根容器必须是「贴住安全区上下边界」的容器（各页最外层 Column），且不能设固定宽高。
+- **软键盘避让模式统一 `KeyboardAvoidMode.RESIZE`**（`Index.aboutToAppear` 里设置）：
+  标题栏保持可见、消息区压缩、输入卡贴在键盘上方。OFFSET 会把整页顶出屏幕（顶栏消失）。
+- `setKeyboardAvoidMode` 只需在首个页面设置一次（UIContext 级全局）。
+
+### 详情页顶栏（`SessionDetailPage.topBar`）
+
+- 返回键用 `sys.symbol.chevron_left`（文字 `‹` 在不同字体下基线会飘）；
+  标题 + 状态行（主机在线/离线）+ 右侧状态胶囊（运行中/空闲），底部 1px `border_l1` 分隔线。
+- 顶栏背景 `bg_base`，由页面根容器 `expandSafeArea` 铺到状态栏区域（沉浸式）。
+
+### 详情页输入区（composer）
+
+- 结构：模型胶囊 + 权限胶囊（一行）→ 可选「繁忙时插话/排队发送」右对齐小字（仅运行中）
+  → 附件 chips → 输入卡（`RADIUS_COMPOSER` 白色圆角面板：`+` 附件、`TextArea`、
+  运行中圆形停止按钮、圆形纸飞机发送按钮）。
+- **两个 ArkUI 布局坑（真机实测）**：
+  1. `Row().width('100%')` 再配 `margin` **不会内缩**（宽度先按父级 100% 算，margin 被吃掉）
+     → 卡片两侧贴边。内缩必须加在**外层容器**的 `padding` 上（composer 外面包了一层
+     `Column().padding({left: SP_3, right: SP_3})`）。
+  2. `Scroll` 会把**比视口窄**的子节点默认**居中**（子代理行整行飘到中间）
+     → 给 Scroll 的子 `Row` 加 `.constraintSize({ minWidth: '100%' })`，内容更宽时照常滚动。
+- 「繁忙时插话发送」这类提示**不要塞进胶囊行**（模型/权限胶囊已占满，文字会被挤出屏幕）；
+  放在输入卡上方的独立右对齐行。
+- 发送按钮禁用态自己配色（`bg_layer_2` + `label_tertiary`），圆形图标按钮没有文字提示。
+- 输入框 placeholder 用「输入提示词…」（手机键盘没有 Enter 发送语义，别再写 Enter）。
+
+### 构建配置
+
+- `compatibleSdkVersion` **保持 `"26.0.0"`**（发版口径）。只有在**模拟器**上跑时才临时降到
+  `"6.0.0(20)"`——模拟器镜像最高 API 20，装不上 API 26 的包；降到 20 后真机（API 26）与
+  模拟器都能跑，构建无 API 越界报错。改法：`app/build-profile.json5` 的
+  `compatibleSdkVersion`（语法：API≥26 用 `"26.0.0"` 字符串，API 10~25 用 `"6.0.0(20)"`
+  这种带系统版本号的字符串）。**发版前必须改回 26.0.0**，别把临时降级带进发布包。
+
+## v1.2.2：「工作步骤」改成 DSH 式过程分组（2026-11-06，真机实测）
+
+用户对照桌面端 DSH 提的三点：思考要进工作步骤、标题要动态、聚合用 ListItemGroup。
+
+### 数据模型（`model/process-activity.ts` 纯 TS + `pages/TimelineView.ets`）
+
+- **过程分组 = 思考块 + 工具调用**（桌面端同一个 process group）：`groupTimeline()` 把连续
+  的 `reasoning` / `step` 归一组，遇到消息就断开（DSH：分组在两次独立回复之间）。
+- `model/process-activity.ts`（纯 TS，node 直接 import .ts）**逐字对齐**桌面端
+  `@deepseek-ai/dsh-client-ui-chat`：
+  - `activityOfTool()` = 桌面端 `activity()`（read/read_image/grep|glob|*_inspect/write/
+    edit|apply_patch/bash|pwsh|exec_command|write_stdin|terminal_*/run_code/web_search/
+    web_fetch/subagent*/todo_write|goal/ask_user_question → 14 类，兜底 tools）；
+  - 文案 = `message.stepProcess.*` 的简体中文词条（正在…/已…）；
+  - `composeProcessTitle()` = 桌面端 `processTitle()`：取前三类，2 类用「并」且两边都以
+    「已」开头时**只保留一个「已」**；3 类起用「，」连接（**不**剥「已」）；>3 类加「等」；
+  - `reasoningPreview()` = 桌面端 `latestCompletedParagraphFirstLine()`（流式时取**最近一个
+    首行已写完的段落**，去 `**`）+ `processLiveDetail()`（参数里挑 command/path/description…）。
+- 标题：**运行中**=「正在运行命令 · {命令摘要}」/「正在分析请求 · {思考首行}」，组件内自己读
+  store 现算；**结束后**=合成标题（「已读取文件并搜索代码」）。组头左侧是**活动图标**
+  （`sys.symbol.*`，运行中换成 `LoadingProgress` 转圈）。
+
+### 聚合结构（ListItemGroup + ListItem）
+
+```
+List {
+  Repeat(entries)
+    → template('message') = ListItem { TimelineMessage(cell) }
+    → template('process') = ProcessGroup(cell) {
+        ListItemGroup({ header: groupHeader(cell) }) {
+          Repeat(cell.item.members)
+            → template('reasoning') = ListItem { ProcessReasoningCard(memberCell) }
+            → template('step')      = ListItem { ProcessStepCard(memberCell) }
+        }
+      }
+}
+```
+
+- **组头直接放 `ListItemGroup({ header: ... })`**，成员各自独立 `ListItem`；不要在
+  `.each()` 里写 `if`，类型分派只走 `.templateId()` / `.template()`。
+- **Repeat 与自定义组件或 @Builder 混用时必须传完整 `RepeatItem`**，不能只传
+  `cell.item` / `cell.index`。外层 process 传 `RepeatItem<TimelineEntry>`，组头 Builder 也显式
+  接收同一对象；内层成员包装传 `RepeatItem<TimelineItem>`。同样规则覆盖 TimelineMessage、
+  MessageImageItem、SessionCard、SubagentChip、ApprovalRepeatCard、QuestionRepeatCard、
+  AskQuestionBlock、remoteRow 与 attachmentChip。原生 Text/Checkbox 等直接读 cell.item 不受此限。
+- `TimelineEntry` 是 **@ObservedV2 类**（@Trace key/isProcess/head/members/groupExpanded），
+  `groupTimeline()` 按稳定 key 复用实例并原地更新 members；**key 不含成员数**，新增成员不换 key。
+- 插话是追加一个 `isProcess=false` 的消息项，再把后续过程放进新组；**旧过程组的类型仍保持
+  `isProcess=true`**，否则 Message 模板会把 reasoning/step 的 head 误当消息。与 DSH 对齐的
+  状态迁移是旧组 **`closed=true`**（`ProcessGroup.closed` / `flush(true)`）：message 到达即关闭，
+  组头立刻从运行态切到合成完成态，即使末项还遗留 running；类型与关闭态不能混用一个字段。
+- 分组**默认折叠**；折叠态存 `TimelineEntry.groupExpanded`，与条目自己的 `expanded` 分开。
+  折叠用 `.visibility(...)`，子项保持挂载。真机验收须覆盖第一次插话、组头 running→finished、
+  展开成员及滚动复用，不能只看 build 成功。
+
+### 回归
+
+- `node process-activity-contract-test.mjs`（分类/文案/标题合成/思考摘要/运行细节）
+- 既有 `attachment-contract-test` / `session-detail-contract-test` / `live-order-node-test` 不得回归。

@@ -6,6 +6,11 @@ const page = readFileSync(new URL('./entry/src/main/ets/pages/SessionDetailPage.
 const store = readFileSync(new URL('./entry/src/main/ets/model/sessionstore.ets', import.meta.url), 'utf8');
 const link = readFileSync(new URL('./entry/src/main/ets/model/link.ets', import.meta.url), 'utf8');
 const protocol = readFileSync(new URL('./entry/src/main/ets/model/protocol.ets', import.meta.url), 'utf8');
+const timelineView = readFileSync(new URL('./entry/src/main/ets/pages/TimelineView.ets', import.meta.url), 'utf8');
+const indexPage = readFileSync(new URL('./entry/src/main/ets/pages/Index.ets', import.meta.url), 'utf8');
+const connectionsPage = readFileSync(new URL('./entry/src/main/ets/pages/ConnectionsPage.ets', import.meta.url), 'utf8');
+const askCards = readFileSync(new URL('./entry/src/main/ets/pages/AskCards.ets', import.meta.url), 'utf8');
+const approvalQueue = readFileSync(new URL('./entry/src/main/ets/pages/ApprovalQueuePage.ets', import.meta.url), 'utf8');
 
 assert.match(protocol, /MSG_SESSION_PERMISSION: string = 'session\.permission'/);
 assert.match(protocol, /MSG_SESSION_SELECT_PERMISSION: string = 'session\.selectPermission'/);
@@ -39,4 +44,47 @@ assert.doesNotMatch(oneShotBlock, /TextInput|TextArea|this\.send\(\)/,
 assert.match(page, /private send\(\): void \{[\s\S]*?this\.subagentMode\(\) === 'one-shot'[\s\S]*?return;/,
   '发送逻辑也要拒绝一次性 subagent，不能只靠隐藏 UI');
 
-console.log('session-detail-contract-test: permission + subagent wiring assertions passed');
+// 过程分组复用：Repeat 与自定义组件/@Builder 混用时必须传完整 RepeatItem。
+// 只传 cell.item 会把节点留在旧分组，尤其会在中途插话后复用前一个 group。
+assert.match(page, /\.template\('process',[\s\S]*?ProcessGroup\(\{\s+cell: cell,/,
+  'process 模板必须把 RepeatItem<TimelineEntry> 整体传给 ProcessGroup');
+assert.doesNotMatch(page, /this\.processGroup\(cell\.item\)|ProcessGroup\(\{ entry:/,
+  '禁止退回只传 entry/cell.item 的旧写法');
+assert.match(timelineView, /export struct ProcessGroup \{[\s\S]*?@Require @Param cell: RepeatItem<TimelineEntry>/);
+assert.match(timelineView, /ListItemGroup\(\{ header: this\.groupHeader\(this\.cell\) \}\)/,
+  '组头必须直接挂在 ListItemGroup.header，并显式接收完整 RepeatItem');
+assert.match(timelineView, /ProcessGroupHeader\(\{ cell: cell,/,
+  '组头与组体必须共享同一个 RepeatItem');
+assert.match(timelineView, /Repeat\(this\.cell\.item\.members\)/);
+assert.match(timelineView, /ProcessStepCard\(\{ cell: memberCell \}\)/);
+assert.match(timelineView, /ProcessReasoningCard\(\{ cell: memberCell,/,
+  '成员包装组件也必须接完整 RepeatItem<TimelineItem>');
+assert.match(store, /@Trace closed: boolean = false/,
+  '过程组必须有独立于条目类型的 DSH closed 状态');
+assert.match(store, /if \(pendingGroup !== undefined\) \{\s+pendingGroup\.closed = true;/,
+  'message 到达时必须立即关闭前一个过程组');
+assert.match(timelineView, /if \(entry\.closed\) \{\s+return false;/,
+  'closed 组不得因末项遗留 running 而继续显示运行态');
+
+// 同一规则覆盖所有 Repeat → 自定义组件/@Builder 边界，不能只修过程分组。
+assert.match(timelineView, /MessageImageItem\(\{ cell: cell,/);
+assert.match(timelineView, /export struct TimelineMessage \{[\s\S]*?@Require @Param cell: RepeatItem<TimelineEntry>/);
+assert.match(page, /TimelineMessage\(\{ cell: cell,/);
+assert.match(page, /SubagentChip\(\{\s+cell: cell,/);
+assert.match(page, /struct SubagentChip \{\s+@Require @Param cell: RepeatItem<SubagentRow>/);
+assert.match(page, /this\.attachmentChip\(cell\)/);
+assert.match(page, /attachmentChip\(cell: RepeatItem<DraftAttachment>\)/);
+assert.match(page, /ApprovalRepeatCard\(\{ cell: cell,/);
+assert.match(page, /QuestionRepeatCard\(\{ cell: cell,/);
+assert.match(indexPage, /export struct SessionCard \{\s+@Require @Param cell: RepeatItem<SessionListItem>/);
+assert.match(indexPage, /SessionCard\(\{\s+cell: cell,/);
+assert.match(connectionsPage, /remoteRow\(cell: RepeatItem<RemoteProfile>\)/);
+assert.match(connectionsPage, /this\.remoteRow\(cell\)/);
+assert.match(askCards, /struct AskQuestionBlock \{\s+@Require @Param cell: RepeatItem<DshrcQuestion>/);
+assert.match(askCards, /AskQuestionBlock\(\{\s+cell: cell,/);
+assert.match(askCards, /export struct ApprovalRepeatCard \{[\s\S]*?@Require @Param cell: RepeatItem<ApprovalCard>/);
+assert.match(askCards, /export struct QuestionRepeatCard \{[\s\S]*?@Require @Param cell: RepeatItem<QuestionCard>/);
+assert.match(approvalQueue, /ApprovalRepeatCard\(\{\s+cell: cell,/);
+assert.match(approvalQueue, /QuestionRepeatCard\(\{\s+cell: cell,/);
+
+console.log('session-detail-contract-test: permission + subagent + RepeatItem wiring assertions passed');

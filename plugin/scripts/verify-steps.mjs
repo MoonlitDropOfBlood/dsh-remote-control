@@ -1911,6 +1911,214 @@ function eventsOf(sent, topic) {
   setSharpResolver(null);
 }
 
+// ===========================================================================
+// 场景 10（宿主 API 分代）：DSH 0.2.2-rc.1 移除了 inspect()，历史读取改走 events()
+//
+// 这组用例是**本次真实故障的防回归资产**：旧宿主形状（inspect+page）的 mock 让
+// 门禁全绿，插件却在新宿主上因为 "sc.inspect is not a function" 完全加载不了历史。
+// 故这里**严格照新宿主的真实语义**搭 mock：
+//   - 只有 events()，**没有** inspect() / page()；
+//   - events(request) 的 request = {address, maxMessages?, beforeSeq?, throughSeq?}；
+//   - 省略 throughSeq → 宿主自己取日志末尾（observation.cursor）；
+//   - beforeSeq 是「更早一页」的开区间上界；
+//   - 地址校验：kind:'session' 打到 subagent 会话 → 抛 session/agent-busy；
+//     kind:'subagent' 必须带上父会话 id（mode:'unknown' 免 mode 比对）。
+// ===========================================================================
+{
+  // 模拟宿主的会话日志（seq 从 1 连续递增）与地址校验
+  const logs2 = [];
+  const events2 = [];
+  for (let i = 1; i <= 6; i++) {
+    events2.push({
+      type: "user/message",
+      seq: i,
+      time: 1000 + i,
+      surfaceOp: "append",
+      data: { source: { kind: "user" }, content: [{ type: "text", text: "消息" + i }] },
+    });
+  }
+  const SESSION_ID = "sess-new";
+  const PARENT_ID = "sess-parent";
+  const CHILD_ID = "sess-child";
+  // 宿主视角：会话 → {parentSessionId?, origin?}
+  const hostSessions = new Map([
+    [SESSION_ID, {}],
+    [CHILD_ID, { parentSessionId: PARENT_ID, origin: "subagent" }],
+  ]);
+  const eventCalls = [];
+  const listCalls = [];
+
+  const newHostController = {
+    // 新宿主没有 inspect() —— 插件若还调它就会抛 TypeError（历史加载失败的根因）
+    async list(_req, _sig) {
+      listCalls.push(true);
+      return {
+        items: [...hostSessions.entries()].map(([id, meta]) => ({
+          sessionId: id,
+          updatedAt: 1,
+          agentAvailable: false,
+          running: false,
+          blank: false,
+          ...(meta.origin ? { origin: meta.origin } : {}),
+          ...(meta.parentSessionId ? { parentSessionId: meta.parentSessionId } : {}),
+        })),
+      };
+    },
+    async events(request, _sig) {
+      eventCalls.push(request);
+      const address = request?.address ?? {};
+      const sessionId = address.kind === "session" ? address.sessionId : address.childSessionId;
+      const meta = hostSessions.get(sessionId);
+      if (meta === undefined) {
+        const e = new Error(`session "${sessionId}" not found`);
+        e.code = "session/not-found";
+        throw e;
+      }
+      // 宿主校验：普通地址不能打到 subagent 会话
+      if (address.kind === "session" && meta.origin === "subagent") {
+        const e = new Error("subagent Sessions require their durable parent address");
+        e.code = "session/agent-busy";
+        throw e;
+      }
+      // 宿主校验：subagent 地址必须对得上父会话
+      if (address.kind === "subagent" && meta.parentSessionId !== address.parentSessionId) {
+        const e = new Error("subagent does not belong to the supplied parent");
+        e.code = "subagent/unauthorized";
+        throw e;
+      }
+      // 宿主语义：省略 throughSeq → 取日志末尾；beforeSeq 是更早一页的开区间上界
+      const cursor = events2.length > 0 ? events2[events2.length - 1].seq : -1;
+      const throughSeq = request.throughSeq === undefined ? cursor : request.throughSeq;
+      const end = Math.min(throughSeq + 1, request.beforeSeq ?? throughSeq + 1);
+      const maxMessages = request.maxMessages ?? 50;
+      // 宿主是「消息对齐」的：从末尾往回数 maxMessages 条消息，取它们的区间
+      let cut = 0;
+      let count = 0;
+      for (let index = end - 1; index >= 0; index--) {
+        count++;
+        if (count >= maxMessages) {
+          cut = index;
+          break;
+        }
+      }
+      const slice = events2.slice(cut, end);
+      return {
+        cursor,
+        records: slice.map((e) => ({ type: "event", event: e })),
+        hasMore: cut > 0,
+      };
+    },
+  };
+
+  const newRelay = makeRelay();
+  const newCtx = makeCtx({ sessionController: newHostController });
+  const newBridge = makeBridge(newCtx, newRelay);
+  newBridge.attach();
+
+  // ① 普通会话：历史能加载出来（这就是手机上「加载不了历史」的那条路径）
+  await newBridge.dispatch({ id: "nh-1", type: "session.history", ts: Date.now(), payload: { sessionId: SESSION_ID } });
+  const nh1 = lastResult(newRelay.sent, "nh-1");
+  check(
+    "新宿主：session.history 走 events() 且能取到消息（不再调 inspect）",
+    nh1?.value?.messages?.length === 6 && nh1?.value?.messages?.[0]?.text === "消息1",
+    JSON.stringify(nh1),
+  );
+  check("新宿主：历史请求没有落到已移除的 inspect() 上", typeof newHostController.inspect !== "function", "n/a");
+  check(
+    "新宿主：events() 请求省略 throughSeq（宿主自己取日志末尾）",
+    eventCalls.length === 1 && eventCalls[0].throughSeq === undefined,
+    JSON.stringify(eventCalls),
+  );
+  check(
+    "新宿主：普通会话用 kind:'session' 地址",
+    eventCalls[0]?.address?.kind === "session" && eventCalls[0]?.address?.sessionId === SESSION_ID,
+    JSON.stringify(eventCalls[0]?.address),
+  );
+  check(
+    "新宿主：回包含 oldestSeq / hasMore（向前翻页游标）",
+    nh1?.value?.oldestSeq === 1 && nh1?.value?.hasMore === false,
+    JSON.stringify({ oldestSeq: nh1?.value?.oldestSeq, hasMore: nh1?.value?.hasMore }),
+  );
+
+  // ② 向前翻页：客户端回传上一页的 oldestSeq 作 beforeSeq
+  await newBridge.dispatch({
+    id: "nh-2",
+    type: "session.history",
+    ts: Date.now(),
+    payload: { sessionId: SESSION_ID, beforeSeq: 4 },
+  });
+  const nh2 = lastResult(newRelay.sent, "nh-2");
+  check(
+    "新宿主：向前翻页把 beforeSeq 透传给宿主",
+    eventCalls[1]?.beforeSeq === 4,
+    JSON.stringify(eventCalls[1]),
+  );
+  check(
+    "新宿主：向前翻页取更早的一页（beforeSeq 是开区间上界 → seq < 4）",
+    nh2?.value?.messages?.length === 4 && nh2?.value?.messages?.[0]?.text === "消息1",
+    JSON.stringify(nh2?.value?.messages?.map((m) => m.text)),
+  );
+
+  // ③ 子代理会话：必须用 durable subagent 地址（父会话 id 从 list 冷读）
+  await newBridge.dispatch({ id: "nh-3", type: "session.history", ts: Date.now(), payload: { sessionId: CHILD_ID } });
+  const nh3 = lastResult(newRelay.sent, "nh-3");
+  const childAddr = eventCalls.find((c) => c.address?.kind === "subagent")?.address;
+  check(
+    "新宿主：子代理会话用 kind:'subagent'  durable 地址",
+    childAddr?.kind === "subagent" && childAddr?.parentSessionId === PARENT_ID && childAddr?.childSessionId === CHILD_ID,
+    JSON.stringify(childAddr),
+  );
+  check("新宿主：子代理地址 mode 固定 'unknown'（免 mode 比对）", childAddr?.mode === "unknown", JSON.stringify(childAddr));
+  check("新宿主：子代理历史能加载（不报 agent-busy）", nh3?.value?.messages?.length === 6, JSON.stringify(nh3));
+
+  // ④ 会话不存在 → 宿主错误原样回，不静默吞掉
+  await newBridge.dispatch({ id: "nh-4", type: "session.history", ts: Date.now(), payload: { sessionId: "sess-missing" } });
+  const nh4 = lastResult(newRelay.sent, "nh-4");
+  check(
+    "新宿主：会话不存在回 session-history-failed（错误不被吞）",
+    nh4?.error?.code === "session-history-failed",
+    JSON.stringify(nh4),
+  );
+
+  // ⑤ 权限查询的 subagent 冷读：新宿主无 inspect → 走 list 判定，不得激活子代理
+  let resolveAgentCalls = 0;
+  const permRelay = makeRelay();
+  const permCtx = makeCtx({
+    sessionController: {
+      ...newHostController,
+      async resolveAgent() {
+        resolveAgentCalls++;
+        return { agent: { session: { id: CHILD_ID } } };
+      },
+    },
+    permissionPresets: {
+      catalog() {
+        return { options: [{ value: "read-only", name: "只读" }], defaultOptions: [{ value: "read-only" }], defaultPreset: "read-only" };
+      },
+      current() {
+        return "read-only";
+      },
+      set() {},
+    },
+  });
+  const permBridge = makeBridge(permCtx, permRelay);
+  permBridge.attach();
+  await permBridge.dispatch({ id: "perm-sub", type: "session.permission", ts: Date.now(), payload: { sessionId: CHILD_ID } });
+  check(
+    "新宿主：子代理权限查询**不** resolveAgent 激活它（v1.1.7 规则）",
+    resolveAgentCalls === 0,
+    String(resolveAgentCalls),
+  );
+  check(
+    "新宿主：子代理权限查询用 list 冷读身份",
+    listCalls.length > 0,
+    String(listCalls.length),
+  );
+
+  newBridge.dispose();
+  permBridge.dispose();
+}
+
 console.log("");
 console.log(fail === 0 ? "VERIFY-STEPS RESULT: PASS (" + pass + " checks)" : "VERIFY-STEPS RESULT: FAIL (" + fail + "/" + (pass + fail) + ")");
 process.exit(fail === 0 ? 0 : 1);

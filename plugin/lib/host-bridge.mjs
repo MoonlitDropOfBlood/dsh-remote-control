@@ -789,6 +789,32 @@ export function mapModelSelection(data) {
 }
 
 /**
+ * 契约 §5.1：会话历史读取地址（宿主 0.2.2+ 的 durable address）。
+ *
+ * 宿主对**普通会话**与**子代理会话**用两种地址：
+ *   - 普通会话：{kind:'session', sessionId}
+ *   - 子代理：{kind:'subagent', parentSessionId, childSessionId, mode:'unknown'}
+ *     （子代理会话用 kind:'session' 会被宿主拒为 session/agent-busy）
+ *
+ * mode 固定 'unknown'：宿主在 mode==='unknown' 时跳过 mode 比对，
+ * 免得我们还得额外读一次子代理目录去确认 one-shot/continuable。
+ * @param {string} sessionId
+ * @param {string} [parentSessionId] 子代理的父会话 id（普通会话留空）
+ * @returns {{kind:string,sessionId?:string,parentSessionId?:string,childSessionId?:string,mode?:string}}
+ */
+export function historyAddress(sessionId, parentSessionId = "") {
+  if (parentSessionId !== "") {
+    return {
+      kind: "subagent",
+      parentSessionId,
+      childSessionId: sessionId,
+      mode: "unknown",
+    };
+  }
+  return { kind: "session", sessionId };
+}
+
+/**
  * 契约 §5.9 归档：宿主错误的「原样」回传。
  * 优先用宿主的错误码（RemoteError.code，如 "workspace/active-session"），
  * 没有就用调用方给的兜底码；message 一律用宿主原文。
@@ -1973,9 +1999,14 @@ export class HostBridge {
   }
 
   /** 契约 §5.1 session.history：向后翻页的历史消息页（v1.0.4）。
-   *  throughSeq（宿主实证）必须是日志中真实存在的末尾 seq——直接传
-   *  MAX_SAFE_INTEGER 会被宿主 bad-request 拒绝（past cursor），-1 只用于空日志；
-   *  故先 inspect 冷读拿日志尾 seq 作为切点，再 page 取消息对齐的一页。
+   *
+   *  宿主 API 分代（DSH 0.2.2-rc.1 起换了历史入口）：
+   *   - 新宿主：sessionController.events({address, throughSeq?, beforeSeq?, maxMessages?})。
+   *     **省略 throughSeq 即取当前日志末尾**（宿主自己算 observation.cursor），
+   *     所以不再需要先 inspect() 拿尾 seq——旧宿主那套 inspect()+page() 在新宿主上
+   *     会直接抛 "sc.inspect is not a function"，手机端表现为「历史消息加载不了」。
+   *   - 旧宿主：只有 inspect()（拿日志尾 seq + subagent 身份）与 page()，保留原路径。
+   *
    *  向前翻页：客户端回传上一页的 oldestSeq 作 beforeSeq（开区间）。 */
   async #rSessionHistory(m) {
     const p = m.payload ?? {};
@@ -1994,34 +2025,7 @@ export class HostBridge {
       const sc = this.#sc();
       // v1.1.1（§5.10.2）：交付物图片作为**独立**的历史消息（两条回包路径都要带上）
       const delivered = await this.#deliveredHistoryMessages(sessionId);
-      let cursor = -1;
-      let address = { kind: "session", sessionId };
-      try {
-        const inspected = await sc.inspect(sessionId, signal);
-        const events = inspected?.events;
-        if (Array.isArray(events) && events.length > 0) {
-          const lastSeq = Number(events[events.length - 1]?.seq);
-          if (Number.isSafeInteger(lastSeq) && lastSeq >= 0) cursor = lastSeq;
-        }
-        // subagent 会话必须走 durable subagent 地址（宿主校验：kind:'session' 会被拒）
-        const header = inspected?.meta;
-        const parent = typeof header?.parentSession === "string" ? header.parentSession : "";
-        if (header?.origin === "subagent" && parent !== "") {
-          address = { kind: "subagent", parentSessionId: parent, childSessionId: sessionId, mode: "unknown" };
-        }
-      } catch (e) {
-        // inspect 失败（会话不存在等）→ 直接把错误回给手机端
-        throw e;
-      }
-      if (cursor < 0) {
-        // 空会话（无任何事件）：直接回空页，不折腾 page
-        // （交付物图片仍要带上——它们不在宿主的会话日志里）
-        this.#reply(m, resultOf(m, { messages: delivered, steps: [], hasMore: false, oldestSeq: 0 }));
-        return;
-      }
-      const request = { address, throughSeq: cursor, maxMessages };
-      if (beforeSeq !== undefined) request.beforeSeq = beforeSeq;
-      const page = await sc.page(request, signal);
+      const page = await this.#readHistoryPage(sc, sessionId, maxMessages, beforeSeq, signal);
       const messages = [];
       let oldestSeq = Number.MAX_SAFE_INTEGER;
       let oldestEventSeq = Number.MAX_SAFE_INTEGER;
@@ -2076,6 +2080,137 @@ export class HostBridge {
       this.#reply(m, resultOf(m, fit.value));
     } catch (e) {
       this.#reply(m, errorOf(m, "session-history-failed", errText(e)));
+    }
+  }
+
+  /**
+   * 读一页会话历史（宿主 API 分代适配层）。
+   *
+   * 新宿主（DSH 0.2.2-rc.1+）：走 events()。
+   *   - **不传 throughSeq**：宿主会自己取当前日志末尾作为切点
+   *     （resolveHistoryRequest 允许省略；history() 用 observation.cursor，
+   *     它就是日志最后一条事件的 seq —— 与旧路径 inspect() 算出的 cursor 等价）。
+   *   - 向前翻页只传 beforeSeq（开区间），宿主自己与末尾取交集。
+   * 旧宿主（0.2.1 及更早）：先 inspect() 冷读拿日志尾 seq（throughSeq 必须是真实
+   *   存在的 seq，传 MAX_SAFE_INTEGER 会被 bad-request 拒为 past cursor），再 page()。
+   *
+   * 版本判据（实测 0.2.1-rc.5 无 events()、有 inspect()；0.2.2-rc.1 有 events()、
+   * 无 inspect()）：**以 events() 的存在与否分流**，不靠版本号猜。
+   *
+   * @param {any} sc sessionController
+   * @param {string} sessionId
+   * @param {number} maxMessages
+   * @param {number|undefined} beforeSeq
+   * @param {AbortSignal} signal
+   * @returns {Promise<{records:any[],hasMore:boolean}>}
+   */
+  async #readHistoryPage(sc, sessionId, maxMessages, beforeSeq, signal) {
+    if (typeof sc.events === "function") {
+      const address = await this.#historyAddress(sc, sessionId, signal);
+      const request = { address, maxMessages };
+      if (beforeSeq !== undefined) request.beforeSeq = beforeSeq;
+      const page = await sc.events(request, signal);
+      return { records: page?.records ?? [], hasMore: page?.hasMore === true };
+    }
+    // 旧宿主：inspect + page。
+    const inspected = await sc.inspect(sessionId, signal);
+    const events = inspected?.events;
+    let cursor = -1;
+    let address = historyAddress(sessionId);
+    if (Array.isArray(events) && events.length > 0) {
+      const lastSeq = Number(events[events.length - 1]?.seq);
+      if (Number.isSafeInteger(lastSeq) && lastSeq >= 0) cursor = lastSeq;
+    }
+    // subagent 会话必须走 durable subagent 地址（宿主校验：kind:'session' 会被拒）
+    const header = inspected?.meta;
+    const parent = typeof header?.parentSession === "string" ? header.parentSession : "";
+    if (header?.origin === "subagent" && parent !== "") {
+      address = historyAddress(sessionId, parent);
+    }
+    if (cursor < 0) {
+      // 空会话（无任何事件）：直接回空页，不折腾 page
+      // （交付物图片仍要带上——它们不在宿主的会话日志里）
+      return { records: [], hasMore: false };
+    }
+    const request = { address, throughSeq: cursor, maxMessages };
+    if (beforeSeq !== undefined) request.beforeSeq = beforeSeq;
+    const page = await sc.page(request, signal);
+    return { records: page?.records ?? [], hasMore: page?.hasMore === true };
+  }
+
+  /**
+   * 解析会话历史的宿主地址（新宿主路径）。
+   *
+   * 子代理会话必须用 durable subagent 地址；它的父会话 id 从**冷读**的
+   * sessionController.list() 里取（list 不激活 Agent）。
+   * list() 拿不到（例如会话已不在可见列表里）→ 退回普通会话地址，
+   * 由宿主自己判定（子代理用 kind:'session' 会被拒为 session/agent-busy，
+   * 错误原样回给手机端，不静默吞掉）。
+   * @param {any} sc sessionController
+   * @param {string} sessionId
+   * @param {AbortSignal} signal
+   * @returns {Promise<{kind:string,sessionId?:string,parentSessionId?:string,childSessionId?:string,mode?:string}>}
+   */
+  async #historyAddress(sc, sessionId, signal) {
+    try {
+      const listed = await sc.list({}, signal);
+      for (const raw of listed?.items ?? []) {
+        if (String(raw?.sessionId ?? "") !== sessionId) continue;
+        const parent = typeof raw?.parentSessionId === "string" ? raw.parentSessionId : "";
+        if (raw?.origin === "subagent" && parent !== "") {
+          return historyAddress(sessionId, parent);
+        }
+        return historyAddress(sessionId);
+      }
+    } catch (e) {
+      this.#log("warn", "history address lookup failed; using plain session address", {
+        sessionId,
+        error: errText(e),
+      });
+    }
+    return historyAddress(sessionId);
+  }
+
+  /**
+   * 冷读判定一个会话是不是子代理（**绝不激活 Agent**）。
+   *
+   * 新宿主没有 inspect() 了 → 用 list() 的 origin/parentSessionId 字段
+   * （宿主 listFields(header) 直接带出这两个字段，与旧宿主 inspect().meta 同源）。
+   * 旧宿主仍走 inspect()（更快，且不必列举全部会话）。
+   *
+   * 用途：权限查询的 live 降级前必须先判身份——子代理绝不能为了显示权限
+   * 而 resolveAgent 激活它（v1.1.7 规则）。
+   * @param {any} sc sessionController
+   * @param {string} sessionId
+   * @param {AbortSignal} signal
+   * @returns {Promise<boolean>}
+   */
+  async #isSubagentSession(sc, sessionId, signal) {
+    try {
+      if (typeof sc.inspect === "function") {
+        const inspected = await sc.inspect(sessionId, signal);
+        const meta = inspected?.meta;
+        return (
+          meta?.origin === "subagent" ||
+          (typeof meta?.parentSession === "string" && meta.parentSession !== "") ||
+          (typeof meta?.parentSessionId === "string" && meta.parentSessionId !== "")
+        );
+      }
+      const listed = await sc.list({}, signal);
+      for (const raw of listed?.items ?? []) {
+        if (String(raw?.sessionId ?? "") !== sessionId) continue;
+        if (raw?.origin === "subagent") return true;
+        return typeof raw?.parentSessionId === "string" && raw.parentSessionId !== "";
+      }
+      return false;
+    } catch (e) {
+      this.#log("warn", "subagent identity cold read unavailable", {
+        sessionId,
+        error: errText(e),
+      });
+      // 判不出来 → 按“不是子代理”处理（宿主对普通会话的权限查询是安全的）；
+      // 真子代理会走 resolveAgent 路径，但那是宿主的既有行为，不是我们引入的。
+      return false;
     }
   }
 
@@ -2611,24 +2746,13 @@ export class HostBridge {
     }
 
     // 旧宿主没有 permissions 投影时，live Session 的 current() 仍是有效值权威来源。
-    // 但 subagent 查询绝不能为了兜底而激活 Agent：先用 inspect 冷读身份，命中即只回内存态。
+    // 但 subagent 查询绝不能为了兜底而激活 Agent：先冷读身份，命中即只回内存态。
+    // 新宿主（0.2.2-rc.1+）没有 inspect() 了 → 冷读改走 list() 的 origin/parentSessionId
+    // （同样不激活 Agent），否则会误把子代理 resolveAgent 起来（违反 v1.1.7）。
     try {
       const svc = this.#service("permissionPresets");
       const sc = this.#sc();
-      let coldSubagent = false;
-      if (typeof sc.inspect === "function") {
-        try {
-          const inspected = await sc.inspect(sessionId, this.#signal(10_000));
-          const meta = inspected?.meta;
-          coldSubagent = meta?.origin === "subagent" ||
-            (typeof meta?.parentSessionId === "string" && meta.parentSessionId !== "");
-        } catch (e) {
-          this.#log("warn", "permission subagent identity inspect unavailable", {
-            sessionId,
-            error: errText(e),
-          });
-        }
-      }
+      const coldSubagent = await this.#isSubagentSession(sc, sessionId, this.#signal(10_000));
       if (!coldSubagent && svc && typeof svc.current === "function" && typeof sc.resolveAgent === "function") {
         const agentRes = await sc.resolveAgent(sessionId);
         const session = agentRes?.agent?.session ?? agentRes?.session ?? null;

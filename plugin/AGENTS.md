@@ -98,6 +98,22 @@ node scripts/sync-client-icon.mjs                                      # 改了 
 - `sessionController.list({}, sig)` → `{items}`（title 走 projections）；
   `prompt` 需 `{requestId, sessionId, mode:'queue', content:[{type:'text',text}]}`；
   `cancel` → `{accepted}`；`create` 无 title 参数（create 后 rename）。
+  ⚠️ **列表行带 `origin` 与 `parentSessionId`**（宿主 `listFields(header)`）：子代理会话
+  `origin==='subagent'` 且有 `parentSessionId` → 这是在**没有 `inspect()` 的新宿主上**
+  判定子代理身份与解析 durable 父地址的唯一冷读来源（`list()` 不激活 Agent）。
+- **历史读取按宿主能力分流（2026-11-06 修，DSH 0.2.2-rc.1 移除了 `inspect()`）**：
+  | 宿主 | 可用方法 | 插件怎么读 |
+  |---|---|---|
+  | 0.2.1-rc.5 及更早 | `inspect()` + `page()` | 先 `inspect()` 拿日志尾 seq 与 subagent 身份，再 `page({address, throughSeq, maxMessages, beforeSeq?})` |
+  | 0.2.2-rc.1+ | `events()`（`page()` 已 deprecated、`inspect()` **已删除**） | `events({address, maxMessages, beforeSeq?})`，**省略 `throughSeq`**（宿主自己取日志末尾 = `observation.cursor`） |
+  - ⚠️ **判据是「`events` 是否存在」，不是版本号**（实测 0.2.1 无 `events`、0.2.2 无 `inspect`）。
+  - ⚠️ `throughSeq` **不能**硬塞常量（如 `MAX_SAFE_INTEGER`）——宿主报 `bad-request`
+    （past cursor）；省略即可。
+  - ⚠️ `beforeSeq` 是**更早一页的开区间上界**（`end = min(throughSeq+1, beforeSeq)`），
+    客户端回传上一页的 `oldestSeq`。
+  - **地址必须分清两类**：`{kind:'session', sessionId}`（普通会话）vs
+    `{kind:'subagent', parentSessionId, childSessionId, mode:'unknown'}`（子代理）。
+    子代理用 `kind:'session'` 会被宿主拒为 `session/agent-busy`；`mode:'unknown'` 免 mode 比对。
 - `sessionController.projections({sessionId}, sig)` → `values.subagentCatalog`
   = `[{id, createdAt, mode:'one-shot'|'continuable', label?}]`（父会话子代理目录投影，
   冷读无激活；v1.0.5 session.subagents 的数据源）。
@@ -542,8 +558,11 @@ Remote 方法（返回 `{ok:true,value}` 或 `{ok:false,error:{code,message}}`�
 - **当前权限**：`session.permission` 优先读 `sc.projections()` 的
   `values.permissions.currentValue`（与桌面端同源，可能为派生态 `custom`）；
   投影不可用时退回 live `permissionPresets.current()` 与事件内存态。
-- **subagent 冷读**：投影失败后的 live 降级前先走 `sc.inspect()` 判断身份，
+- **subagent 冷读**：投影失败后的 live 降级前先**冷读**判断会话是不是子代理，
   不得为了显示权限而 `resolveAgent` 激活 subagent。
+  冷读数据源随宿主分代（见上文「Host API 速查」）：旧宿主走 `sc.inspect()` 的 `meta`，
+  新宿主（0.2.2-rc.1+，**无 `inspect()`**）走 `sc.list()` 的 `origin`/`parentSessionId`。
+  ⚠️ 两者都不激活 Agent——判据是「有没有激活」，不是「调了哪个方法」。
 - **切换**：`session.selectPermission` 通过 `resolveAgent` 取 live Session 后调
   `permissionPresets.set(session,name)`，再回读有效当前值；Host 拒绝原样回错。
 - **变更**：`permission/preset`、`sandbox/mode`、`approval/policy` 三类事件都按 Host 顺序

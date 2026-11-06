@@ -3,7 +3,36 @@
 本仓库的版本说明。发版时（推 `v*` 标签）release workflow 会抽取对应版本段落作为
 GitHub Release 的正文——**bump 版本时必须同步补一段 `## [版本]`**，否则发布失败。
 
-## [Unreleased]
+## [1.1.9] - 2026-11-06
+
+修复手机端「历史消息加载不了」——DSH 宿主升级到 0.2.2-rc.1 后移除了插件依赖的
+`sessionController.inspect()`，历史读取整条链路失败（**仅 Host 侧取数口径，
+无协议/线格式变化**：App / relay / 契约 §5.1 都不动）。
+
+### 插件（Host 侧）
+
+- **修复手机端「历史消息加载不了」**：DSH 0.2.2-rc.1 移除了 `sessionController.inspect()`，
+  而插件读历史时**无条件**先调 `sc.inspect(...)` 拿日志尾 seq → 每次请求都抛
+  `sc.inspect is not a function`（`session-history-failed`），手机上表现为历史整页加载不出来。
+  - 历史读取改为**按宿主能力分流**（实测 0.2.1-rc.5 只有 `inspect()+page()`，
+    0.2.2-rc.1 只有 `events()`）：新宿主走 `sc.events({address, maxMessages, beforeSeq?})`，
+    **省略 `throughSeq`** 由宿主自己取日志末尾（`observation.cursor`）；旧宿主保留
+    `inspect()+page()` 原路径，行为不变。
+  - 子代理会话仍走 durable subagent 地址（`{kind:'subagent', parentSessionId, childSessionId,
+    mode:'unknown'}`）：父会话 id 改为从**冷读**的 `sc.list()` 的 `origin`/`parentSessionId`
+    字段解析（新宿主的 `listFields(header)` 直接带出这两个字段）。
+  - 权限查询的 subagent 冷读判定同步适配新宿主（原先也依赖 `inspect()`）：改为走 `list()`，
+    **不得为了显示权限而 `resolveAgent` 激活子代理**（v1.1.7 规则）。
+- **wire 协议无变化**：回包形状仍是 `{messages, steps, hasMore, oldestSeq}`。
+
+### 门禁
+
+- `scripts/verify-steps.mjs` 由 220 项增至 **233 项**：新增「新宿主」场景——mock 出
+  **没有 `inspect()`/`page()`、只有 `events()`** 的 0.2.2-rc.1 宿主形状，覆盖普通会话加载、
+  向前翻页（`beforeSeq` 开区间）、子代理 durable 地址、会话不存在报错、以及权限查询不激活子代理。
+  此前门禁只 mock 旧 API（`inspect()+page()`），故宿主升级后 220 项照样全绿而插件已完全不可用。
+- 变异测试 5/5 全部杀死（禁用 `events()` 分支 / 硬塞 `throughSeq` / 禁用子代理地址解析 /
+  禁用权限冷读判定 / 不透传 `beforeSeq`），确认新增用例真能捕捉该故障而非假绿。
 
 ## [1.1.8] - 2026-11-04
 

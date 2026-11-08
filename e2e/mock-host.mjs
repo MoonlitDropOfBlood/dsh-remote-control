@@ -47,8 +47,23 @@ export const MOCK_MODELS = [
 ];
 
 export const MOCK_DEFAULT_PRESET = "standard";
-export const MOCK_DEFAULT_PERMISSION = "read-only";
+/**
+ * 默认权限。默认仍是 `read-only`（与 v1.0.7 起的行为一致），
+ * 需要验证「可写会话」路径（如手机端权限切换 + 发消息闭环）时用
+ * `MOCK_PERMISSION=workspace-write node mock-host.mjs …` 覆盖。
+ */
+export const MOCK_DEFAULT_PERMISSION = process.env.MOCK_PERMISSION || "read-only";
 export const MOCK_DEFAULT_MODEL = "deepseek/deepseek-chat";
+
+/**
+ * `MOCK_PROMPT_RESULT_LAST=1`：**把 session.prompt 的 accepted 回包挪到流式回复之后**。
+ *
+ * 插件端 `#rSessionPrompt` 是先 await 宿主 prompt、之后才回 accepted → 手机的
+ * `assistant.delta` 可能**先于** prompt 回包到达（契约 §5.1：回包与直播事件是两条独立的时序）。
+ * 默认（先回 accepted）复现不出这个顺序，客户端「等 accepted 再上屏」的写法就会把用户气泡
+ * 插进流式回复中间（一条回复被切成两个气泡）。打开这个开关即可让联调用例**稳定复现**该顺序。
+ */
+export const MOCK_PROMPT_RESULT_LAST = process.env.MOCK_PROMPT_RESULT_LAST === "1";
 
 /** v1.2.0（契约 §5.11.1）：mock 声明与插件一致的附件目录。 */
 export const MOCK_ATTACHMENT_CAPS = {
@@ -260,6 +275,27 @@ export function createMockHost(deps) {
         agentPreset: MOCK_DEFAULT_PRESET,
         permission: MOCK_DEFAULT_PERMISSION,
         events: [],
+        // v1.0.5（§5.6）：父会话的直接子代理目录（mock 造一条，覆盖客户端子代理目录 UI）
+        subagents: [
+          {
+            sessionId: "s-demo-1:sub-1",
+            label: "fix-login",
+            mode: "continuable",
+            running: false,
+            hasChildren: false,
+            createdAt: Date.now() - 60_000,
+          },
+          {
+            sessionId: "s-demo-1:sub-2",
+            label: "",
+            mode: "one-shot",
+            running: false,
+            hasChildren: false,
+            createdAt: Date.now() - 30_000,
+          },
+        ],
+        // v1.1.2（§5.1）：当前待执行消息（全量快照）
+        queue: [],
       },
     ],
   ]);
@@ -334,6 +370,26 @@ export function createMockHost(deps) {
     record(session, historyType, historyData);
     link.send(msg("event", { topic, data: wireData }));
   };
+
+  /**
+   * 演示推送（`MOCK_PUSH_DEMO=1` 开启，默认关）：
+   * 连接稳定后给每个会话推一条**带 markdown 语法**的助手消息，
+   * 供各端 App 验证 markdown 渲染（流式气泡 + 代码块）。
+   */
+  if (process.env.MOCK_PUSH_DEMO === "1") {
+    const pushDemo = () => {
+      for (const s of sessions.values()) {
+        const text =
+          "**markdown 渲染验证**：这条消息由 mock host 主动推送。\n\n" +
+          "- 列表项 A\n" +
+          "- 列表项 B\n\n" +
+          "```\n代码块\n```\n";
+        link.send(msg("event", { topic: "assistant.delta", data: { sessionId: s.sessionId, text } }));
+      }
+    };
+    setTimeout(pushDemo, 3_000);
+    setInterval(pushDemo, 20_000);
+  }
 
   /** v1.0.7（§5.9）：广播归档全集（对应宿主的 domain/changed 触发）。 */
   const broadcastArchives = () => {
@@ -455,6 +511,22 @@ export function createMockHost(deps) {
         applyModel(s, selection);
         return link.send(resultOf(m, { model: { ...selection } }));
       }
+      case "session.queue": {
+        // v1.1.2（§5.1）：拉取该会话**当前**待执行消息的全量快照（断线重连补状态）
+        const sessionId = typeof p.sessionId === "string" ? p.sessionId : "";
+        if (sessionId === "") return link.send(errorOf(m, "bad-params", "sessionId required"));
+        const s = sessions.get(sessionId);
+        if (!s) return link.send(errorOf(m, "not-found", "session not found"));
+        return link.send(resultOf(m, { sessionId, items: Array.isArray(s.queue) ? s.queue : [] }));
+      }
+      case "session.subagents": {
+        // v1.0.5（§5.6）：父会话的直接子代理目录
+        const sessionId = typeof p.sessionId === "string" ? p.sessionId : "";
+        if (sessionId === "") return link.send(errorOf(m, "bad-params", "sessionId required"));
+        const s = sessions.get(sessionId);
+        if (!s) return link.send(errorOf(m, "not-found", "session not found"));
+        return link.send(resultOf(m, { subagents: Array.isArray(s.subagents) ? s.subagents : [] }));
+      }
       case "session.model": {
         // v1.0.8：查询会话当前模型/思考强度（没有则 null）
         const sessionId = typeof p.sessionId === "string" ? p.sessionId : "";
@@ -462,6 +534,28 @@ export function createMockHost(deps) {
         const s = sessions.get(sessionId);
         if (!s) return link.send(errorOf(m, "not-found", "session not found"));
         return link.send(resultOf(m, { model: s.model ? { ...s.model } : null }));
+      }
+      case "session.permission": {
+        // 契约 §5.8：查询会话有效当前权限（无则 null）
+        const sessionId = typeof p.sessionId === "string" ? p.sessionId : "";
+        if (sessionId === "") return link.send(errorOf(m, "bad-params", "sessionId required"));
+        const s = sessions.get(sessionId);
+        if (!s) return link.send(errorOf(m, "not-found", "session not found"));
+        return link.send(resultOf(m, { permission: typeof s.permission === "string" ? s.permission : null }));
+      }
+      case "session.selectPermission": {
+        // 契约 §5.8：提交权限选择 → 广播 session.permissionChanged（客户端据此刷新显示）
+        const sessionId = typeof p.sessionId === "string" ? p.sessionId : "";
+        if (sessionId === "") return link.send(errorOf(m, "bad-params", "sessionId required"));
+        const s = sessions.get(sessionId);
+        if (!s) return link.send(errorOf(m, "not-found", "session not found"));
+        const permission = typeof p.permission === "string" ? p.permission : "";
+        if (!MOCK_PERMISSIONS.some((x) => x.id === permission)) {
+          return link.send(errorOf(m, "bad-params", `invalid permission: ${permission}`));
+        }
+        s.permission = permission;
+        link.send(msg("event", { topic: "session.permissionChanged", data: { sessionId, permission } }));
+        return link.send(resultOf(m, { permission }));
       }
       case "session.archive": {
         const sessionId = typeof p.sessionId === "string" ? p.sessionId : "";
@@ -532,7 +626,7 @@ export function createMockHost(deps) {
           stagedAttachments.delete(uploadId);
           consumedUploads.add(uploadId);
         }
-        link.send(resultOf(m, { accepted: true }));
+        if (!MOCK_PROMPT_RESULT_LAST) link.send(resultOf(m, { accepted: true }));
         s.running = true;
         link.send(msg("event", { topic: "session.status", data: { sessionId: s.sessionId, running: true } }));
         // 用户输入进历史（正文 + 图片/文件附件块）
@@ -569,11 +663,18 @@ export function createMockHost(deps) {
           }),
         );
         // 流式回复
-        const reply = `已收到：「${promptText.trim() !== "" ? promptText : "（附件）"}」。这是 mock-host 的流式回复。`;
+        // 流式回复（带 markdown 语法：给各端验证 markdown 渲染用）
+        const reply =
+          `已收到：**${promptText.trim() !== "" ? promptText : "（附件）"}**。\n\n` +
+          `- 这是 mock-host 的流式回复\n` +
+          `- 用于验证 **markdown** 渲染\n\n` +
+          "```\n代码块走同一套渲染\n```";
         for (const ch of reply.match(/.{1,8}/g) ?? []) {
           link.send(msg("event", { topic: "assistant.delta", data: { sessionId: s.sessionId, text: ch } }));
           await new Promise((r) => setTimeout(r, 60));
         }
+        // MOCK_PROMPT_RESULT_LAST=1：accepted 回包挪到流式回复之后（复现插件端的真实顺序）
+        if (MOCK_PROMPT_RESULT_LAST) link.send(resultOf(m, { accepted: true }));
         // 历史里带一条 reasoning 块（§5.3：独立成 role:"reasoning" 的消息）
         record(s, "assistant/message", {
           turn: 1,

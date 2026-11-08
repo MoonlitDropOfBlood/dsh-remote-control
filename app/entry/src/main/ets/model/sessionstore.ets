@@ -33,6 +33,7 @@ import {
   DshrcLiveText
 } from './timeline-reconcile';
 import { AttachmentCaps, normalizeAttachmentCaps } from './attachment-plan';
+import { DraftAttachment } from './attachments';
 import {
   DshrcMsg,
   DshrcPayload,
@@ -437,6 +438,16 @@ class HistMeta {
   oldestSeq: number = 0; // 已加载的最老 durable seq（向前翻页的 beforeSeq）
 }
 
+/**
+ * 新建会话首发失败时跨页面移交的草稿。
+ * 会话已经创建成功，不能再次 create；文字、附件及已 commit 的 uploadId 一起带到详情页重试。
+ */
+export interface FirstPromptDraft {
+  sessionId: string;
+  text: string;
+  attachments: DraftAttachment[];
+}
+
 /** 推送点击待导航目标（契约 §6：intent 携带 sessionId / askId）。 */
 export interface PendingNav {
   sessionId: string;
@@ -506,6 +517,9 @@ export class SessionStore {
   private pendingHistory: Map<string, boolean> = new Map<string, boolean>();
   @Trace historyHasMore: boolean = false;
   @Trace historyLoaded: boolean = false;
+  /** 历史错误归属具体会话，只在详情页展示；不能写进首页全局 lastError。 */
+  @Trace historyErrorSessionId: string = '';
+  @Trace historyErrorMessage: string = '';
   // ---- 子代理目录（契约 §5.6 v1.0.5；活动会话投影 + 每父会话缓存）----
   @Trace activeSubagents: SubagentRow[] = [];
   // ---- 待执行消息（契约 §5.2 v1.1.1 session.queue）----
@@ -576,6 +590,8 @@ export class SessionStore {
   private chatSeq: number = 0;
   /** 在途刷新（并发刷新合并到同一个 Promise，v1.0.6：不再直接 resolve 假装已刷新）。 */
   private pendingRefresh: Promise<SessionRefreshResult> | null = null;
+  /** 新建页 → 详情页的一次性首发草稿（只在 create 成功、prompt 未接受时使用）。 */
+  private firstPromptDraft: FirstPromptDraft | null = null;
 
   private constructor() {
     this.link.onState = (s: LinkState): void => {
@@ -635,6 +651,8 @@ export class SessionStore {
     }
     if (s === 'stopped' || s === 'idle') {
       this.pendingHistory.clear();
+      this.historyErrorSessionId = '';
+      this.historyErrorMessage = '';
       // 断开/切换远程：清掉当前会话的投影，避免展示上一台主机的时间线
       this.activeId = '';
       this.applyTimeline([]);
@@ -1152,8 +1170,52 @@ export class SessionStore {
     return this.findRow(sid);
   }
 
+  /**
+   * 保存新建会话的首发失败草稿（契约 §5.11：先建会话，再上传，再 prompt）。
+   * 只保存一份待移交草稿；附件字节仍由 attachments.ets 的模块级缓存持有，不进状态树。
+   */
+  stashFirstPromptDraft(sid: string, text: string, attachments: DraftAttachment[]): void {
+    const draft: FirstPromptDraft = {
+      sessionId: sid,
+      text: text,
+      attachments: attachments.slice()
+    };
+    this.firstPromptDraft = draft;
+  }
+
+  /** 详情页按 sessionId 取走首发草稿；一次性消费，避免返回页面时重复覆盖用户的新输入。 */
+  takeFirstPromptDraft(sid: string): FirstPromptDraft | null {
+    const draft: FirstPromptDraft | null = this.firstPromptDraft;
+    if (draft === null || draft.sessionId !== sid) {
+      return null;
+    }
+    this.firstPromptDraft = null;
+    return draft;
+  }
+
+  /** 详情页只读自己 sessionId 的历史错误，避免串到首页或其他会话。 */
+  historyErrorFor(sid: string): string {
+    return this.historyErrorSessionId === sid ? this.historyErrorMessage : '';
+  }
+
+  private setHistoryError(sid: string, message: string): void {
+    if (message.length === 0) {
+      if (this.historyErrorSessionId === sid) {
+        this.historyErrorSessionId = '';
+        this.historyErrorMessage = '';
+      }
+      return;
+    }
+    this.historyErrorSessionId = sid;
+    this.historyErrorMessage = message;
+  }
+
   loadHistory(sid: string, prepend: boolean): Promise<void> {
-    if (sid.length === 0 || this.link.getState() !== 'online') {
+    if (sid.length === 0) {
+      return Promise.resolve();
+    }
+    if (this.link.getState() !== 'online') {
+      this.setHistoryError(sid, '加载历史失败：未连接主机');
       return Promise.resolve();
     }
     if (this.historyLoading) {
@@ -1167,6 +1229,7 @@ export class SessionStore {
     if (prepend && !meta.hasMore) {
       return Promise.resolve();
     }
+    this.setHistoryError(sid, '');
     this.historyLoading = true;
     const before: number | undefined = prepend ? meta.oldestSeq : undefined;
     return this.link.sessionHistory(sid, before).then((page: DshrcHistoryPage): void => {
@@ -1180,12 +1243,14 @@ export class SessionStore {
         this.historyHasMore = meta.hasMore;
         this.historyLoaded = true;
       }
+      this.setHistoryError(sid, '');
       this.historyLoading = false;
       this.runNextHistory();
     }).catch((e: Error): void => {
       this.historyLoading = false;
-      this.lastError = '加载历史失败：' + e.message;
-      logDshrc(TAG, 'warn', 'session.history failed: ' + e.message);
+      const msg: string = e.message.length > 0 ? e.message : '未知错误';
+      this.setHistoryError(sid, '加载历史失败：' + msg);
+      logDshrc(TAG, 'warn', 'session.history failed: ' + msg);
       this.runNextHistory();
     });
   }

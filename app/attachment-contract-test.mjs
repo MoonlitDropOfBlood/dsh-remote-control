@@ -213,6 +213,7 @@ const link = read('./entry/src/main/ets/model/link.ets');
 const store = read('./entry/src/main/ets/model/sessionstore.ets');
 const attachments = read('./entry/src/main/ets/model/attachments.ets');
 const page = read('./entry/src/main/ets/pages/SessionDetailPage.ets');
+const newPage = read('./entry/src/main/ets/pages/NewSessionPage.ets');
 const timeline = read('./entry/src/main/ets/pages/TimelineView.ets');
 
 // protocol：版本 + 四个请求 + 类型
@@ -292,6 +293,29 @@ assert.match(page, /if \(this\.sessionId === sid\) \{[\s\S]{0,200}this\.attachme
   '异步完成只清本会话的草稿与附件');
 assert.doesNotMatch(page, /ForEach\(/, 'V2：列表必须 Repeat，禁 ForEach');
 assert.doesNotMatch(page, /\[文件\]/, 'App 不再为文件块写「[文件]」占位（附件由 files[] 渲染）');
+
+// 新建页：先 create 得 sessionId，再上传，再带 uploads 首发；失败草稿移交详情页。
+assert.match(newPage, /private attachmentEntryVisible\(\): boolean \{[\s\S]{0,120}attachmentsSupported\(\)/,
+  '新建页只在宿主支持时显示附件入口');
+assert.match(newPage, /value: '图片'[\s\S]{0,160}value: '文件'/, '新建页附件菜单两项：图片 / 文件');
+assert.match(newPage, /checkNewAttachment\(this\.attachments, item, caps\)/, '新建页加入 chip 前必须过上限校验');
+assert.match(newPage, /prompt\.length === 0 && items\.length === 0/, '新建页允许附件-only，不能只校验正文');
+assert.match(newPage, /\.enabled\(this\.canCreate\(\)\)/, '创建按钮必须支持附件-only');
+assert.match(newPage, /await this\.sendFirstPrompt\(res\.sessionId, prompt, items\)/,
+  '必须先 create 成功，再把新 sessionId 交给首发上传编排');
+const newUploadAt = newPage.indexOf('await this.uploadAllAttachments(sid, items, caps)');
+const newPromptAt = newPage.indexOf('await dshrcLink.sessionPromptResult(sid, text, uploadIds)');
+assert.ok(newUploadAt >= 0 && newPromptAt > newUploadAt, '新建页必须先 commit 全部附件再发 prompt.uploads');
+const firstPromptBody = newPage.slice(newPage.indexOf('private async sendFirstPrompt('), newPage.indexOf('private failFirstPrompt('));
+assert.doesNotMatch(firstPromptBody, /sessionCreate\(/, '首发上传/prompt 失败不得重复 create');
+assert.match(newPage, /this\.store\.stashFirstPromptDraft\(sid, text, items\)/,
+  '首发失败必须移交文字、附件和已 commit uploadId');
+assert.match(store, /stashFirstPromptDraft\(sid: string, text: string, attachments: DraftAttachment\[\]\): void/);
+assert.match(store, /takeFirstPromptDraft\(sid: string\): FirstPromptDraft \| null/);
+assert.match(page, /private restoreFirstPromptDraft\(\): void \{[\s\S]{0,240}takeFirstPromptDraft\(this\.sessionId\)/,
+  '详情页必须恢复新建页移交的首发草稿');
+assert.match(page, /this\.attachments = draft\.attachments;/, '详情页必须恢复附件而非只恢复文字');
+assert.doesNotMatch(newPage, /ForEach\(/, '新建页 V2 列表同样必须 Repeat');
 
 // timeline：文件卡片 + 纯附件不画空气泡 + 本地图片不可点开大图
 assert.match(timeline, /struct MessageFiles \{/);

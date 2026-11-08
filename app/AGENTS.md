@@ -423,3 +423,23 @@ List {
 
 - `node process-activity-contract-test.mjs`（分类/文案/标题合成/思考摘要/运行细节）
 - 既有 `attachment-contract-test` / `session-detail-contract-test` / `live-order-node-test` 不得回归。
+
+## 2026-11-08：新建会话首发附件（协议不变）
+
+- `NewSessionPage` 与详情页一样提供「图片 / 文件」选择、上限校验、附件 chips 与逐项上传进度；
+  正文可空，**附件-only 也能创建并发送**。
+- 线协议仍是 v1.2.0，**不给 `session.create` 增加附件字段**：先 `session.create` 拿到新 sessionId，
+  再按 §5.11 串行 `attachment.upload.*`，最后 `session.prompt.uploads[]`。
+- 只有 prompt accepted 才清空并释放本地附件。create 成功但上传/prompt 失败时，
+  `SessionStore.stashFirstPromptDraft` 把正文、附件与已 commit 的 uploadId 一次性移交详情页；
+  `SessionDetailPage.restoreFirstPromptDraft` 恢复后重试，**不得重复 create 或重复上传**。
+  新建页移交时只清空本页引用、不释放字节；详情页接手发送成功/删除/退出时的原有释放生命周期。
+- 回归：`node attachment-contract-test.mjs` 新增新建页顺序、附件-only、失败移交与禁止重复 create 的接线断言。
+
+## 2026-11-08：历史错误归属详情页（协议不变）
+
+- `session.history` 失败**不得再写首页全局 `lastError`**：SessionStore 用
+  `historyErrorSessionId/historyErrorMessage` 记录会话归属，详情页通过 `historyErrorFor(sessionId)`
+  读取自己的完整错误原因，并提供「重新加载」；首页不再截断或抢走这类错误。
+- 开始/成功加载会清除该会话旧错误，断开或切换远程时清空，避免跨主机串错。
+- 回归：`node session-detail-contract-test.mjs` 包含历史错误归属、详情卡与重试接线断言。

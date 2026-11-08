@@ -179,6 +179,17 @@ function assistantImageEvent(seq = 1, attachmentId = "att-1") {
   };
 }
 
+/** 一条纯文本 assistant 消息事件。 */
+function assistantTextEvent(seq, text) {
+  return {
+    type: "assistant/message",
+    seq,
+    time: 1000 + seq,
+    surfaceOp: "append",
+    data: { message: { role: "assistant", content: [{ type: "text", text }] } },
+  };
+}
+
 /** 取最后一条 result 回包。 */
 function lastResult(sent, id) {
   for (let i = sent.length - 1; i >= 0; i--) {
@@ -614,6 +625,117 @@ setSharpResolver(null);
     0,
   );
   check("多图历史：缩略图总量受页预算约束", thumbs <= 10 && replyBytes <= REPLY_PLAIN_MAX_BYTES, `${thumbs} 张缩略图`);
+}
+
+// ===========================================================================
+// 历史大文本页：剥完图片仍超帧时自动减半，并重读 / 重映射 / 重建完整回包
+// ===========================================================================
+{
+  const text = "X".repeat(20_000); // 50 条超 640KB，25 条能装进预算
+  const historyEvents = Array.from({ length: 60 }, (_, i) => assistantTextEvent(i + 1, `${i + 1}:${text}`));
+  const readPage = (request) => {
+    const beforeSeq = Number.isSafeInteger(request?.beforeSeq) ? request.beforeSeq : Number.MAX_SAFE_INTEGER;
+    const throughSeq = Number.isSafeInteger(request?.throughSeq) ? request.throughSeq : Number.MAX_SAFE_INTEGER;
+    const eligible = historyEvents.filter((event) => event.seq < beforeSeq && event.seq <= throughSeq);
+    const selected = eligible.slice(-(request?.maxMessages ?? 50));
+    return {
+      records: selected.map((event) => ({ event })),
+      hasMore: eligible.length > selected.length,
+    };
+  };
+
+  for (const mode of ["events", "page"]) {
+    const calls = [];
+    const sc = mode === "events"
+      ? {
+          async events(request) {
+            calls.push({ ...request });
+            return readPage(request);
+          },
+        }
+      : {
+          async inspect() {
+            return { events: historyEvents };
+          },
+          async page(request) {
+            calls.push({ ...request });
+            return readPage(request);
+          },
+        };
+    const ctx = makeCtx({ sessionController: sc });
+    const relay = makeRelay();
+    const bridge = new HostBridge({
+      ctx,
+      relay,
+      push: { configured: false, notify: async () => ({ ok: true }) },
+      config: CFG,
+      log,
+    });
+    bridge.attach();
+
+    const firstId = `req-hist-shrink-${mode}`;
+    await bridge.dispatch({ id: firstId, type: "session.history", ts: Date.now(), payload: { sessionId: "sess-shrink" } });
+    const first = lastResult(relay.sent, firstId);
+    const firstMessages = first?.value?.messages ?? [];
+    check(`历史自动缩页（${mode}）：大文本页默认 50→25 后成功`,
+      first?.error === undefined && firstMessages.length === 25, JSON.stringify(first?.error ?? firstMessages.length));
+    check(`历史自动缩页（${mode}）：返回实际成功的最新 25 条`,
+      firstMessages[0]?.seq === 36 && firstMessages[24]?.seq === 60,
+      JSON.stringify(firstMessages.map((message) => message?.seq)));
+    check(`历史自动缩页（${mode}）：hasMore/oldestSeq 属于成功页`,
+      first?.value?.hasMore === true && first?.value?.oldestSeq === 36,
+      JSON.stringify({ hasMore: first?.value?.hasMore, oldestSeq: first?.value?.oldestSeq }));
+    check(`历史自动缩页（${mode}）：宿主请求条数确实从 50 减到 25`,
+      calls.length === 2 && calls.map((call) => call.maxMessages).join(",") === "50,25",
+      JSON.stringify(calls.map((call) => call.maxMessages)));
+
+    const olderId = `req-hist-shrink-older-${mode}`;
+    await bridge.dispatch({
+      id: olderId,
+      type: "session.history",
+      ts: Date.now(),
+      payload: { sessionId: "sess-shrink", beforeSeq: first?.value?.oldestSeq },
+    });
+    const older = lastResult(relay.sent, olderId);
+    const olderMessages = older?.value?.messages ?? [];
+    check(`历史自动缩页（${mode}）：重试全程保留 beforeSeq 游标`,
+      calls.length === 4 && calls.slice(2).every((call) => call.beforeSeq === 36)
+        && calls.slice(2).map((call) => call.maxMessages).join(",") === "50,25",
+      JSON.stringify(calls.slice(2)));
+    check(`历史自动缩页（${mode}）：更早页游标仍按成功页返回`,
+      older?.error === undefined && olderMessages.length === 25
+        && olderMessages[0]?.seq === 11 && olderMessages[24]?.seq === 35
+        && older?.value?.oldestSeq === 11 && older?.value?.hasMore === true,
+      JSON.stringify({ error: older?.error, oldestSeq: older?.value?.oldestSeq, hasMore: older?.value?.hasMore }));
+    bridge.dispose();
+  }
+
+  // 单条消息本身就超过预算：一路减半到 1 后才保留 history-too-large。
+  const singleCalls = [];
+  const singleEvent = assistantTextEvent(1, "Z".repeat(REPLY_PLAIN_MAX_BYTES + 1000));
+  const singleSc = {
+    async events(request) {
+      singleCalls.push(request.maxMessages);
+      return { records: [{ event: singleEvent }], hasMore: false };
+    },
+  };
+  const singleCtx = makeCtx({ sessionController: singleSc });
+  const singleRelay = makeRelay();
+  const singleBridge = new HostBridge({
+    ctx: singleCtx,
+    relay: singleRelay,
+    push: { configured: false, notify: async () => ({ ok: true }) },
+    config: CFG,
+    log,
+  });
+  singleBridge.attach();
+  await singleBridge.dispatch({ id: "req-hist-single-huge", type: "session.history", ts: Date.now(), payload: { sessionId: "sess-single-huge" } });
+  const single = lastResult(singleRelay.sent, "req-hist-single-huge");
+  check("历史自动缩页：单条仍超帧才回 history-too-large",
+    single?.error?.code === "history-too-large", JSON.stringify(single));
+  check("历史自动缩页：单条超限前已逐次减半到 maxMessages=1",
+    singleCalls.join(",") === "50,25,12,6,3,1", JSON.stringify(singleCalls));
+  singleBridge.dispose();
 }
 
 // ---------------------------------------------------------------------------
@@ -1094,6 +1216,54 @@ setSharpResolver(null);
   check("交付物图片：空会话历史里也带独立图片消息",
     emptyMsgs.length === 1 && emptyMsgs[0]?.text === "" && (emptyMsgs[0]?.images ?? []).length === 1,
     JSON.stringify(emptyMsgs.map((m) => m?.id)));
+
+  // 第一轮 fit 会就地删掉已追加的交付物 images[]；自动缩页重试必须重新生成它们，
+  // 不能把这个被破坏的对象复用到第二轮，否则成功页会永久丢图。
+  const retryEvents = Array.from({ length: 60 }, (_, i) => assistantTextEvent(i + 1, "Y".repeat(20_000)));
+  const retryCalls = [];
+  const retrySc = {
+    async inspect() {
+      return { events: retryEvents };
+    },
+    async page(request) {
+      retryCalls.push(request.maxMessages);
+      const selected = retryEvents.slice(-request.maxMessages);
+      return {
+        records: selected.map((event) => ({ event })),
+        hasMore: retryEvents.length > selected.length,
+      };
+    },
+  };
+  const retryCtx = makeCtx({ sessionController: retrySc });
+  const retryRelay = makeRelay();
+  const retryBridge = new HostBridge({
+    ctx: retryCtx,
+    relay: retryRelay,
+    push: { configured: false, notify: async () => ({ ok: true }) },
+    config: CFG,
+    log,
+  });
+  retryBridge.attach();
+  retryCtx.emit("session/event", { id: "sess-hist-retry" }, {
+    type: "deliverables/presented",
+    seq: 90,
+    time: 9000,
+    data: { turn: 9, callId: "call-retry", files: [{ path: pngPath, name: "shot.png" }] },
+  });
+  await new Promise((r) => setTimeout(r, 150));
+  await retryBridge.dispatch({ id: "req-hist-retry-delivered", type: "session.history", ts: Date.now(), payload: { sessionId: "sess-hist-retry" } });
+  const retryHist = lastResult(retryRelay.sent, "req-hist-retry-delivered");
+  const retryMessages = retryHist?.value?.messages ?? [];
+  const retryDelivered = retryMessages[25];
+  check("交付物图片：大文本页自动缩页后仍保留独立交付物消息",
+    retryHist?.error === undefined && retryMessages.length === 26
+      && retryCalls.join(",") === "50,25",
+    JSON.stringify({ error: retryHist?.error, messages: retryMessages.length, calls: retryCalls }));
+  check("交付物图片：缩页重试重建 images[] 和缩略图（不受上轮 fit 破坏）",
+    retryDelivered?.images?.[0]?.source === "deliverable"
+      && String(retryDelivered?.images?.[0]?.thumb ?? "").startsWith("data:image/jpeg;base64,"),
+    JSON.stringify(retryDelivered));
+  retryBridge.dispose();
   rmSync(dir, { recursive: true, force: true });
 
   // 附件来源的图片**不带** source 字段（只有交付物图片带）

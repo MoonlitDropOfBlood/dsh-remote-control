@@ -45,6 +45,7 @@ import { AttachmentCaps, AttachmentCheck, formatAttachmentSize } from '../model/
 import { SessionDetailParam, goBack, openSessionDetail } from '../model/routes';
 import {
   ApprovalCard,
+  FirstPromptDraft,
   QuestionCard,
   SessionRow,
   SessionStore,
@@ -257,6 +258,7 @@ export struct SessionDetailPage {
     this.readRouteParams();
     if (this.sessionId.length > 0) {
       this.store.openSession(this.sessionId);
+      this.restoreFirstPromptDraft();
       // 契约 §5.1 v1.0.4：先拉最新一页历史消息（修复打开历史会话空白）
       this.store.loadHistory(this.sessionId, false);
       // 契约 §5.1 v1.0.8：拉会话当前模型 / 思考强度（静默，失败不打扰时间线）
@@ -278,6 +280,7 @@ export struct SessionDetailPage {
           this.readRouteParams();
           if (this.sessionId.length > 0) {
             this.store.openSession(this.sessionId);
+            this.restoreFirstPromptDraft();
             this.store.loadHistory(this.sessionId, false);
             this.store.loadSessionModel(this.sessionId);
             this.store.loadSessionPermission(this.sessionId);
@@ -575,6 +578,19 @@ export struct SessionDetailPage {
     });
     this.followBottom = true;
     this.scrollToBottom();
+  }
+
+  /**
+   * 恢复新建会话首发失败的草稿（契约 §5.11：create 已成功，绝不重复创建）。
+   * 已 commit 的 uploadId 随 DraftAttachment 一起恢复，重试只会复用，不会重复上传。
+   */
+  private restoreFirstPromptDraft(): void {
+    const draft: FirstPromptDraft | null = this.store.takeFirstPromptDraft(this.sessionId);
+    if (draft === null) {
+      return;
+    }
+    this.draft = draft.text;
+    this.attachments = draft.attachments;
   }
 
   /** 从 hrouter 路由上下文读取 sessionId（幂等）。 */
@@ -1814,10 +1830,46 @@ export struct SessionDetailPage {
     .padding({ top: 48, bottom: 48 })
   }
 
+  /** 当前详情页自己的历史错误；其他会话或全局链路错误不抢这里的展示。 */
+  private historyErrorText(): string {
+    return this.store.historyErrorFor(this.sessionId);
+  }
+
+  @Builder
+  historyErrorCard() {
+    Column({ space: SP_2 }) {
+      Text(this.historyErrorText())
+        .fontSize(FS_SMALL)
+        .fontColor($r('app.color.state_error'))
+        .width('100%')
+      Row() {
+        Button('重新加载')
+          .height(32)
+          .fontSize(FS_CAPTION)
+          .fontColor($r('app.color.state_error'))
+          .backgroundColor($r('app.color.bg_layer_1'))
+          .borderRadius(RADIUS_CTRL)
+          .enabled(!this.store.historyLoading)
+          .onClick((): void => {
+            this.store.loadHistory(this.sessionId, false);
+          })
+      }
+      .width('100%')
+      .justifyContent(FlexAlign.End)
+    }
+    .width('100%')
+    .alignItems(HorizontalAlign.Start)
+    .padding({ left: SP_3, right: SP_3, top: SP_2, bottom: SP_2 })
+    .backgroundColor($r('app.color.state_error_tint'))
+  }
+
   build() {
     // NavDestination 外壳由 hrouter-compiler 生成的 wrapper 提供。
     Column() {
       this.topBar()
+      if (this.historyErrorText().length > 0) {
+        this.historyErrorCard()
+      }
       if (this.store.activeSubagents.length > 0) {
         this.subagentBar()
       }

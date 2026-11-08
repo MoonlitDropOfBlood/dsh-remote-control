@@ -2048,61 +2048,76 @@ export class HostBridge {
     const signal = this.#signal(30_000);
     try {
       const sc = this.#sc();
-      // v1.1.1（§5.10.2）：交付物图片作为**独立**的历史消息（两条回包路径都要带上）
-      const delivered = await this.#deliveredHistoryMessages(sessionId);
-      const page = await this.#readHistoryPage(sc, sessionId, maxMessages, beforeSeq, signal);
-      const messages = [];
-      let oldestSeq = Number.MAX_SAFE_INTEGER;
-      let oldestEventSeq = Number.MAX_SAFE_INTEGER;
-      for (const record of page?.records ?? []) {
-        const rawSeq = Number(record?.event?.seq);
-        if (Number.isSafeInteger(rawSeq) && rawSeq >= 0 && rawSeq < oldestEventSeq) {
-          oldestEventSeq = rawSeq;
+      while (true) {
+        // 每轮都重建完整回包：fitReplyBudget 会就地剥缩略图 / 删 images[]，
+        // 尤其不能把上一轮已追加的交付物图片对象带进下一次重试。
+        const delivered = await this.#deliveredHistoryMessages(sessionId);
+        const page = await this.#readHistoryPage(sc, sessionId, maxMessages, beforeSeq, signal);
+        const messages = [];
+        let oldestSeq = Number.MAX_SAFE_INTEGER;
+        let oldestEventSeq = Number.MAX_SAFE_INTEGER;
+        for (const record of page?.records ?? []) {
+          const rawSeq = Number(record?.event?.seq);
+          if (Number.isSafeInteger(rawSeq) && rawSeq >= 0 && rawSeq < oldestEventSeq) {
+            oldestEventSeq = rawSeq;
+          }
+          // v1.0.7：一条事件可能产出「思考 + 正文」两条（mapHistoryMessages）
+          for (const mapped of mapHistoryMessages(sessionId, record)) {
+            messages.push(mapped);
+            // v1.0.9（§5.10）：记下 imageId → 附件引用（image.fetch 要用原始字节）
+            this.#rememberImages(mapped.images);
+            if (mapped.seq < oldestSeq) oldestSeq = mapped.seq;
+          }
         }
-        // v1.0.7：一条事件可能产出「思考 + 正文」两条（mapHistoryMessages）
-        for (const mapped of mapHistoryMessages(sessionId, record)) {
-          messages.push(mapped);
-          // v1.0.9（§5.10）：记下 imageId → 附件引用（image.fetch 要用原始字节）
-          this.#rememberImages(mapped.images);
-          if (mapped.seq < oldestSeq) oldestSeq = mapped.seq;
+        if (oldestSeq === Number.MAX_SAFE_INTEGER) {
+          // 本页无可聊消息（全被过滤）→ 用页内最老事件 seq 续翻，避免卡页
+          oldestSeq = oldestEventSeq === Number.MAX_SAFE_INTEGER ? 0 : oldestEventSeq;
         }
-      }
-      if (oldestSeq === Number.MAX_SAFE_INTEGER) {
-        // 本页无可聊消息（全被过滤）→ 用页内最老事件 seq 续翻，避免卡页
-        oldestSeq = oldestEventSeq === Number.MAX_SAFE_INTEGER ? 0 : oldestEventSeq;
-      }
-      // v1.0.9（§5.10）：缩略图必须内联（客户端立刻显示）——这里补齐
-      await attachThumbs(messages, this.#ctx);
-      // v1.1.1（§5.10.2）：交付物图片作为**独立**的历史消息追加进去
-      // （宿主的持久副本里没有它们 → 不补的话图片「一闪而过然后消失」）。
-      messages.push(...delivered);
-      // v1.0.6（§5.7）：工作步骤（工具调用）——旧客户端只读 messages，不受影响
-      const steps = mapHistorySteps(page?.records ?? []);
-      // v1.0.9：帧预算守卫——中继的 1MiB 是 **ws 单帧**上限，超了 ws 直接断链
-      //（不是丢一帧）。先剥缩略图、再丢 images[]；实在装不下（只剩文字就超了）
-      // → 回 error，宁可这一页失败也不能把整条链路顶爆。
-      const value = { messages, steps, hasMore: page?.hasMore === true, oldestSeq };
-      const fit = fitReplyBudget(value);
-      if (fit.strippedThumbs > 0 || fit.strippedImages > 0) {
-        this.#log("warn", "history reply trimmed to fit the relay frame budget", {
+        // v1.0.9（§5.10）：缩略图必须内联（客户端立刻显示）——这里补齐
+        await attachThumbs(messages, this.#ctx);
+        // v1.1.1（§5.10.2）：交付物图片作为**独立**的历史消息追加进去
+        // （宿主的持久副本里没有它们 → 不补的话图片「一闪而过然后消失」）。
+        messages.push(...delivered);
+        // v1.0.6（§5.7）：工作步骤（工具调用）——旧客户端只读 messages，不受影响
+        const steps = mapHistorySteps(page?.records ?? []);
+        // v1.0.9：帧预算守卫——中继的 1MiB 是 **ws 单帧**上限，超了 ws 直接断链
+        // （不是丢一帧）。先剥缩略图、再丢 images[]；只剩文字仍超限时自动减半
+        // 页大小并重读。只有单条消息仍装不下时才回 history-too-large。
+        const value = { messages, steps, hasMore: page?.hasMore === true, oldestSeq };
+        const fit = fitReplyBudget(value);
+        if (fit.strippedThumbs > 0 || fit.strippedImages > 0) {
+          this.#log("warn", "history reply trimmed to fit the relay frame budget", {
+            sessionId,
+            strippedThumbs: fit.strippedThumbs,
+            strippedImages: fit.strippedImages,
+            bytes: fit.bytes,
+          });
+        }
+        if (!fit.overflow) {
+          // 游标必须属于实际成功的这一页，而不是首次超限的大页。
+          this.#reply(m, resultOf(m, fit.value));
+          return;
+        }
+        if (maxMessages <= 1) {
+          this.#reply(
+            m,
+            errorOf(
+              m,
+              "history-too-large",
+              "这一页会话内容过大，无法在一帧内传输（请缩小每页条数后重试）。",
+            ),
+          );
+          return;
+        }
+        const retryMaxMessages = Math.max(1, Math.floor(maxMessages / 2));
+        this.#log("warn", "history reply still too large; retrying with fewer messages", {
           sessionId,
-          strippedThumbs: fit.strippedThumbs,
-          strippedImages: fit.strippedImages,
+          maxMessages,
+          retryMaxMessages,
           bytes: fit.bytes,
         });
+        maxMessages = retryMaxMessages;
       }
-      if (fit.overflow) {
-        this.#reply(
-          m,
-          errorOf(
-            m,
-            "history-too-large",
-            "这一页会话内容过大，无法在一帧内传输（请缩小每页条数后重试）。",
-          ),
-        );
-        return;
-      }
-      this.#reply(m, resultOf(m, fit.value));
     } catch (e) {
       this.#reply(m, errorOf(m, "session-history-failed", errText(e)));
     }

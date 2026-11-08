@@ -87,4 +87,15 @@ assert.match(askCards, /export struct QuestionRepeatCard \{[\s\S]*?@Require @Par
 assert.match(approvalQueue, /ApprovalRepeatCard\(\{\s+cell: cell,/);
 assert.match(approvalQueue, /QuestionRepeatCard\(\{\s+cell: cell,/);
 
-console.log('session-detail-contract-test: permission + subagent + RepeatItem wiring assertions passed');
+// 历史错误归属详情页：保留完整 Host 原因，不能由首页全局横幅截断或抢走。
+assert.match(store, /@Trace historyErrorSessionId: string = ''/);
+assert.match(store, /@Trace historyErrorMessage: string = ''/);
+assert.match(store, /historyErrorFor\(sid: string\): string/);
+assert.match(store, /this\.setHistoryError\(sid, '加载历史失败：' \+ msg\)/);
+assert.doesNotMatch(store, /this\.lastError = '加载历史失败：'/);
+assert.match(page, /private historyErrorText\(\): string \{\s+return this\.store\.historyErrorFor\(this\.sessionId\);/);
+assert.match(page, /if \(this\.historyErrorText\(\)\.length > 0\) \{\s+this\.historyErrorCard\(\)/);
+assert.match(page, /Text\(this\.historyErrorText\(\)\)/);
+assert.match(page, /Button\('重新加载'\)[\s\S]*?this\.store\.loadHistory\(this\.sessionId, false\)/);
+
+console.log('session-detail-contract-test: permission + subagent + history error + RepeatItem wiring assertions passed');

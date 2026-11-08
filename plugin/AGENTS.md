@@ -35,7 +35,7 @@ node --check index.js client.js typert.host.js lib/*.mjs scripts/*.mjs   # 语�
 node -e "import('./lib/protocol.mjs').then(m=>m.assertKat())"           # KAT
 node scripts/verify-qr.mjs && node scripts/verify-pairing.mjs           # QR/配对 API 回归（需 devDependencies）
 node scripts/verify-steps.mjs                                          # 步骤/模式/权限/归档/模型/思考/强度 + 图片/附件回归（无依赖，234 项）
-node scripts/verify-images.mjs                                         # 图片专项 + 交付物桥接 + 排队(session.queue)/宿主投递设置(busyEnter)：元数据映射/缩略图降级/image.fetch/帧预算守卫/交付物进历史/排队追踪（无依赖，154 项）
+node scripts/verify-images.mjs                                         # 图片专项 + 交付物桥接 + 排队(session.queue)/宿主投递设置(busyEnter)：元数据映射/缩略图降级/image.fetch/帧预算守卫/历史自动缩页/交付物进历史/排队追踪（无依赖，170 项）
 node scripts/verify-settings.mjs                                       # v1.1.x 设置页/manifest/combo/信封自检 + Host 真跑一遍 + 导航图标（151 项）
 node scripts/verify-relay-supervisor.mjs                               # v1.1.1 中继进程托管：决策/端口占用不抢/启停/看门狗/跨平台/bundle（无依赖，162 项）
 node scripts/verify-crypto.mjs                                          # v1.1.3 加密层/抗重放：KAT+AAD 两模式+sid 绑定+证明 v2+纪元单调性+接线层（无依赖，45 项）
@@ -207,9 +207,11 @@ node scripts/sync-client-icon.mjs                                      # 改了 
 - **帧预算守卫（v1.0.9 补）**：中继的 1MiB 是 **ws 单帧**上限，超了 ws 直接**断链**
   （不是丢一帧）！故回包发出去前一律过 `fitReplyBudget(value)`：
   明文 JSON 预算 `REPLY_PLAIN_MAX_BYTES` = 640KB（帧 ≈ 明文 ×4/3 ≈ 853KB < 1MiB）；
-  超了先**剥缩略图**（保留 imageId/尺寸元数据），再**丢整条 images[]**，
-  连文字都装不下时回 `history-too-large` error——宁可这一页失败也不能把链路顶爆。
-  `image.fetch` 回包同样过这道守卫（超了回 `image-too-large`）。
+  超了先**剥缩略图**（保留 imageId/尺寸元数据），再**丢整条 images[]**。
+  连文字都装不下时，`session.history` 会把 `maxMessages` **减半并完整重建页面重试**
+  （50→25→…→1；每轮重新 attachThumbs/追加交付物，避免上一轮剥图污染），成功页自己的
+  `hasMore/oldestSeq` 原样返回；**单条消息仍超限**才回 `history-too-large` error——宁可这一条失败，
+  也不能把链路顶爆。`image.fetch` 回包同样过这道守卫（超了回 `image-too-large`）。
 - **sharp 不在插件自己的 node_modules 里**（link 安装 + 依赖不打包）：用 `createRequire`
   从 **DSH 部署目录**（`<APPDATA>/DeepSeek Harness Desktop/dsh/node_modules/sharp`）动态解析；
   解析不到就**降级**（只发元数据、thumb 留空），**绝不抛异常崩掉插件**。

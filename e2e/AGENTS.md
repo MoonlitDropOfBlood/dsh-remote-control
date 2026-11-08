@@ -69,5 +69,12 @@ E2E_LOOPBACK_ONLY=1 node auto-test.mjs                              # 只跑回�
 - **LoopbackLink 的 seq 必须在 send 时刻定格**：连续多次 send 会把多帧排进微任务队列，
   投递时再读计数器会拿到更大的 seq → AAD 不匹配 → 整帧解密失败（已踩）。
 - mock-host 是 App 的联调靶子：文本含 "approve" 触发审批问答演示。
+- **mock host 拒绝对端证明 → 进程直接退出**：link.mjs 的致命错误（纪元回退
+  `epoch-regression` / 证明非法）按设计**不再重连**，事件循环随之空掉 → `node mock-host.mjs`
+  进程结束、宿主静默消失（联调现场表现为「宿主收到请求但一条不回」）。
+  触发条件：用**纪元更旧**的客户端连同一个 channel（例如另起一个 mock-phone 复用旧
+  channel，它会带着自己持久化的旧纪元连上来）。
+  → 换随机 channel，或删掉 `/tmp/dshrc-e2e-epoch-{host,client}-<channel>.json` 后重开；
+  看到「host 突然不回包」先查 mock host 进程是否还在。
 - auto-test.mjs 的 relay 地址优先取插件配置里的 `relayUrl`（argv 可覆盖）——
   本机中继常跑在 8788，硬编码 8787 会连不上。

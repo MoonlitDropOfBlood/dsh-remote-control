@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Copyright (c) 2026 dukedsh.
+  DSH Pocket for Android —— 网络安全策略（只放宽「明文 WebSocket」这一项，不放宽证书校验）。
+
+  为什么需要 cleartext：
+    仓库 AGENTS.md 全局约定 4「零公网部署是默认模式」——中继跑在用户自己的局域网 PC 上，
+    地址是 ws://<PC-IP>:<port>。Android 9+ 默认禁止明文流量，会让默认部署连不上，
+    所以这里显式允许 cleartext。
+
+  安全边界：
+    - 只影响 **传输层** 是否明文；业务载荷本身是 AES-256-GCM 端到端密文（契约 §7），
+      中继只见密文，读不到会话内容。
+    - 信任锚只用**系统 CA**，不接受用户安装的 CA（不做中间人调试放宽）。
+    - wss:// 走系统默认校验，行为不变。
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Copyright (c) 2026 dukedsh.
+  DSH Pocket for Android —— 新版备份 / 设备迁移规则（API 31+）。
+
+  与 backup_rules.xml 同口径：配对 secret / relayToken 只存本机，
+  云备份与设备迁移都不带走（契约 §3.5）。
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude
+            domain="file"
+            path="datastore" />
+        <exclude
+            domain="sharedpref"
+            path="." />
+    </cloud-backup>
+    <device-transfer>
+        <exclude
+            domain="file"
+            path="datastore" />
+        <exclude
+            domain="sharedpref"
+            path="." />
+    </device-transfer>
+</data-extraction-rules>

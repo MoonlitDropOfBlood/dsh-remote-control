@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Copyright (c) 2026 dukedsh.
+  DSH Pocket for Android —— 旧版备份规则（API ≤ 30，android:fullBackupContent）。
+
+  排除 DataStore 与 SharedPreferences：配对 secret / relayToken 只存本机、
+  绝不随云备份或设备迁移离开设备（契约 §3.5 与仓库 AGENTS.md 的「secret 只存本地」口径）。
+-->
+<full-backup-content>
+    <!-- DataStore Preferences：多远程档案（relayUrl / channel / secret / relayToken） -->
+    <exclude
+        domain="file"
+        path="datastore" />
+    <exclude
+        domain="sharedpref"
+        path="." />
+</full-backup-content>

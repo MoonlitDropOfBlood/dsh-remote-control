@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Copyright (c) 2026 dukedsh.
+  DSH Pocket for Android —— 字符串资源（应用名 / 通道名）。
+  业务文案在 Kotlin 侧与 HarmonyOS 版保持一致（中文），此处只放系统级文案。
+-->
+<resources>
+    <string name="app_name">DSH Pocket</string>
+    <!-- 扫码页面的相机权限说明（运行时弹窗用） -->
+    <string name="camera_permission_rationale">需要相机权限才能扫描 DSH 配对二维码。你也可以手动输入配对信息。</string>
+</resources>

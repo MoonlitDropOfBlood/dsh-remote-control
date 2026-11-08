@@ -9,12 +9,14 @@
 ┌─ plugin/ (DSH 插件, PC) ─┐  WSS   ┌─ relay/ (中继) ──┐  WSS   ┌─ app/ (HarmonyOS) ─┐
 │ 会话/审批桥接 + E2E 加密 │───────▶│  只转发密文     │◀───────│ 遥控器 UI          │
 └──────────┬──────────────┘  出站   └─────────────────┘  出站   └────────────────────┘
-           └── (可选) Push Kit ──────────────────────────────────────▶ 📱
+           │                              ▲                          ┌─ app-android/ (Android) ┐
+           └── (可选) Push Kit ──────────────────────────────────────▶│ 遥控器 UI（同一份契约）│
 ```
 
 - 两端都是 WS **客户端**（出站连接中继）→ 中继放局域网 PC（零公网部署）或 VPS 均可。
 - 全部业务数据 AES-256-GCM 端到端加密，中继只见密文（哑管道）。
 - **fail-open 原则**：手机永远不是任务的单点阻塞——审批超时/断线一律放行桌面答案器。
+- 手机端有两套实现（HarmonyOS ArkTS + Android Kotlin），**共用同一份线协议契约**。
 
 ## 目录与职责
 
@@ -23,6 +25,7 @@
 | [plugin/](plugin/AGENTS.md) | Node.js | DSH 插件：sessionController 桥接、事件桥接、审批瀑布、QR 配对、Push | `node --check` × N；plugin_manager install |
 | [relay/](relay/AGENTS.md) | Node.js | 中继服务器：hello 校验、转发、离线缓存、限速、心跳 | `npm test`（16 用例） |
 | [app/](app/AGENTS.md) | ArkTS | HarmonyOS 手机 App（DevEco 工程） | `devecocli build` + linter-cli 0 ERROR |
+| [app-android/](app-android/AGENTS.md) | Kotlin | **Android 手机 App**（Compose；core 纯 JVM 可无设备跑单测） | `./gradlew :core:test` + `./gradlew :app:assembleDebug` |
 | [e2e/](e2e/AGENTS.md) | Node.js | 协议参考实现 + mock 两端 + 自动化联调 | `node auto-test.mjs` |
 | [docs/PROTOCOL.md](docs/PROTOCOL.md) | — | **线协议契约 v1.2.0（唯一事实源，三方共同合同）** | 改协议必须先改它 |
 

@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Copyright (c) 2026 dukedsh.
+  DSH Pocket for Android —— 暗色首帧窗口底色（与 Theme.kt 暗色 bg_base 同值）。
+-->
+<resources>
+    <color name="pocket_window_background">#0E0F12</color>
+</resources>

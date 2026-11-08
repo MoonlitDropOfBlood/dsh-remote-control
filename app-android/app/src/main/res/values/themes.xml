@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Copyright (c) 2026 dukedsh.
+  DSH Pocket for Android —— 平台主题（只负责启动窗口与系统栏；真正配色在 Compose 侧
+  ui/theme/Theme.kt 的语义 token 里，亮/暗随系统自动切换）。
+
+  这里刻意**不**在 XML 里铺业务色：所有 DSH 语义色（brand_fill / bg_* / label_* …）
+  只在 Theme.kt 出现一次，避免两处色板漂移。colors.xml 里的两个值仅用于
+  「首帧之前的窗口底色」，与 Theme.kt 的 bg_base 保持同值。
+-->
+<resources>
+    <style name="Theme.DshPocket" parent="android:Theme.Material.Light.NoActionBar">
+        <!-- 沉浸式：系统栏透明，背景由 Compose 铺满（对齐 HarmonyOS v1.2.1 的沉浸式口径） -->
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowBackground">@color/pocket_window_background</item>
+    </style>
+</resources>

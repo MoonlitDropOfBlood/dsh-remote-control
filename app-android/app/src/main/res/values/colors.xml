@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Copyright (c) 2026 dukedsh.
+  DSH Pocket for Android —— 仅供「首帧之前的窗口底色」使用（与 Theme.kt 的 bg_base 同值）。
+  业务配色一律在 ui/theme/Theme.kt，XML 侧不再复制色板。
+-->
+<resources>
+    <color name="pocket_window_background">#F4F5F7</color>
+</resources>

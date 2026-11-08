@@ -141,4 +141,29 @@ JCA 加密是同步的 → 发送侧用 `sendLock` 临界区完成「seq 分配 
   3. 跟随标志**只能由用户手势滚动改变**（`followBottom`）：`turn.end` 后的历史刷新把
      直播项换成 durable 项（key 变了）→ LazyColumn 跳回顶部 → 靠「可见项是否在末尾」
      判定会误判成「用户不在底部」→ 又不贴底 → 刚发的消息被顶出视口。
+- **幽灵 process group 的根因在「对账」，不在「分组」**（对齐 ArkTS 2026-11-08 修复）：
+  分组只是把**真实残留**的 reasoning/step 归组，不是凭空多画节点。最终助手消息之后偶尔
+  多出一个分组、重启 App 才消失 → 是历史/直播竞态把 `seq=-1` 的迟到 reasoning 或
+  orphan step 留在尾部。修法（core/Store.kt）：
+  - `mergeHistory` 在「**非 prepend 的最新页 + 宿主已空闲**」时，这页已是最终权威投影 →
+    **所有 `seq<0` 的直播步骤都要退出**（含没进本页的 orphan step）；宿主还忙时只按
+    `callId` 去重，运行中的直播步骤不消失。
+  - `turn.end` 置空闲后**立刻**用最新权威页对账一次；`session.status` 的
+    `running:true→false` 是 `turn.end` 丢失时的兜底，同样补一次对账。
+  - ⚠️ 对账请求**不能在锁内发起**：`handleEventLocked` 返回要刷新的 sessionId，
+    由 `onEvent` 在锁外 `scope.launch { refreshHistory(...) }`。
+  - 回归用例：`core/src/test/kotlin/dsh/rc/core/LiveStepReconcileTest.kt`。
+- **历史错误归属会话，不写全局 `lastError`**（对齐 ArkTS 2026-11-08）：
+  `session.history` 失败**不得**写全局错误（首页会抢走、还会串到别的会话）。
+  错误记在会话自己身上（`store.historyError` / `historyErrorFor(sid)`），只在它的
+  详情页展示并给「重新加载」（`retryHistory(sid)`）；离线时给「加载历史失败：未连接主机」。
+  链路 stop/idle → 清空，避免跨主机串错。
+- **新建会话是「首条任务合成器」**（对齐 ArkTS 2026-11-08，线协议不变）：
+  新建页填**首条任务** + 附件 → **create → 串行上传 → 带 `uploads` 发 prompt**
+  （契约 §5.11）。create 成功即**不得重复 create**（`modelError` 只提示「已用默认模型」
+  并继续）；上传/prompt 失败 → 把正文 + 附件（含已 commit 的 `uploadId`）**移交详情页**，
+  表单不留在原地诱导重复创建。
+  - 上传**必须串行**：同一 `uploadId` 只允许一条 chunk 流（并行 = 违反契约）。
+  - 附件草稿**新建页与详情页各有一份**（ArkTS 是页面级字段）：共用一张表会把
+    A 会话暂存的附件串到 B 会话（文件发到错的会话）。
 

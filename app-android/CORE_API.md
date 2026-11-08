@@ -143,6 +143,11 @@ class SessionStore(
     val approvals: StateFlow<List<ApprovalRequest>>
     val questions: StateFlow<List<QuestionRequest>>
 
+    // ---- 历史错误（归属具体会话，不写全局 lastError） ----
+    val historyError: StateFlow<SessionHistoryError?>      // sessionId + 文案；null = 无
+    fun historyErrorFor(sessionId: String): String          // 非本会话的错误返回 ""
+    fun retryHistory(sessionId: String)                    // 重新拉该会话最新一页历史
+
     // ---- 操作 ----
     suspend fun loadSessions()
     suspend fun openSession(sessionId: String)              // 拉 history + queue + subagents + model + permission
@@ -194,6 +199,21 @@ class SessionStore(
     `MOCK_PROMPT_RESULT_LAST=1` 复现插件端真实顺序）。
     繁忙时（发请求**之前**快照 `running=true`）**不插**主时间线——宿主可能正在输出当前 turn，
     插进去会切开当前回复；排队消息由宿主 `session.queue` 展示，被消费后由权威历史展示。
+12. **幽灵 process group 的根因在「对账」，不在「分组」**：分组只是把真实残留的 reasoning/step 归组，
+    不是凭空多画节点。最终助手消息之后偶尔多出一个分组、重启 App 才消失 → 是历史/直播竞态把
+    `seq=-1` 的迟到 reasoning 或 orphan step 留在尾部。修法（对齐 ArkTS 2026-11-08）：
+    - `mergeHistory` 在「**非 prepend 的最新页 + 宿主已空闲**」时，这页已是最终权威投影 →
+      **所有 `seq<0` 的直播步骤都必须退出**（含没进本页的 orphan step）；
+      宿主还忙时只按 `callId` 去重，运行中的直播步骤不消失。
+    - `turn.end` 把会话置空闲后**立刻**用最新权威页对账一次；
+      `session.status` 的 `running:true→false` 是 `turn.end` 丢失时的兜底，同样补一次对账。
+13. **历史错误归属会话**：`session.history` 失败**不得**写全局 `lastError`（首页会抢走、
+    还会串到别的会话）。错误记在会话自己身上（`historyError`），只在它的详情页展示并给「重新加载」。
+    离线时也要给出「加载历史失败：未连接主机」，不要静默。
+14. **新建会话首发**：线协议顺序是 **create → 串行上传附件 → 带 `uploads` 发 prompt**（契约 §5.11）。
+    create 成功即**不得重复 create**（模型设置失败只提示「已用默认模型」并继续）；
+    上传/prompt 失败时把正文 + 附件（含已 commit 的 `uploadId`）**移交详情页**重试，
+    表单不留在原地诱导重复创建。
 
 ### 2.4 附件分块（`AttachmentPlan.kt`）
 

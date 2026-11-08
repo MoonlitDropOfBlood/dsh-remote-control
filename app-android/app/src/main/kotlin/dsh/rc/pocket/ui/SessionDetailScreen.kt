@@ -120,6 +120,8 @@ fun SessionDetailScreen(
     val drafts by vm.drafts.collectAsState()
     val uploadProgress by vm.uploadProgress.collectAsState()
     val uploading by vm.uploading.collectAsState()
+    val historyError by vm.historyError.collectAsState()
+    val historyLoading by vm.historyLoading.collectAsState()
 
     var draft by remember { mutableStateOf("") }
     var showAttachMenu by remember { mutableStateOf(false) }
@@ -137,6 +139,12 @@ fun SessionDetailScreen(
     }
     LaunchedEffect(sessionId) {
         vm.openSession(sessionId)
+        // 新建会话首发失败移交过来的草稿（契约 §5.11：create 已成功 → 绝不重复 create）。
+        // 一次性消费；附件的 uploadId 随草稿带过来，重试只复用不重传。
+        vm.takeFirstPromptDraft(sessionId)?.let { handed ->
+            draft = handed.text
+            if (handed.attachments.isNotEmpty()) vm.restoreDrafts(handed.attachments)
+        }
     }
     DisposableEffect(sessionId) {
         onDispose { vm.closeSession() }
@@ -231,6 +239,38 @@ fun SessionDetailScreen(
                                 .background(colors.bgLayer2, RoundedCornerShape(Radius.pill))
                                 .padding(horizontal = Sp.sp2, vertical = Sp.sp1),
                         )
+                    }
+                }
+            }
+
+            // ---- 历史错误（归属本会话，不抢首页的全局错误） ----
+            if (historyError.isNotEmpty()) {
+                Column(
+                    verticalArrangement = Arrangement.spacedBy(Sp.sp2),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(colors.stateErrorTint)
+                        .padding(horizontal = Sp.sp3, vertical = Sp.sp2),
+                ) {
+                    Text(
+                        text = historyError,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = colors.stateError,
+                    )
+                    Row(
+                        horizontalArrangement = Arrangement.End,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        TextButton(
+                            onClick = { vm.retryHistory(sessionId) },
+                            enabled = !historyLoading,
+                        ) {
+                            Text(
+                                text = "重新加载",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = colors.stateError,
+                            )
+                        }
                     }
                 }
             }

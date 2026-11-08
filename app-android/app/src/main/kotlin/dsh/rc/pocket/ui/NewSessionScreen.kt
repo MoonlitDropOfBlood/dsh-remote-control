@@ -2,7 +2,9 @@
  * Copyright (c) 2026 dukedsh.
  * DSH Pocket for Android —— 新建会话页（对齐 HarmonyOS 版 NewSessionPage.ets）。
  *
- *  - 首条任务：多行输入（**不填标题**，由 DSH 自动生成）
+ *  - 首条任务：多行输入 + 附件（**不填标题**，由 DSH 自动生成）
+ *    - 契约 §5.11 的发送顺序：**先 create → 再串行上传 → 最后带 uploads 发 prompt**
+ *    - create 成功但上传 / prompt 失败 → 草稿移交详情页（**绝不重复 create**）
  *  - 工作目录：默认目录（Host `~/.dsh/remote`）+ 已有会话用过的 cwd（去重）
  *  - 模型 + 思考强度：同一张卡里的两行（模型无 efforts → 强度行隐藏）
  *  - 模式（Host Agent preset）/ 权限：目录为空 → 整块隐藏（宿主不支持不报错）
@@ -13,9 +15,11 @@
  */
 package dsh.rc.pocket.ui
 
+import android.app.Activity
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
@@ -25,7 +29,15 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Image
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.Button
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
@@ -38,6 +50,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextField
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -46,12 +59,19 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import dsh.rc.core.ModelSelection
+import dsh.rc.pocket.ui.attach.AttachmentChips
+import dsh.rc.pocket.ui.attach.rememberAttachmentPicker
 import dsh.rc.pocket.ui.theme.Hairline
 import dsh.rc.pocket.ui.theme.PocketTheme
 import dsh.rc.pocket.ui.theme.Radius
 import dsh.rc.pocket.ui.theme.Sp
+import dsh.rc.pocket.vm.FirstSendPhase
 import dsh.rc.pocket.vm.PocketViewModel
 
 /**
@@ -70,6 +90,11 @@ fun NewSessionScreen(
     val capabilities by vm.capabilities.collectAsState()
     val sessions by vm.sessions.collectAsState()
     val createdId by vm.createdSessionId.collectAsState()
+    // 新建页**自己的**草稿表（与详情页的 vm.drafts 相互独立 → 不会跨会话串附件）
+    val drafts by vm.newSessionDrafts.collectAsState()
+    val uploadProgress by vm.uploadProgress.collectAsState()
+    val firstSend by vm.firstSend.collectAsState()
+    val attachmentCaps by vm.attachmentCaps.collectAsState()
 
     var prompt by remember { mutableStateOf("") }
     var cwd by remember { mutableStateOf("") }
@@ -82,11 +107,45 @@ fun NewSessionScreen(
     var showPresetPicker by remember { mutableStateOf(false) }
     var showPermissionPicker by remember { mutableStateOf(false) }
     var showDirPicker by remember { mutableStateOf(false) }
+    var showAttachMenu by remember { mutableStateOf(false) }
     val snackbar = remember { SnackbarHostState() }
+
+    // 首发三段（create / 上传 / prompt）任一段进行中 → 禁用发送与附件入口
+    val busy = firstSend.phase != FirstSendPhase.IDLE
+    val attachmentVisible = attachmentCaps?.supported == true
+    val sendLabel = when (firstSend.phase) {
+        FirstSendPhase.IDLE -> "创建并发送"
+        FirstSendPhase.CREATING -> "正在创建并发送…"
+        FirstSendPhase.UPLOADING -> "正在上传附件 ${firstSend.uploadIndex}/${firstSend.uploadTotal}…"
+        FirstSendPhase.SENDING -> "正在发送首条消息…"
+    }
 
     LaunchedEffect(Unit) {
         vm.messages.collect { snackbar.showSnackbar(it) }
     }
+
+    // 离开新建页 → 清空本页草稿（对齐 HarmonyOS 的 aboutToDisappear 释放附件字节）。
+    // 监听的是**导航条目**的生命周期：真正「离开页面」才清；旋转（配置变更）保留。
+    val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_DESTROY) {
+                val activity = context as? Activity
+                if (activity?.isChangingConfigurations != true) {
+                    vm.clearNewSessionDrafts()
+                }
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    // 附件选择器（与详情页**同一套**，不写第二份选择器）
+    val picker = rememberAttachmentPicker(
+        maxItemBytes = attachmentCaps?.maxItemBytes
+            ?: PocketViewModel.DEFAULT_MAX_ITEM_BYTES,
+    ) { picked -> vm.addNewSessionDrafts(picked) }
     // 创建成功 → 跳详情页（并清一次事件）
     LaunchedEffect(createdId) {
         val id = createdId ?: return@LaunchedEffect
@@ -154,30 +213,86 @@ fun NewSessionScreen(
                     color = colors.labelSecondary,
                     modifier = Modifier.padding(top = Sp.sp1),
                 )
-                TextField(
-                    value = prompt,
-                    onValueChange = { prompt = it },
-                    placeholder = {
-                        Text(
-                            text = "例如：把最近改动的三个文件读一遍并总结",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = colors.labelTertiary,
-                        )
-                    },
-                    minLines = 4,
-                    colors = TextFieldDefaults.colors(
-                        focusedContainerColor = colors.bgLayer2,
-                        unfocusedContainerColor = colors.bgLayer2,
-                        focusedIndicatorColor = colors.borderL2,
-                        unfocusedIndicatorColor = colors.borderL1,
-                        cursorColor = colors.brandFill,
-                        focusedTextColor = colors.labelPrimary,
-                        unfocusedTextColor = colors.labelPrimary,
-                    ),
+                // 附件 chips（缩略图 / 名称 / 大小 / 删除 + 逐项上传进度）
+                AttachmentChips(
+                    drafts = drafts,
+                    progress = uploadProgress,
+                    enabled = !busy,
+                    onRemove = vm::removeNewSessionDraft,
+                    modifier = Modifier.padding(top = Sp.sp2),
+                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(top = Sp.sp2),
-                )
+                ) {
+                    // 附件入口（契约 §5.11：宿主不支持附件时整块隐藏）
+                    if (attachmentVisible) {
+                        Box {
+                            IconButton(
+                                onClick = { showAttachMenu = true },
+                                enabled = !busy,
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Add,
+                                    contentDescription = "添加附件",
+                                    tint = colors.labelSecondary,
+                                )
+                            }
+                            DropdownMenu(
+                                expanded = showAttachMenu,
+                                onDismissRequest = { showAttachMenu = false },
+                            ) {
+                                DropdownMenuItem(
+                                    text = { Text("图片") },
+                                    leadingIcon = {
+                                        Icon(Icons.Default.Image, contentDescription = null)
+                                    },
+                                    onClick = {
+                                        showAttachMenu = false
+                                        picker.pickImage()
+                                    },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("文件") },
+                                    leadingIcon = {
+                                        Icon(
+                                            Icons.AutoMirrored.Filled.InsertDriveFile,
+                                            contentDescription = null,
+                                        )
+                                    },
+                                    onClick = {
+                                        showAttachMenu = false
+                                        picker.pickFile()
+                                    },
+                                )
+                            }
+                        }
+                    }
+                    TextField(
+                        value = prompt,
+                        onValueChange = { prompt = it },
+                        placeholder = {
+                            Text(
+                                text = "例如：把最近改动的三个文件读一遍并总结",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = colors.labelTertiary,
+                            )
+                        },
+                        minLines = 4,
+                        colors = TextFieldDefaults.colors(
+                            focusedContainerColor = colors.bgLayer2,
+                            unfocusedContainerColor = colors.bgLayer2,
+                            focusedIndicatorColor = colors.borderL2,
+                            unfocusedIndicatorColor = colors.borderL1,
+                            cursorColor = colors.brandFill,
+                            focusedTextColor = colors.labelPrimary,
+                            unfocusedTextColor = colors.labelPrimary,
+                        ),
+                        modifier = Modifier.weight(1f),
+                    )
+                }
             }
 
             // ---- 工作目录 ----
@@ -243,20 +358,25 @@ fun NewSessionScreen(
             ) {
                 Button(
                     onClick = {
-                        vm.createSession(
-                            prompt = prompt.trim(),
+                        vm.createSessionWithFirstPrompt(
+                            text = prompt.trim(),
                             agentPreset = presetId.ifEmpty { null },
                             permission = permissionId.ifEmpty { null },
                             cwd = cwd.ifEmpty { null },
                             model = model,
                         )
                     },
-                    enabled = prompt.isNotBlank(),
+                    // 正文可空（附件-only 也合法）；上传 / 创建期间禁用
+                    enabled = !busy && (prompt.isNotBlank() || drafts.isNotEmpty()),
                     shape = RoundedCornerShape(Radius.ctrl),
                     modifier = Modifier.fillMaxWidth(),
-                ) { Text("创建并发送") }
+                ) { Text(sendLabel) }
                 TextButton(
-                    onClick = onBack,
+                    onClick = {
+                        vm.clearNewSessionDrafts()
+                        onBack()
+                    },
+                    enabled = !busy,
                     modifier = Modifier.fillMaxWidth(),
                 ) { Text("取消") }
             }

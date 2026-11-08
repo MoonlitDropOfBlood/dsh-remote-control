@@ -143,6 +143,14 @@ data class TimelineEntry(
 /** 仓库层异常（宿主拒绝 / 链路失败 / 返回值缺失）。 */
 class StoreException(message: String) : Exception(message)
 
+/**
+ * 历史错误归属具体会话（只在该会话详情页展示）；不写全局 lastError。
+ *
+ * 背景：`session.history` 失败过去写进首页的全局错误条 → 错误横幅跑到首页，
+ * 甚至被当成别的会话出错。错误属于**发起这次加载的会话**，详情页自己展示 + 「重新加载」。
+ */
+data class SessionHistoryError(val sessionId: String, val message: String)
+
 // =====================================================================================
 // 会话仓
 // =====================================================================================
@@ -264,6 +272,15 @@ class SessionStore(
     /** 最近一次错误文案（UI 提示用；成功路径自动清空）。 */
     val lastError: StateFlow<String> = _lastError.asStateFlow()
 
+    private val _historyError = MutableStateFlow<SessionHistoryError?>(null)
+
+    /**
+     * 历史错误归属具体会话（只在该会话详情页展示）；不写全局 lastError。
+     *
+     * null = 当前没有历史加载错误（链路断开 / 加载成功都会清空）。
+     */
+    val historyError: StateFlow<SessionHistoryError?> = _historyError.asStateFlow()
+
     private val _logLines = MutableStateFlow<List<String>>(emptyList())
 
     /** 链路日志（最近若干条，About 页展示）。 */
@@ -316,7 +333,12 @@ class SessionStore(
     private var liveSeq = 0L
 
     /** 历史请求在途标记（并发刷新合并到同一次）。 */
-    private var historyLoading = false
+    private var historyLoadingFlag = false
+
+    private val _historyLoading = MutableStateFlow(false)
+
+    /** 历史正在加载（详情页据此禁用「重新加载」按钮）。 */
+    val historyLoading: StateFlow<Boolean> = _historyLoading.asStateFlow()
 
     /** 历史请求在途时被合并的尾随刷新：sid → 是否向前翻页。 */
     private val pendingHistory = LinkedHashMap<String, Boolean>()
@@ -956,6 +978,36 @@ class SessionStore(
     // =================================================================================
 
     /**
+     * 详情页只读**自己**会话的历史错误（空串 = 没有错误，或错误属于别的会话）。
+     *
+     * 错误归属会话，避免首页错误条抢走详情页的错误（HarmonyOS 2026-11-08 口径）。
+     */
+    fun historyErrorFor(sessionId: String): String = synchronized(lock) {
+        val err = _historyError.value
+        if (err != null && err.sessionId == sessionId) err.message else ""
+    }
+
+    /** 重新拉该会话最新一页历史（详情页「重新加载」按钮）。 */
+    fun retryHistory(sessionId: String) {
+        if (sessionId.isEmpty()) return
+        scope.launch { refreshHistory(sessionId, prepend = false) }
+    }
+
+    /** 写 / 清该会话的历史错误（**不碰全局 lastError**）。 */
+    private fun setHistoryError(sessionId: String, message: String) {
+        if (sessionId.isEmpty()) return
+        synchronized(lock) {
+            val cur = _historyError.value
+            if (message.isEmpty()) {
+                if (cur != null && cur.sessionId == sessionId) _historyError.value = null
+                return
+            }
+            if (cur != null && cur.sessionId == sessionId && cur.message == message) return
+            _historyError.value = SessionHistoryError(sessionId, message)
+        }
+    }
+
+    /**
      * 拉一页历史（契约 §5.1 v1.0.4）。
      *  - `beforeSeq` 缺省取最新一页；向前翻页回传上一页的 `oldestSeq`；
      *  - `maxMessages` 单页条数上限（缺省 50）。
@@ -968,15 +1020,24 @@ class SessionStore(
         maxMessages: Int = 50
     ): HistoryPage {
         if (sessionId.isEmpty()) throw StoreException("sessionId 为空")
+        if (link.getState() != LinkState.ONLINE) {
+            // 离线属于**该会话**的历史错误（详情页展示），不写全局 lastError。
+            setHistoryError(sessionId, "${HISTORY_ERROR_PREFIX}未连接主机")
+            throw StoreException("${HISTORY_ERROR_PREFIX}未连接主机")
+        }
         val payload = buildJsonObject {
             put("sessionId", sessionId)
             if (beforeSeq != null && beforeSeq > 0) put("beforeSeq", beforeSeq)
             if (maxMessages > 0) put("maxMessages", maxMessages)
         }
+        // 开始加载 → 先清掉该会话的旧错误（避免旧错误盖住新的加载过程）。
+        setHistoryError(sessionId, "")
         val value = try {
             link.request(Protocol.MSG_SESSION_HISTORY, payload, HISTORY_TIMEOUT_MS)
         } catch (e: Exception) {
-            throw StoreException("加载历史失败：" + (e.message ?: ""))
+            val reason = e.message?.takeIf { it.isNotEmpty() } ?: "未知错误"
+            setHistoryError(sessionId, historyErrorText(reason))
+            throw StoreException(historyErrorText(reason))
         }
         val page = HistoryPage.fromJson(value)
         synchronized(lock) {
@@ -986,6 +1047,7 @@ class SessionStore(
             meta.loaded = true
             mergeHistory(sessionId, page.messages, page.steps, prepend = beforeSeq != null)
         }
+        setHistoryError(sessionId, "")
         return page
     }
 
@@ -996,8 +1058,13 @@ class SessionStore(
      */
     private suspend fun refreshHistory(sessionId: String, prepend: Boolean) {
         if (sessionId.isEmpty()) return
+        if (link.getState() != LinkState.ONLINE) {
+            // 离线：归属到该会话（详情页展示「未连接主机」），不写全局 lastError。
+            setHistoryError(sessionId, "${HISTORY_ERROR_PREFIX}未连接主机")
+            return
+        }
         val start = synchronized(lock) {
-            if (historyLoading) {
+            if (historyLoadingFlag) {
                 // 不丢刷新意图：当前页可能是在 queue 项被消费前发出的。
                 val prev = pendingHistory[sessionId]
                 pendingHistory[sessionId] = if (prev == null) prepend else (prev && prepend)
@@ -1005,7 +1072,8 @@ class SessionStore(
             } else {
                 val meta = histMeta.getOrPut(sessionId) { HistMeta() }
                 if (prepend && !meta.hasMore) return
-                historyLoading = true
+                historyLoadingFlag = true
+                _historyLoading.value = true
                 true
             }
         }
@@ -1018,9 +1086,14 @@ class SessionStore(
             }
             loadHistory(sessionId, if (before > 0) before else null)
         } catch (e: Exception) {
-            setLastError(e.message ?: "加载历史失败")
+            // 历史错误归属该会话（详情页展示 + 「重新加载」）；**不写全局 lastError**。
+            val reason = e.message?.takeIf { it.isNotEmpty() } ?: "未知错误"
+            setHistoryError(sessionId, historyErrorText(reason))
         } finally {
-            synchronized(lock) { historyLoading = false }
+            synchronized(lock) {
+                historyLoadingFlag = false
+                _historyLoading.value = false
+            }
             runNextHistory()
         }
     }
@@ -1344,7 +1417,12 @@ class SessionStore(
 
     /**
      * 处理一条事件（**调用方必须持有 lock**）。
-     * @return 需要补拉权威历史的会话 id（队列项被消费时）。
+     *
+     * @return 需要补拉权威历史的会话 id：
+     *   - 队列项被消费（`session.queue` 快照变短）；
+     *   - `turn.end` 回合收尾（空闲权威对账）；
+     *   - `session.status` 的 running:true→false（turn.end 丢失兜底）。
+     *   调用方在**锁外**发起请求。
      */
     private fun handleEventLocked(topic: String, data: JsonObject): String? {
         when (topic) {
@@ -1371,8 +1449,21 @@ class SessionStore(
             Protocol.TOPIC_SESSION_STATUS -> {
                 val sid = data.str("sessionId")
                 val row = allSessions[sid] ?: return null
-                allSessions[sid] = row.copy(running = data.bool("running"))
+                val wasRunning = row.running
+                val running = data.bool("running")
+                allSessions[sid] = row.copy(running = running)
                 refreshSessionsFlow()
+                // turn.end 丢失时 running:true→false 是完成兜底 → 补一次空闲权威对账。
+                if (needsAuthoritativeRefresh(
+                        sessionId = sid,
+                        trigger = AuthoritativeRefreshTrigger.SESSION_IDLE,
+                        wasRunning = wasRunning,
+                        runningNow = running,
+                        linkOnline = link.getState() == LinkState.ONLINE
+                    )
+                ) {
+                    return sid
+                }
             }
 
             Protocol.TOPIC_SESSION_ACTIVITY -> {
@@ -1468,6 +1559,19 @@ class SessionStore(
                     ""
                 }
                 finalizeTurn(sid, errText)
+                // turn.end 是回合硬边界：会话已归空闲 → 用最新权威页对账，
+                // 清掉直播残留（幽灵 process group 的根因）。
+                // 若此前有在途历史，refreshHistory 会记录尾随刷新，旧快照不会吃掉这次收尾。
+                if (needsAuthoritativeRefresh(
+                        sessionId = sid,
+                        trigger = AuthoritativeRefreshTrigger.TURN_END,
+                        wasRunning = true,
+                        runningNow = false,
+                        linkOnline = link.getState() == LinkState.ONLINE
+                    )
+                ) {
+                    return sid
+                }
             }
 
             Protocol.TOPIC_APPROVAL_REQUEST -> {
@@ -1566,6 +1670,7 @@ class SessionStore(
     private fun clearHostState() {
         synchronized(lock) {
             pendingHistory.clear()
+            _historyError.value = null
             _activeSessionId.value = null
             publishTimeline(emptyList())
             _hostInfo.value = null
@@ -1602,6 +1707,13 @@ private const val IMAGE_FETCH_DEFAULT_MAX_EDGE = 1600
 private const val IMAGE_FETCH_MAX_EDGE = 4096
 private const val IMAGE_CACHE_MAX = 24
 private const val LOG_KEEP = 80
+
+/** 历史错误文案前缀（归属到会话，不写全局 lastError）。 */
+private const val HISTORY_ERROR_PREFIX = "加载历史失败："
+
+/** 历史错误文案（已带前缀的不重复加）。 */
+private fun historyErrorText(reason: String): String =
+    if (reason.startsWith(HISTORY_ERROR_PREFIX)) reason else HISTORY_ERROR_PREFIX + reason
 
 // =====================================================================================
 // 纯函数：分组 / 合并 / 对账（便于 JVM 单测，不依赖链路）
@@ -1730,9 +1842,15 @@ internal fun mergeTimelineItems(
     val live = ArrayList<TimelineItem>()
     var coveredLive: Set<String> = emptySet()
     var coveredAttachments: Set<String> = emptySet()
+    var coveredSteps: Set<String> = emptySet()
+    // 「非 prepend 最新页 + 宿主已空闲」= 本页已是最终权威投影。
+    val authoritativeIdle = !prepend && dropFinalized
     if (!prepend) {
-        coveredLive = coveredLiveIds(oldItems, messages, dropFinalized)
+        coveredLive = coveredLiveIds(oldItems, messages, authoritativeIdle)
         coveredAttachments = coveredLiveAttachmentIds(oldItems, messages)
+        // 空闲后的最新页接管**全部**残留直播步骤（含没进本页的 orphan），
+        // 否则它们会被挪到最终消息之后拼成幽灵 process group；运行中 / 向前翻页仍只按 callId 去重。
+        coveredSteps = coveredLiveStepIds(oldItems, steps, authoritativeIdle)
     }
 
     for (it in oldItems) {
@@ -1759,8 +1877,8 @@ internal fun mergeTimelineItems(
             ) {
                 continue // 直播的独立图片消息（交付物）已被本页 durable 副本覆盖
             }
-            if (it is TimelineStep && stepCoveredByPage(steps, it)) {
-                continue // 直播步骤已被本页持久步骤覆盖
+            if (it is TimelineStep && coveredSteps.contains(it.key)) {
+                continue // 直播步骤已被本页持久步骤覆盖；空闲最新页会清掉所有残留直播步骤
             }
         }
         live.add(it)
@@ -2054,4 +2172,78 @@ internal fun stepCoveredByPage(steps: List<StepRecord>, item: TimelineStep): Boo
         if (s.callId == item.callId) return true
     }
     return false
+}
+
+/** 权威对账的触发来源（回合收尾 / turn.end 丢失兜底）。 */
+internal enum class AuthoritativeRefreshTrigger {
+    /** turn.end：回合硬边界，会话已归空闲。 */
+    TURN_END,
+
+    /** session.status：running:true→false（turn.end 丢失时的对账兜底）。 */
+    SESSION_IDLE
+}
+
+/**
+ * 是否需要触发一次权威历史对账（**纯函数**，便于单测）。
+ *
+ * - 会话 id 为空 / 链路不在线 → 不触发（离线没有权威页可对）；
+ * - `turn.end` → 触发（回合收尾，直播残留必须收编）；
+ * - `session.status` → 只有 running:true→false 才触发（turn.end 丢失兜底）。
+ */
+internal fun needsAuthoritativeRefresh(
+    sessionId: String,
+    trigger: AuthoritativeRefreshTrigger,
+    wasRunning: Boolean,
+    runningNow: Boolean,
+    linkOnline: Boolean
+): Boolean {
+    if (sessionId.isEmpty() || !linkOnline) return false
+    return when (trigger) {
+        AuthoritativeRefreshTrigger.TURN_END -> true
+        AuthoritativeRefreshTrigger.SESSION_IDLE -> wasRunning && !runningNow
+    }
+}
+
+/** 工作步骤对账所需的最小 durable 形状。 */
+internal data class DurableStep(val callId: String)
+/** 直播步骤（条目 id + callId）。 */
+internal data class LiveStep(val itemId: String, val callId: String)
+
+/**
+ * 找出已由权威历史接管、应从时间线移除的直播步骤（移植 timeline-reconcile.ts）。
+ *
+ * - 普通合并仍按 callId 去重：运行中的直播步骤不会因暂时没进历史而消失；
+ * - authoritativeIdle=true 仅用于「非 prepend 最新页 + 宿主已空闲」：本页已经是最终权威投影，
+ *   **所有** seq=-1 的步骤都必须退出（含没进入本页的 orphan step）——
+ *   否则这些残留会被统一挪到最终消息之后，拼出一个「重启 App 才消失」的幽灵 process group。
+ */
+internal fun collectCoveredLiveStepIds(
+    durable: List<DurableStep>,
+    live: List<LiveStep>,
+    authoritativeIdle: Boolean
+): Set<String> {
+    val covered = LinkedHashSet<String>()
+    if (authoritativeIdle) {
+        for (item in live) covered.add(item.itemId)
+        return covered
+    }
+    val durableIds = HashSet<String>()
+    for (d in durable) durableIds.add(d.callId)
+    for (item in live) {
+        if (durableIds.contains(item.callId)) covered.add(item.itemId)
+    }
+    return covered
+}
+
+/** 计算应退出的直播步骤 id（seq < 0 的步骤才参与）。 */
+internal fun coveredLiveStepIds(
+    oldItems: List<TimelineItem>,
+    steps: List<StepRecord>,
+    authoritativeIdle: Boolean
+): Set<String> {
+    val live = oldItems.mapNotNull { it ->
+        if (it is TimelineStep && it.seqOf() < 0) LiveStep(it.key, it.callId) else null
+    }
+    if (live.isEmpty()) return emptySet()
+    return collectCoveredLiveStepIds(steps.map { DurableStep(it.callId) }, live, authoritativeIdle)
 }

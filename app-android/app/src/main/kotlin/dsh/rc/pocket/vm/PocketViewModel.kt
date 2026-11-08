@@ -53,6 +53,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.stateIn
@@ -98,9 +99,66 @@ class PendingAttachment(
     fun withUploadId(uploadId: String): PendingAttachment =
         PendingAttachment(draft.copy(uploadId = uploadId), payload, thumb)
 
+    /** 宿主已丢弃该 upload（回执失效）→ 清掉 uploadId，重试时重新上传。 */
+    fun withoutUploadId(): PendingAttachment =
+        PendingAttachment(draft.copy(uploadId = null), payload, thumb)
+
     override fun equals(other: Any?): Boolean = this === other
     override fun hashCode(): Int = localId.hashCode()
 }
+
+/**
+ * 新建会话「首条任务」的发送阶段（新建会话页的按钮文案 + 禁用态）。
+ *
+ * 契约 §5.11 的顺序：先 create → 再上传 → 最后 prompt，三段各自可见。
+ */
+enum class FirstSendPhase {
+    /** 空闲（可发起首发）。 */
+    IDLE,
+
+    /** 正在 session.create。 */
+    CREATING,
+
+    /** 正在串行上传附件。 */
+    UPLOADING,
+
+    /** 正在 session.prompt。 */
+    SENDING,
+}
+
+/** 首发阶段状态（供新建会话页渲染按钮文案）。 */
+data class FirstSendState(
+    val phase: FirstSendPhase = FirstSendPhase.IDLE,
+    /** 当前上传项（1 起；UPLOADING 阶段有意义）。 */
+    val uploadIndex: Int = 0,
+    /** 待上传总数。 */
+    val uploadTotal: Int = 0,
+)
+
+/**
+ * 草稿附件表的归属。
+ *
+ * 上传成功后的 uploadId 回填**必须写回来源那张表**——否则新建页的附件拿不到
+ * uploadId → prompt 失败重试会**重复上传**。
+ */
+private enum class DraftOwner {
+    /** 详情页 composer。 */
+    DETAIL,
+
+    /** 新建会话页。 */
+    NEW_SESSION,
+}
+
+/**
+ * 首建会话首发失败时跨页面移交的草稿（create 已成功 → 绝不能重复 create）。
+ *
+ * 附件连同**已 commit 的 uploadId** 一起带过去 → 详情页重试不重复上传（契约 §5.11.3）。
+ */
+data class FirstPromptDraft(
+    val sessionId: String,
+    val text: String,
+    val attachments: List<PendingAttachment>,
+)
 
 /** KAT 自检结果（关于页展示；契约 §7 硬验收）。 */
 data class KatResult(
@@ -178,6 +236,19 @@ class PocketViewModel(application: Application) : AndroidViewModel(application) 
     /** 本地日志（关于页）。 */
     val logs = app.logs
 
+    /**
+     * 当前活动会话的历史错误（空串 = 无）。
+     *
+     * 历史错误**只归属该会话**（不写全局 lastError → 首页不会抢别人的错误横幅）。
+     */
+    val historyError: StateFlow<String> =
+        combine(store.historyError, store.activeSessionId) { err, sid ->
+            if (err != null && err.sessionId == sid) err.message else ""
+        }.stateIn(viewModelScope, SharingStarted.Eagerly, "")
+
+    /** 历史正在加载（详情页据此禁用「重新加载」按钮）。 */
+    val historyLoading: StateFlow<Boolean> = store.historyLoading
+
     // ---- 多远程 ----
 
     /** 全部远程档案。 */
@@ -203,6 +274,17 @@ class PocketViewModel(application: Application) : AndroidViewModel(application) 
 
     /** 输入框草稿附件。 */
     val drafts: StateFlow<List<PendingAttachment>> = _drafts.asStateFlow()
+
+    /**
+     * 新建会话页的草稿附件（**与详情页的 `_drafts` 相互独立**）。
+     *
+     * 两页各持一份（对齐 HarmonyOS：ArkTS 是两个页面级字段，字节放模块级 Map）
+     * → 详情页暂存的附件**绝不会**出现在新建页（反之亦然）→ 不会跨会话串附件。
+     */
+    private val _newSessionDrafts = MutableStateFlow<List<PendingAttachment>>(emptyList())
+
+    /** 新建会话页的草稿附件。 */
+    val newSessionDrafts: StateFlow<List<PendingAttachment>> = _newSessionDrafts.asStateFlow()
 
     /** 上传进度（localId → 百分比）。 */
     private val _uploadProgress = MutableStateFlow<Map<String, Int>>(emptyMap())
@@ -233,6 +315,15 @@ class PocketViewModel(application: Application) : AndroidViewModel(application) 
 
     /** 创建成功后要跳转的会话 id。 */
     val createdSessionId: StateFlow<String?> = _createdSessionId.asStateFlow()
+
+    /** 首发阶段（新建会话页按钮文案 + 禁用态）。 */
+    private val _firstSend = MutableStateFlow(FirstSendState())
+
+    /** 首发阶段。 */
+    val firstSend: StateFlow<FirstSendState> = _firstSend.asStateFlow()
+
+    /** 待移交的首发草稿（只保存一份；一次性消费）。 */
+    private val _firstPromptDraft = MutableStateFlow<FirstPromptDraft?>(null)
 
     init {
         viewModelScope.launch {
@@ -468,58 +559,174 @@ class PocketViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     /**
-     * 新建会话 + 发送首条任务（契约 §5.1 session.create）。
+     * 新建会话 + 发送首条任务（**首发合成器**，契约 §5.1 / §5.11）。
      *
-     * 口径与 HarmonyOS 版一致：
-     *  - 标题一律传空串（DSH 自动生成）
+     * 顺序**不可颠倒**：
+     *  1. session.create → 拿 sessionId（标题一律空串，DSH 自动生成）
+     *  2. attachment.upload.* 串行上传（同一 uploadId 只能有一条 chunk 流）
+     *  3. session.prompt 带 uploads
+     *
+     * 失败口径（与 HarmonyOS 版一致）：
      *  - 宿主拒绝模式 / 权限（错误含 unsupported）→ 回退「只去掉 preset/permission，
      *    保留 cwd 与模型」再创建一次
-     *  - create 成功但模型设置失败（modelError）→ 提示后**继续 prompt**，不得重复创建
-     *  - create 成功但 prompt 失败 → 照样进详情页提示重试
+     *  - create 成功但模型设置失败（CreateResult.modelError）→ 提示「已用默认模型」
+     *    并**继续**首发，**绝不重复 create**
+     *  - create 成功但上传 / prompt 失败 → **stash 草稿**并跳详情页（表单不留在原地
+     *    诱导重复 create）
+     *  - create **失败** → 只复位状态并 toast「创建失败：…」，**附件与正文保留**
+     *    （对齐 ArkTS：用户改参数重试时不必重选附件）
      */
-    fun createSession(
-        prompt: String,
+    fun createSessionWithFirstPrompt(
+        text: String,
         agentPreset: String?,
         permission: String?,
         cwd: String?,
         model: ModelSelection?,
     ) {
+        if (_firstSend.value.phase != FirstSendPhase.IDLE) return
+        val prompt = text.trim()
+        // 附件**只取新建页那张表**（详情页的草稿与本流程无关 → 不会跨会话串附件）
+        val items = _newSessionDrafts.value.toList()
+        if (prompt.isEmpty() && items.isEmpty()) {
+            notify("请填写任务内容或选择附件")
+            return
+        }
+        if (linkState.value != LinkState.ONLINE) {
+            notify("未连接，请先在连接管理页连接主机")
+            return
+        }
+        if (items.isNotEmpty() && attachmentCaps.value?.supported != true) {
+            notify("当前主机不支持附件，请移除附件后再创建")
+            return
+        }
+        _firstSend.value = FirstSendState(phase = FirstSendPhase.CREATING)
         viewModelScope.launch {
-            try {
-                val res: CreateResult = store.createSession("", agentPreset, permission, cwd, model)
-                finishCreate(res, prompt)
+            // ① create
+            val res: CreateResult = try {
+                createWithFallback(agentPreset, permission, cwd, model)
             } catch (e: Exception) {
-                val msg = e.message ?: "未知错误"
-                if (isUnsupportedError(msg)) {
-                    // 回退：宿主不认识所选模式/权限 → 只去掉 preset/permission
-                    try {
-                        val res = store.createSession("", null, null, cwd, model)
-                        notify("主机不支持所选模式/权限，已用默认创建")
-                        finishCreate(res, prompt)
-                    } catch (e2: Exception) {
-                        notify("创建失败：${e2.message}")
+                _firstSend.value = FirstSendState()
+                // create 失败 → **保留**附件与正文（对齐 ArkTS：只复位状态并 toast，
+                // 用户改参数重试时不必重选附件）
+                notify("创建失败：${e.message ?: "未知错误"}")
+                return@launch
+            }
+            val sid = res.sessionId
+            if (sid.isEmpty()) {
+                _firstSend.value = FirstSendState()
+                // 同属 create 失败 → 保留附件与正文
+                notify("主机未返回会话 id")
+                return@launch
+            }
+            if (res.modelError != null) {
+                // 会话已建成，不能因模型设置失败而重复 create
+                notify("会话已创建，模型设置失败，已用默认模型")
+            }
+
+            // ② 串行上传附件（契约 §5.11.2）
+            var uploaded = items
+            if (items.isNotEmpty()) {
+                _firstSend.value = FirstSendState(
+                    phase = FirstSendPhase.UPLOADING,
+                    uploadIndex = 0,
+                    uploadTotal = items.size,
+                )
+                try {
+                    uploaded = uploadAllAttachments(sid, items)
+                } catch (e: Exception) {
+                    val message = e.message ?: "未知错误"
+                    // 已上传成功的项在草稿列表里已带上 uploadId → 从那里取回，
+                    // 保证详情页重试**不重复上传**；宿主说回执失效时清掉 uploadId
+                    val carried = carriedDrafts(items)
+                    val stashable = if (isUploadExpired(message)) {
+                        carried.map { it.withoutUploadId() }
+                    } else {
+                        carried
                     }
-                } else {
-                    notify("创建失败：$msg")
+                    failFirstPrompt(sid, prompt, stashable, message)
+                    return@launch
                 }
             }
+
+            // ③ 带 uploads 发首条消息
+            _firstSend.value = FirstSendState(phase = FirstSendPhase.SENDING)
+            val ok = try {
+                store.sendPrompt(sid, prompt, uploaded.mapNotNull { it.draft.uploadId })
+            } catch (e: Exception) {
+                val message = e.message ?: "未知错误"
+                // 宿主说回执失效 → 清掉 uploadId，重试必须重新上传
+                val carried = if (isUploadExpired(message)) {
+                    uploaded.map { it.withoutUploadId() }
+                } else {
+                    uploaded
+                }
+                failFirstPrompt(sid, prompt, carried, message)
+                return@launch
+            }
+            if (!ok) {
+                failFirstPrompt(sid, prompt, uploaded, "宿主未接受首条消息")
+                return@launch
+            }
+
+            // 成功：清掉**新建页**的草稿与进度，跳详情页
+            clearNewSessionDrafts()
+            _firstSend.value = FirstSendState()
+            _createdSessionId.value = sid
         }
     }
 
-    /** 创建成功后的收尾（模型告警 → 发首条 → 跳详情）。 */
-    private suspend fun finishCreate(res: CreateResult, prompt: String) {
-        if (res.sessionId.isEmpty()) {
-            notify("主机未返回会话 id")
-            return
+    /**
+     * session.create + unsupported 回退。
+     *
+     * 宿主不认识所选模式 / 权限时，只去掉 preset / permission，**保留 cwd 与模型**
+     * （与 HarmonyOS 版 createSession 同口径）。
+     */
+    private suspend fun createWithFallback(
+        agentPreset: String?,
+        permission: String?,
+        cwd: String?,
+        model: ModelSelection?,
+    ): CreateResult = try {
+        store.createSession("", agentPreset, permission, cwd, model)
+    } catch (e: Exception) {
+        val msg = e.message ?: "未知错误"
+        if (!isUnsupportedError(msg)) throw e
+        notify("主机不支持所选模式/权限，已用默认创建")
+        store.createSession("", null, null, cwd, model)
+    }
+
+    /**
+     * 会话已建成但首发失败：草稿一次性移交详情页。
+     *
+     * 本页**清空但不释放**移交出去的附件字节（详情页接手发送成功 / 删除 / 退出时再释放）。
+     */
+    private fun failFirstPrompt(
+        sessionId: String,
+        text: String,
+        items: List<PendingAttachment>,
+        message: String,
+    ) {
+        stashFirstPromptDraft(sessionId, text, items)
+        _firstSend.value = FirstSendState()
+        notify("会话已创建，首条消息发送失败：$message。请在详情页重试")
+        // 跳详情页（不留在原地诱导重复 create）
+        _createdSessionId.value = sessionId
+    }
+
+    /**
+     * 取回「本次首发用到的附件」的当前副本（带上已 commit 的 uploadId）。
+     *
+     * 上传成功时 uploadId 已回填到草稿列表 → 这里按 localId 取回即可拿到它们。
+     */
+    private fun carriedDrafts(items: List<PendingAttachment>): List<PendingAttachment> {
+        val ids = items.map { it.localId }.toSet()
+        // 从新建页那张表取（uploadId 已回填在那里）
+        val fromDrafts = _newSessionDrafts.value.filter { ids.contains(it.localId) }
+        if (fromDrafts.size == items.size) return fromDrafts
+        // 草稿列表里缺项（理论上不会）→ 用原列表补齐，保留已知的 uploadId
+        return items.map { item ->
+            fromDrafts.firstOrNull { it.localId == item.localId } ?: item
         }
-        if (res.modelError != null) {
-            notify("会话已创建，模型设置失败，将使用默认模型")
-        }
-        if (prompt.isNotBlank()) {
-            val ok = store.sendPrompt(res.sessionId, prompt)
-            if (!ok) notify("会话已创建，首条消息发送失败，请重试")
-        }
-        _createdSessionId.value = res.sessionId
     }
 
     /** 消费「创建成功」事件（页面跳走后清一次）。 */
@@ -539,9 +746,26 @@ class PocketViewModel(application: Application) : AndroidViewModel(application) 
      * 加不进的提示原因（附件类型 / 单项字节 / 数量 / 总字节）。
      */
     fun addDrafts(items: List<PendingAttachment>) {
+        addDraftsTo(_drafts, items)
+    }
+
+    /**
+     * 加入草稿附件（**新建会话页**；与详情页的 [addDrafts] 互不影响）。
+     *
+     * 上限校验同样统一走 core（契约 §5.11.1）。
+     */
+    fun addNewSessionDrafts(items: List<PendingAttachment>) {
+        addDraftsTo(_newSessionDrafts, items)
+    }
+
+    /** 逐个试加草稿附件（超限时提示 core 给出的原因）。 */
+    private fun addDraftsTo(
+        table: MutableStateFlow<List<PendingAttachment>>,
+        items: List<PendingAttachment>,
+    ) {
         if (items.isEmpty()) return
         val caps = attachmentCaps.value
-        var current = drafts.value
+        var current = table.value
         for (item in items) {
             val candidate = current + item
             val error = AttachmentPlan.checkAttachmentDraft(
@@ -554,15 +778,75 @@ class PocketViewModel(application: Application) : AndroidViewModel(application) 
             }
             current = candidate
         }
-        if (current.size != drafts.value.size) {
-            _drafts.value = current
+        if (current.size != table.value.size) {
+            table.value = current
         }
+    }
+
+    /**
+     * 保存新建会话的首发失败草稿（契约 §5.11：先建会话，再上传，再 prompt）。
+     *
+     * 只保存**一份**待移交草稿；附件连同**已 commit 的 uploadId** 一起带过去
+     * → 详情页重试**不重复上传**（契约 §5.11.3）。
+     *
+     * 附件从活动草稿列表**移走**（本页不再显示它们；详情页 take + restoreDrafts 接手）。
+     */
+    fun stashFirstPromptDraft(sessionId: String, text: String, attachments: List<PendingAttachment>) {
+        val ids = attachments.map { it.localId }.toSet()
+        // 从**新建页**那张表移走（首发时附件在新建页的草稿表里）
+        _newSessionDrafts.value = _newSessionDrafts.value.filterNot { ids.contains(it.localId) }
+        _uploadProgress.value = _uploadProgress.value - ids
+        _firstPromptDraft.value = FirstPromptDraft(sessionId, text, attachments)
+    }
+
+    /**
+     * 详情页按 sessionId 取走首发草稿；**一次性消费**（避免返回页面时重复覆盖用户的新输入）。
+     *
+     * 草稿归属别的会话时返回 null。
+     */
+    fun takeFirstPromptDraft(sessionId: String): FirstPromptDraft? {
+        val draft = _firstPromptDraft.value ?: return null
+        if (draft.sessionId != sessionId) return null
+        _firstPromptDraft.value = null
+        return draft
+    }
+
+    /** 把移交过来的附件放回草稿列表（详情页接手首发草稿；不触发上传）。 */
+    fun restoreDrafts(attachments: List<PendingAttachment>) {
+        if (attachments.isEmpty()) return
+        val known = _drafts.value.map { it.localId }.toSet()
+        _drafts.value = _drafts.value + attachments.filterNot { known.contains(it.localId) }
+    }
+
+    /** 重新拉该会话最新一页历史（core 内部起协程）。 */
+    fun retryHistory(sessionId: String) {
+        store.retryHistory(sessionId)
     }
 
     /** 移除一个草稿附件（只释放本地字节；宿主已 commit 的附件不可撤回）。 */
     fun removeDraft(localId: String) {
         _drafts.value = drafts.value.filterNot { it.localId == localId }
         _uploadProgress.value = _uploadProgress.value - localId
+    }
+
+    /** 移除一个草稿附件（**新建会话页**）。 */
+    fun removeNewSessionDraft(localId: String) {
+        _newSessionDrafts.value = _newSessionDrafts.value.filterNot { it.localId == localId }
+        _uploadProgress.value = _uploadProgress.value - localId
+    }
+
+    /**
+     * 清空新建会话页的草稿。
+     *
+     * 时机：**首发成功** / **离开新建页**（对齐 HarmonyOS 的 aboutToDisappear
+     * 释放附件字节）——create 失败**不清**（对齐 ArkTS：附件与正文保留，用户改参数
+     * 重试时不必重选）——**绝不**碰详情页那张表。
+     */
+    fun clearNewSessionDrafts() {
+        if (_newSessionDrafts.value.isEmpty()) return
+        val ids = _newSessionDrafts.value.map { it.localId }.toSet()
+        _newSessionDrafts.value = emptyList()
+        _uploadProgress.value = _uploadProgress.value - ids
     }
 
     /** 上传附件并发送（契约 §5.11.2/§5.11.3）。 */
@@ -576,7 +860,9 @@ class PocketViewModel(application: Application) : AndroidViewModel(application) 
         try {
             val ids = ArrayList<String>(items.size)
             for (item in items) {
-                ids.add(uploadAttachment(sessionId, item))
+                ids.add(
+                    uploadAttachment(sessionId, item, DraftOwner.DETAIL).draft.uploadId.orEmpty(),
+                )
             }
             // 忙闲快照取在发请求之前（与 core 同口径）：繁忙时本地不插气泡 → 必须提示投递去向。
             val busy = parentSessionId.isEmpty() && store.runningOf(sessionId)
@@ -605,10 +891,15 @@ class PocketViewModel(application: Application) : AndroidViewModel(application) 
      *
      * 复用：commit 成功后的 uploadId 记在 [uploadIds]，prompt 失败重试时**不重复上传**。
      */
-    private suspend fun uploadAttachment(sessionId: String, item: PendingAttachment): String {
+    private suspend fun uploadAttachment(
+        sessionId: String,
+        item: PendingAttachment,
+        owner: DraftOwner,
+    ): PendingAttachment {
         // 已 commit 的 uploadId 直接复用（prompt 失败重试**不重复上传**；契约 §5.11.3）
         val existing = item.draft.uploadId.orEmpty()
-        if (existing.isNotEmpty()) return existing
+        if (existing.isNotEmpty()) return item
+        val table = draftTable(owner)
         val caps = attachmentCaps.value
         val hostChunk = caps?.chunkBytes ?: AttachmentPlan.DEFAULT_CHUNK_BYTES
         val chunkBytes = AttachmentPlan.clampChunkBytes(hostChunk)
@@ -647,12 +938,42 @@ class PocketViewModel(application: Application) : AndroidViewModel(application) 
             UPLOAD_COMMIT_TIMEOUT_MS,
         )
         // 回填 uploadId → prompt 失败重试时复用，不重复上传（契约 §5.11.3）
-        _drafts.value = _drafts.value.map {
-            if (it.localId == item.localId) it.withUploadId(uploadId) else it
+        // **写回来源那张表**（新建页 / 详情页各写各的 → uploadId 不会串台）
+        val committed = item.withUploadId(uploadId)
+        table.value = table.value.map {
+            if (it.localId == item.localId) committed else it
         }
         _uploadProgress.value = _uploadProgress.value + (item.localId to 100)
-        return uploadId
+        return committed
     }
+
+    /**
+     * 串行上传全部附件（契约 §5.11.2：同一 uploadId 只能有一条 chunk 流，**绝不并行**）。
+     *
+     * @return 每项都带上已 commit 的 uploadId 的副本（首发失败时随草稿移交，重试不重传）
+     */
+    private suspend fun uploadAllAttachments(
+        sessionId: String,
+        items: List<PendingAttachment>,
+    ): List<PendingAttachment> {
+        val out = ArrayList<PendingAttachment>(items.size)
+        for ((index, item) in items.withIndex()) {
+            _firstSend.value = FirstSendState(
+                phase = FirstSendPhase.UPLOADING,
+                uploadIndex = index + 1,
+                uploadTotal = items.size,
+            )
+            out.add(uploadAttachment(sessionId, item, DraftOwner.NEW_SESSION))
+        }
+        return out
+    }
+
+    /** 归属的草稿表（uploadId 回填的目标）。 */
+    private fun draftTable(owner: DraftOwner): MutableStateFlow<List<PendingAttachment>> =
+        when (owner) {
+            DraftOwner.DETAIL -> _drafts
+            DraftOwner.NEW_SESSION -> _newSessionDrafts
+        }
 
     // ------------------------------------------------------------------
     // 折叠态 / 提示 / KAT
@@ -743,6 +1064,11 @@ internal fun isUnsupportedError(message: String): Boolean {
     val lower = message.lowercase()
     return lower.contains("unsupported") || lower.contains("not supported")
 }
+
+/** 附件回执是否已失效（宿主已丢弃该 uploadId → 重试必须重新上传）。 */
+internal fun isUploadExpired(message: String): Boolean =
+    message.contains("attachment-upload-expired") ||
+        message.contains("attachment-upload-not-found")
 
 /**
  * 单条时间线条目的折叠态（core 在 TimelineStep.expanded / TimelineReasoning.expanded 上给出）。

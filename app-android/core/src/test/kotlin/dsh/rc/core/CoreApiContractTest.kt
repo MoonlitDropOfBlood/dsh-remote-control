@@ -15,6 +15,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.runBlocking
 import org.junit.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -26,6 +27,11 @@ class CoreApiContractTest {
         val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
         try {
             val store = SessionStore(DshrcLink(scope), scope)
+
+            // 初始没有历史错误、也不在加载中（后续的离线重试会写入该会话的错误）。
+            assertNull(store.historyError.value, "初始没有历史错误")
+            assertFalse(store.historyLoading.value, "初始不在加载历史")
+            assertEquals("", store.historyErrorFor("sess-1"), "别的会话读不到历史错误")
 
             // ---- 会话列表 ----
             val sessions: StateFlow<List<SessionSummary>> = store.sessions
@@ -48,6 +54,12 @@ class CoreApiContractTest {
             // ---- 审批 / 提问 ----
             val approvals: StateFlow<List<ApprovalRequest>> = store.approvals
             val questions: StateFlow<List<QuestionRequest>> = store.questions
+
+            // ---- 历史错误归属 + 加载状态（2026-11-08） ----
+            val historyError: StateFlow<SessionHistoryError?> = store.historyError
+            val historyLoading: StateFlow<Boolean> = store.historyLoading
+            val historyErrorFor: (String) -> String = { sid -> store.historyErrorFor(sid) }
+            val retryHistory: (String) -> Unit = { sid -> store.retryHistory(sid) }
 
             // ---- 操作（签名逐条对齐） ----
             val loadSessions: suspend () -> Unit = { store.loadSessions() }
@@ -105,6 +117,7 @@ class CoreApiContractTest {
             assertNull(attachmentCaps.value)
             assertTrue(approvals.value.isEmpty())
             assertTrue(questions.value.isEmpty())
+            assertNotNull(retryHistory)
 
             // 引用一次，避免「未使用的局部变量」告警
             assertNotNull(loadSessions)

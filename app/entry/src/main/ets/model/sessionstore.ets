@@ -26,10 +26,12 @@ import {
 import { DshrcLink, DshrcHostInfo, LinkPeers, LinkState, dshrcLink } from './link';
 import {
   collectCoveredLiveAttachmentIds,
+  collectCoveredLiveStepIds,
   collectCoveredLiveTextIds,
   DshrcDurableAttachments,
   DshrcDurableText,
   DshrcLiveAttachments,
+  DshrcLiveStep,
   DshrcLiveText
 } from './timeline-reconcile';
 import { AttachmentCaps, normalizeAttachmentCaps } from './attachment-plan';
@@ -1311,9 +1313,21 @@ export class SessionStore {
     let coveredLive: Set<string> = new Set<string>();
     // v1.2.0（§5.11.4）：附件-only 乐观消息的覆盖集（正文为空，文本对账覆盖不到）
     let coveredAttachments: Set<string> = new Set<string>();
+    let coveredSteps: Set<string> = new Set<string>();
+    const authoritativeIdle: boolean = !prepend && !this.runningOf(sid);
     if (!prepend) {
-      coveredLive = this.coveredLiveIds(items, messages, !this.runningOf(sid));
+      coveredLive = this.coveredLiveIds(items, messages, authoritativeIdle);
       coveredAttachments = this.coveredLiveAttachmentIds(items, messages);
+      const liveSteps: DshrcLiveStep[] = [];
+      for (let i: number = 0; i < items.length; i++) {
+        const it: TimelineItem = items[i];
+        if (it.seq < 0 && it.isStep()) {
+          liveSteps.push({ itemId: it.id, callId: it.callId });
+        }
+      }
+      // 空闲后的最新页是最终权威投影：本页没包含的 live 步骤也不能留到最终消息后面，
+      // 否则它们会重新拼成一个幽灵 group；运行中/向前翻页仍只按 callId 去重。
+      coveredSteps = collectCoveredLiveStepIds(steps, liveSteps, authoritativeIdle);
     }
     for (let k: number = 0; k < items.length; k++) {
       const it: TimelineItem = items[k];
@@ -1336,8 +1350,8 @@ export class SessionStore {
         this.imagesCoveredByPage(messages, it)) {
         continue; // v1.1.1：直播的独立图片消息（交付物，正文为空）已被本页 durable 副本覆盖 → 不重复显示
       }
-      if (!prepend && it.isStep() && this.stepCoveredByPage(steps, it)) {
-        continue; // 直播步骤已被本页持久步骤覆盖
+      if (!prepend && it.isStep() && coveredSteps.has(it.id)) {
+        continue; // 直播步骤已被本页持久步骤覆盖；空闲最新页会清掉所有残留 live 步骤
       }
       live.push(it);
     }
@@ -1573,16 +1587,6 @@ export class SessionStore {
       }
     }
     return collectCoveredLiveAttachmentIds(durable, live);
-  }
-
-  /** 直播步骤是否已被本页持久步骤覆盖（同 callId）。 */
-  private stepCoveredByPage(steps: DshrcStepRecord[], it: TimelineItem): boolean {
-    for (let i: number = 0; i < steps.length; i++) {
-      if (steps[i].callId === it.callId) {
-        return true;
-      }
-    }
-    return false;
   }
 
   /**
@@ -2121,8 +2125,14 @@ export class SessionStore {
         const sid2: string = data.sessionId !== undefined ? data.sessionId : '';
         const row2: SessionRow | undefined = this.findRow(sid2);
         if (row2 !== undefined) {
-          row2.running = data.running === true;
+          const wasRunning: boolean = row2.running;
+          const running: boolean = data.running === true;
+          row2.running = running;
           this.listVersion = this.listVersion + 1;
+          // turn.end 丢失时，running:true→false 是完成兜底；补一次空闲权威对账。
+          if (wasRunning && !running && this.link.getState() === 'online') {
+            this.loadHistory(sid2, false);
+          }
         }
         break;
       }
@@ -2229,6 +2239,11 @@ export class SessionStore {
         const errText: string = data.status === 'error'
           ? (data.error !== undefined ? data.error : '回复出错') : '';
         this.finalizeTurn(sid5, errText);
+        // turn.end 是回合硬边界：row.running 已在上面归零，立即用最新权威页对账。
+        // 若此前有在途历史，loadHistory 会记录尾随刷新，旧快照不会吃掉这次收尾。
+        if (sid5.length > 0 && this.link.getState() === 'online') {
+          this.loadHistory(sid5, false);
+        }
         break;
       }
       case TOPIC_APPROVAL_REQUEST: {

@@ -2,7 +2,10 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { DshrcOrderedQueue } from './entry/src/main/ets/model/ordered-queue.ts';
-import { collectCoveredLiveTextIds } from './entry/src/main/ets/model/timeline-reconcile.ts';
+import {
+  collectCoveredLiveStepIds,
+  collectCoveredLiveTextIds
+} from './entry/src/main/ets/model/timeline-reconcile.ts';
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -89,6 +92,21 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
     '运行中没有新增 durable 时不得清理 live');
 }
 
+{
+  const durable = [{ callId: 'known' }];
+  const live = [
+    { itemId: 's-known', callId: 'known' },
+    { itemId: 's-orphan', callId: 'orphan' },
+  ];
+  assert.deepEqual([...collectCoveredLiveStepIds(durable, live, false)], ['s-known'],
+    '运行中只按 callId 去重，不能误删尚未进历史的直播步骤');
+  assert.deepEqual([...collectCoveredLiveStepIds(durable, live, true)].sort(),
+    ['s-known', 's-orphan'],
+    '空闲最新页必须清掉未进本页的残留步骤，禁止在最终消息后拼出幽灵 group');
+  assert.deepEqual([...collectCoveredLiveStepIds([], live, true)].sort(),
+    ['s-known', 's-orphan'], '即使本页没有任何步骤，空闲权威对账也要接管全部 live 步骤');
+}
+
 // 纯函数之外再做接线断言，防止以后留下测试通过但生产路径未接队列/对账的假回归。
 const linkSource = readFileSync(new URL('./entry/src/main/ets/model/link.ets', import.meta.url), 'utf8');
 assert.match(linkSource, /this\.inboundQueue\.enqueue/);
@@ -96,6 +114,11 @@ assert.match(linkSource, /this\.outboundQueue\.enqueue/);
 assert.match(linkSource, /generation !== this\.connectionGeneration/);
 const storeSource = readFileSync(new URL('./entry/src/main/ets/model/sessionstore.ets', import.meta.url), 'utf8');
 assert.match(storeSource, /collectCoveredLiveTextIds\(durable, live, dropFinalized\)/);
-assert.match(storeSource, /this\.coveredLiveIds\(items, messages, !this\.runningOf\(sid\)\)/);
+assert.match(storeSource, /const authoritativeIdle: boolean = !prepend && !this\.runningOf\(sid\)/);
+assert.match(storeSource, /this\.coveredLiveIds\(items, messages, authoritativeIdle\)/);
+assert.match(storeSource, /collectCoveredLiveStepIds\(steps, liveSteps, authoritativeIdle\)/);
+assert.match(storeSource, /it\.isStep\(\) && coveredSteps\.has\(it\.id\)/);
+assert.match(storeSource, /case TOPIC_TURN_END:[\s\S]*?row5\.running = false;[\s\S]*?this\.finalizeTurn\(sid5, errText\);[\s\S]*?this\.loadHistory\(sid5, false\)/);
+assert.match(storeSource, /case TOPIC_SESSION_STATUS:[\s\S]*?wasRunning && !running[\s\S]*?this\.loadHistory\(sid2, false\)/);
 
-console.log('live-order-node-test: 6 behavior groups + wiring assertions passed');
+console.log('live-order-node-test: 7 behavior groups + completion/step reconcile wiring assertions passed');

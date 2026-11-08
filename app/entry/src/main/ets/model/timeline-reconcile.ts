@@ -87,6 +87,45 @@ export function collectCoveredLiveTextIds(durable: DshrcDurableText[], live: Dsh
   return covered;
 }
 
+/** 工作步骤对账所需的最小 durable / live 形状。 */
+export interface DshrcDurableStep {
+  callId: string;
+}
+
+export interface DshrcLiveStep {
+  itemId: string;
+  callId: string;
+}
+
+/**
+ * 找出已由权威历史接管、应从时间线移除的直播步骤。
+ *
+ * - 普通合并仍按 callId 去重，运行中的直播步骤不会因暂时没进历史而消失。
+ * - authoritativeIdle=true 仅用于「非 prepend 最新页 + Host 已空闲」：本页已经
+ *   是最终权威投影，所有 seq=-1 的步骤都必须退出；否则没进入本页的直播步骤
+ *   会被统一追加到最终消息之后，形成一个重启 App 才消失的幽灵 process group。
+ */
+export function collectCoveredLiveStepIds(durable: DshrcDurableStep[], live: DshrcLiveStep[],
+  authoritativeIdle: boolean): Set<string> {
+  const covered: Set<string> = new Set<string>();
+  if (authoritativeIdle) {
+    for (let i: number = 0; i < live.length; i++) {
+      covered.add(live[i].itemId);
+    }
+    return covered;
+  }
+  const durableIds: Set<string> = new Set<string>();
+  for (let d: number = 0; d < durable.length; d++) {
+    durableIds.add(durable[d].callId);
+  }
+  for (let i: number = 0; i < live.length; i++) {
+    if (durableIds.has(live[i].callId)) {
+      covered.add(live[i].itemId);
+    }
+  }
+  return covered;
+}
+
 /**
  * 找出可被持久历史覆盖的**附件-only 乐观消息**（契约 §5.11.4 v1.2.0）。
  *

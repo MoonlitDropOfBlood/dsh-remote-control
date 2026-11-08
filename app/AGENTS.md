@@ -443,3 +443,14 @@ List {
   读取自己的完整错误原因，并提供「重新加载」；首页不再截断或抢走这类错误。
 - 开始/成功加载会清除该会话旧错误，断开或切换远程时清空，避免跨主机串错。
 - 回归：`node session-detail-contract-test.mjs` 包含历史错误归属、详情卡与重试接线断言。
+
+## 2026-11-08：回合完成后的幽灵 process group（协议不变）
+
+- 症状：最终助手消息后偶尔多出一个分组，重启 App 后消失。根因是历史/直播竞态把
+  `seq=-1` 的迟到 reasoning 或 orphan step 留在尾部；`groupTimeline` 只是把这些真实残留归组，
+  **不是 Repeat 凭空多画节点**，不要靠改 key/禁复用掩盖。
+- `turn.end` 先把该会话视为空闲，再触发最新页 `loadHistory`；在途请求由 pendingHistory
+  自动追加尾随刷新。`session.status` 的 `running:true→false` 另作 turn.end 丢失时的对账兜底。
+- `collectCoveredLiveStepIds`：运行中/向前翻页仍按 callId 去重；**非 prepend 最新页 + Host 空闲**
+  接管全部 live steps，包括没进入本页的 orphan，防止它们统一挪到最终消息后形成幽灵组。
+- 回归：`node live-order-node-test.mjs` 覆盖 orphan step 的运行中保留、空闲清理及两条完成触发路径。

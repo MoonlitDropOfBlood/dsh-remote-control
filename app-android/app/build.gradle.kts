@@ -2,11 +2,42 @@
  * Copyright (c) 2026 dukedsh.
  * DSH Pocket for Android —— :app（Android application，Compose UI）。
  */
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
 }
+
+// ---------------------------------------------------------------------------
+// 发布签名（密钥与口令**一律不入库**）
+//
+// 把下列四项写进 app-android/local.properties（已被 .gitignore 忽略）：
+//   dshrc.storeFile=<keystore 绝对路径>   例：C:/Users/<you>/.dsh/android/dsh-pocket-release.jks
+//   dshrc.storePassword=<keystore 口令>
+//   dshrc.keyAlias=<别名>
+//   dshrc.keyPassword=<key 口令>
+// 也可用同名环境变量（DSHRC_STORE_FILE / DSHRC_STORE_PASSWORD / DSHRC_KEY_ALIAS / DSHRC_KEY_PASSWORD）。
+// 缺任一项 → release 构建不签名（仍能出包，只是装不上），**不会让构建失败**。
+// ---------------------------------------------------------------------------
+val signingProps = Properties().apply {
+    val f = rootProject.file("local.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
+}
+
+fun signingProp(name: String): String? =
+    (signingProps.getProperty(name) ?: System.getenv(name.replace('.', '_').uppercase()))
+        ?.trim()
+        ?.takeIf { it.isNotEmpty() }
+
+val releaseStoreFile = signingProp("dshrc.storeFile")
+val releaseStorePassword = signingProp("dshrc.storePassword")
+val releaseKeyAlias = signingProp("dshrc.keyAlias")
+val releaseKeyPassword = signingProp("dshrc.keyPassword")
+val hasReleaseSigning = listOf(
+    releaseStoreFile, releaseStorePassword, releaseKeyAlias, releaseKeyPassword
+).all { it != null }
 
 android {
     namespace = "dsh.rc.pocket"
@@ -18,13 +49,27 @@ android {
         minSdk = 26
         targetSdk = 36
         versionCode = 1
-        versionName = "1.0.0"
+        versionName = "1.3.0"
+    }
+
+    signingConfigs {
+        if (hasReleaseSigning) {
+            create("release") {
+                storeFile = file(releaseStoreFile!!)
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+            }
+        }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            if (hasReleaseSigning) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
         debug {
             applicationIdSuffix = ".debug"

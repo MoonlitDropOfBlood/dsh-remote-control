@@ -50,11 +50,13 @@ import dsh.rc.pocket.data.RemoteRepo
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -237,14 +239,13 @@ class PocketViewModel(application: Application) : AndroidViewModel(application) 
     val logs = app.logs
 
     /**
-     * 当前活动会话的历史错误（空串 = 无）。
+     * 某会话自己的历史错误流（空串 = 无）。
      *
-     * 历史错误**只归属该会话**（不写全局 lastError → 首页不会抢别人的错误横幅）。
+     * 错误**按会话归属**（对齐鸿蒙 `historyErrorFor(sid)`）：详情页只显示自己会话的错误，
+     * 断链清空活动会话投影时也**不会**把已经报出来的错误一起抹掉。
      */
-    val historyError: StateFlow<String> =
-        combine(store.historyError, store.activeSessionId) { err, sid ->
-            if (err != null && err.sessionId == sid) err.message else ""
-        }.stateIn(viewModelScope, SharingStarted.Eagerly, "")
+    fun historyErrorFor(sessionId: String): Flow<String> =
+        store.historyError.map { err -> if (err != null && err.sessionId == sessionId) err.message else "" }
 
     /** 历史正在加载（详情页据此禁用「重新加载」按钮）。 */
     val historyLoading: StateFlow<Boolean> = store.historyLoading

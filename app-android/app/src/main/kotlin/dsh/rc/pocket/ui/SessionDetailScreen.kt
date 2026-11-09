@@ -38,18 +38,19 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.ChevronLeft
 import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
@@ -69,6 +70,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -120,7 +122,9 @@ fun SessionDetailScreen(
     val drafts by vm.drafts.collectAsState()
     val uploadProgress by vm.uploadProgress.collectAsState()
     val uploading by vm.uploading.collectAsState()
-    val historyError by vm.historyError.collectAsState()
+    // 历史错误**按会话归属**（对齐鸿蒙 historyErrorFor）：断链清活动会话也不抹掉已报出的错误
+    val historyError by remember(sessionId) { vm.historyErrorFor(sessionId) }
+        .collectAsState(initial = "")
     val historyLoading by vm.historyLoading.collectAsState()
 
     var draft by remember { mutableStateOf("") }
@@ -185,11 +189,20 @@ fun SessionDetailScreen(
                         .fillMaxWidth()
                         .padding(horizontal = Sp.sp4, vertical = Sp.sp2),
                 ) {
-                    IconButton(onClick = onBack) {
+                    // 返回键：浅灰圆底 + chevron 矢量图标（对齐鸿蒙 sys.symbol.chevron_left；
+                    // 文字 ‹ 在不同字体下基线会飘 → 不用字符）。
+                    Box(
+                        modifier = Modifier
+                            .size(36.dp)
+                            .background(colors.bgLayer2, CircleShape)
+                            .clickable { onBack() },
+                        contentAlignment = Alignment.Center,
+                    ) {
                         Icon(
-                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                            imageVector = Icons.Filled.ChevronLeft,
                             contentDescription = "返回",
                             tint = colors.labelPrimary,
+                            modifier = Modifier.size(22.dp),
                         )
                     }
                     Column(modifier = Modifier.weight(1f)) {
@@ -261,14 +274,23 @@ fun SessionDetailScreen(
                         horizontalArrangement = Arrangement.End,
                         modifier = Modifier.fillMaxWidth(),
                     ) {
-                        TextButton(
+                        // 白色实心圆角按钮「重新加载」（红字）；加载中禁用
+                        Button(
                             onClick = { vm.retryHistory(sessionId) },
                             enabled = !historyLoading,
+                            shape = RoundedCornerShape(Radius.ctrl),
+                            contentPadding = PaddingValues(horizontal = Sp.sp3, vertical = Sp.sp1),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = colors.bgLayer1,
+                                contentColor = colors.stateError,
+                                disabledContainerColor = colors.bgLayer1,
+                                disabledContentColor = colors.labelTertiary,
+                            ),
+                            modifier = Modifier.height(32.dp),
                         ) {
                             Text(
                                 text = "重新加载",
                                 style = MaterialTheme.typography.labelSmall,
-                                color = colors.stateError,
                             )
                         }
                     }
@@ -277,34 +299,61 @@ fun SessionDetailScreen(
 
             // ---- 子代理目录（契约 §5.6） ----
             if (subagents.isNotEmpty()) {
-                LazyRow(
-                    horizontalArrangement = Arrangement.spacedBy(Sp.sp2),
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = Sp.sp4, vertical = Sp.sp1),
+                        .padding(start = Sp.sp4, end = Sp.sp4, top = Sp.sp1, bottom = Sp.sp1),
                 ) {
+                    // 「子代理」前缀标签（对齐鸿蒙 subagentBar）
+                    Text(
+                        text = "子代理",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = colors.labelSecondary,
+                        modifier = Modifier.padding(end = Sp.sp2),
+                    )
+                    LazyRow(
+                        horizontalArrangement = Arrangement.spacedBy(Sp.sp2),
+                        modifier = Modifier.weight(1f),
+                    ) {
                     items(subagents, key = { it.sessionId }) { sub ->
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
                             modifier = Modifier
                                 .background(colors.bgLayer2, RoundedCornerShape(Radius.pill))
+                                .border(Hairline, colors.borderL1, RoundedCornerShape(Radius.pill))
                                 .clickable { onOpenSubagent(sub.sessionId, sessionId, sub.mode) }
-                                .padding(horizontal = Sp.sp2, vertical = Sp.sp1),
+                                .padding(horizontal = Sp.sp3, vertical = Sp.sp1 + 2.dp),
                         ) {
-                            if (sub.running) {
-                                Box(
-                                    modifier = Modifier
-                                        .size(6.dp)
-                                        .background(colors.brandFill, CircleShape),
-                                )
-                            }
+                            // 运行态圆点：运行中用品牌色，否则灰（对齐鸿蒙 SubagentChip）
+                            Box(
+                                modifier = Modifier
+                                    .size(6.dp)
+                                    .background(
+                                        if (sub.running) colors.brandFill else colors.labelTertiary,
+                                        CircleShape,
+                                    ),
+                            )
                             Text(
                                 text = sub.displayLabel(),
                                 style = MaterialTheme.typography.labelSmall,
-                                color = colors.labelSecondary,
-                                modifier = Modifier.padding(start = 4.dp),
+                                color = colors.labelPrimary,
+                                modifier = Modifier.padding(start = 5.dp),
                             )
+                            // 一次性子代理角标（对齐鸿蒙 SubagentChip 的「一次性」标签）
+                            if (sub.mode == "one-shot") {
+                                Text(
+                                    text = "一次性",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = colors.labelSecondary,
+                                    modifier = Modifier
+                                        .padding(start = Sp.sp1)
+                                        .background(colors.bgLayer2, RoundedCornerShape(Radius.pill))
+                                        .padding(horizontal = 6.dp, vertical = 1.dp),
+                                )
+                            }
                         }
+                    }
                     }
                 }
             }
@@ -412,14 +461,16 @@ fun SessionDetailScreen(
             ) {
                 Capsule(
                     text = modelCapsuleText(capabilities, sessionModel),
-                    sub = sessionModel?.reasoningEffort.orEmpty(),
-                    readOnly = readOnly,
+                    sub = modelEffortText(capabilities, sessionModel),
+                    trailingText = if (readOnly) "只读" else "",
+                    showChevron = !readOnly,
                     onClick = { if (!readOnly) showModelPicker = true },
                 )
                 Capsule(
                     text = permissionCapsuleText(capabilities, sessionPermission),
-                    sub = if (readOnly) "只读" else "权限",
-                    readOnly = readOnly,
+                    sub = "",
+                    trailingText = if (readOnly) "只读" else "权限",
+                    showChevron = !readOnly,
                     onClick = { if (!readOnly) showPermissionPicker = true },
                 )
             }
@@ -464,108 +515,139 @@ fun SessionDetailScreen(
                             modifier = Modifier.padding(horizontal = Sp.sp3, vertical = Sp.sp1),
                         )
                     }
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
+                    // composer 卡片：一张白色圆角面板里放「附件 / 输入 / 停止 / 发送」
+                    //（对齐鸿蒙 SessionDetailPage.ets：卡片就是容器，输入框不再自带描边 → 避免框中框）
+                    Column(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(Sp.sp3),
+                            .padding(horizontal = Sp.sp3)
+                            .padding(top = Sp.sp1, bottom = Sp.sp3),
                     ) {
-                        if (attachmentVisible) {
-                            Box {
-                                IconButton(
-                                    onClick = { showAttachMenu = true },
-                                    enabled = !uploading,
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.Add,
-                                        contentDescription = "添加附件",
-                                        tint = colors.labelSecondary,
-                                    )
-                                }
-                                DropdownMenu(
-                                    expanded = showAttachMenu,
-                                    onDismissRequest = { showAttachMenu = false },
-                                ) {
-                                    DropdownMenuItem(
-                                        text = { Text("图片") },
-                                        leadingIcon = {
-                                            Icon(Icons.Default.Image, contentDescription = null)
-                                        },
-                                        onClick = {
-                                            showAttachMenu = false
-                                            picker.pickImage()
-                                        },
-                                    )
-                                    DropdownMenuItem(
-                                        text = { Text("文件") },
-                                        leadingIcon = {
-                                            Icon(Icons.AutoMirrored.Filled.InsertDriveFile, contentDescription = null)
-                                        },
-                                        onClick = {
-                                            showAttachMenu = false
-                                            picker.pickFile()
-                                        },
-                                    )
-                                }
-                            }
-                        }
-                        TextField(
-                            value = draft,
-                            onValueChange = { draft = it },
-                            placeholder = {
-                                Text(
-                                    text = "输入提示词…",
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    color = colors.labelTertiary,
-                                )
-                            },
-                            colors = TextFieldDefaults.colors(
-                                focusedContainerColor = colors.bgLayer1,
-                                unfocusedContainerColor = colors.bgLayer1,
-                                focusedIndicatorColor = colors.borderL2,
-                                unfocusedIndicatorColor = colors.borderL1,
-                                cursorColor = colors.brandFill,
-                                focusedTextColor = colors.labelPrimary,
-                                unfocusedTextColor = colors.labelPrimary,
-                            ),
-                            modifier = Modifier.weight(1f),
-                        )
-                        // 发送 / 停止聚合成同一个按钮（与 DSH composer 一致）
-                        if (running && draft.isBlank() && drafts.isEmpty()) {
-                            IconButton(
-                                onClick = { vm.cancelTurn(sessionId, parentSessionId) },
-                                modifier = Modifier
-                                    .size(40.dp)
-                                    .background(colors.stateErrorTint, CircleShape),
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(colors.bgLayer1, RoundedCornerShape(Radius.composer))
+                                .border(Hairline, colors.borderL1, RoundedCornerShape(Radius.composer))
+                                .padding(Sp.sp2),
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.fillMaxWidth(),
                             ) {
-                                Icon(
-                                    imageVector = Icons.Default.Stop,
-                                    contentDescription = "停止",
-                                    tint = colors.stateError,
-                                )
-                            }
-                        } else {
-                            val canSend = !uploading &&
-                                (draft.isNotBlank() || drafts.isNotEmpty()) &&
-                                linkState == LinkState.ONLINE
-                            IconButton(
-                                onClick = {
-                                    vm.send(sessionId, draft.trim(), parentSessionId)
-                                    draft = ""
-                                },
-                                enabled = canSend,
-                                modifier = Modifier
-                                    .size(40.dp)
-                                    .background(
-                                        if (canSend) colors.brandFill else colors.bgLayer2,
-                                        CircleShape,
+                                if (attachmentVisible) {
+                                    Box {
+                                        // 灰色圆形「+」入口（鸿蒙：Circle 按钮 + bg_layer_2）
+                                        Box(
+                                            modifier = Modifier
+                                                .size(36.dp)
+                                                .background(colors.bgLayer2, CircleShape)
+                                                .clickable(enabled = !uploading) { showAttachMenu = true },
+                                            contentAlignment = Alignment.Center,
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.Add,
+                                                contentDescription = "添加附件",
+                                                tint = colors.labelSecondary,
+                                                modifier = Modifier.size(20.dp),
+                                            )
+                                        }
+                                        DropdownMenu(
+                                            expanded = showAttachMenu,
+                                            onDismissRequest = { showAttachMenu = false },
+                                        ) {
+                                            DropdownMenuItem(
+                                                text = { Text("图片") },
+                                                leadingIcon = {
+                                                    Icon(Icons.Default.Image, contentDescription = null)
+                                                },
+                                                onClick = {
+                                                    showAttachMenu = false
+                                                    picker.pickImage()
+                                                },
+                                            )
+                                            DropdownMenuItem(
+                                                text = { Text("文件") },
+                                                leadingIcon = {
+                                                    Icon(Icons.AutoMirrored.Filled.InsertDriveFile, contentDescription = null)
+                                                },
+                                                onClick = {
+                                                    showAttachMenu = false
+                                                    picker.pickFile()
+                                                },
+                                            )
+                                        }
+                                    }
+                                }
+                                TextField(
+                                    value = draft,
+                                    onValueChange = { draft = it },
+                                    placeholder = {
+                                        Text(
+                                            text = "输入提示词…",
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            color = colors.labelTertiary,
+                                        )
+                                    },
+                                    colors = TextFieldDefaults.colors(
+                                        // 卡片已经是容器 → 输入框自身透明、无下划线（避免框中框）
+                                        focusedContainerColor = colors.bgLayer1,
+                                        unfocusedContainerColor = colors.bgLayer1,
+                                        disabledContainerColor = colors.bgLayer1,
+                                        focusedIndicatorColor = Color.Transparent,
+                                        unfocusedIndicatorColor = Color.Transparent,
+                                        disabledIndicatorColor = Color.Transparent,
+                                        cursorColor = colors.brandFill,
+                                        focusedTextColor = colors.labelPrimary,
+                                        unfocusedTextColor = colors.labelPrimary,
                                     ),
-                            ) {
-                                Icon(
-                                    imageVector = Icons.AutoMirrored.Filled.Send,
-                                    contentDescription = "发送",
-                                    tint = if (canSend) colors.labelOnBrand else colors.labelTertiary,
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .padding(horizontal = Sp.sp2),
                                 )
+                                // 发送 / 停止聚合成同一个按钮（与 DSH composer 一致）
+                                //  - 输入区有内容（文字或附件）→ 永远显示「发送」（运行中也发，走插话/排队）
+                                //  - 输入区为空且 agent 运行中 → 显示「停止」（取消当前 turn）
+                                //  - 输入区为空且空闲 → 发送置灰（禁用态：灰底 + 灰图标）
+                                if (running && draft.isBlank() && drafts.isEmpty()) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(40.dp)
+                                            .background(colors.stateErrorTint, CircleShape)
+                                            .clickable { vm.cancelTurn(sessionId, parentSessionId) },
+                                        contentAlignment = Alignment.Center,
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Stop,
+                                            contentDescription = "停止",
+                                            tint = colors.stateError,
+                                            modifier = Modifier.size(18.dp),
+                                        )
+                                    }
+                                } else {
+                                    val canSend = !uploading &&
+                                        (draft.isNotBlank() || drafts.isNotEmpty()) &&
+                                        linkState == LinkState.ONLINE
+                                    Box(
+                                        modifier = Modifier
+                                            .size(40.dp)
+                                            .background(
+                                                if (canSend) colors.brandFill else colors.bgLayer2,
+                                                CircleShape,
+                                            )
+                                            .clickable(enabled = canSend) {
+                                                vm.send(sessionId, draft.trim(), parentSessionId)
+                                                draft = ""
+                                            },
+                                        contentAlignment = Alignment.Center,
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.AutoMirrored.Filled.Send,
+                                            contentDescription = "发送",
+                                            tint = if (canSend) colors.labelOnBrand else colors.labelTertiary,
+                                            modifier = Modifier.size(18.dp),
+                                        )
+                                    }
+                                }
                             }
                         }
                     }
@@ -608,12 +690,21 @@ fun SessionDetailScreen(
     }
 }
 
-/** 输入区上方的胶囊（模型 / 权限）。 */
+/**
+ * 输入区上方的胶囊（模型 / 权限）。
+ *
+ * 结构对齐鸿蒙 SessionDetailPage.ets：
+ *  - 主文案（模型显示名 / 权限名）；
+ *  - 第二段小字 = 思考强度**显示名**（没有则不显示）；
+ *  - 第三段小字 = 「只读」（subagent）或「权限」（根会话）；
+ *  - 右侧下拉箭头（**只有根会话**有 → 可点开切换；subagent 只读无箭头）。
+ */
 @Composable
 private fun Capsule(
     text: String,
     sub: String,
-    readOnly: Boolean,
+    trailingText: String,
+    showChevron: Boolean,
     onClick: () -> Unit,
 ) {
     val colors = PocketTheme.colors
@@ -641,15 +732,65 @@ private fun Capsule(
                 modifier = Modifier.padding(start = Sp.sp1),
             )
         }
+        if (trailingText.isNotEmpty()) {
+            Text(
+                text = trailingText,
+                style = MaterialTheme.typography.labelSmall,
+                color = colors.labelTertiary,
+                modifier = Modifier.padding(start = Sp.sp1),
+            )
+        }
+        if (showChevron) {
+            Icon(
+                imageVector = Icons.Default.KeyboardArrowDown,
+                contentDescription = null,
+                tint = colors.labelTertiary,
+                modifier = Modifier
+                    .padding(start = 2.dp)
+                    .size(16.dp),
+            )
+        }
     }
 }
 
-/** 模型胶囊文案（当前模型；null → 目录默认；目录里没有该模型时**不回退默认**）。 */
+/**
+ * 模型胶囊文案（目录里的**显示名**；目录里没有该模型才退回 provider/model 截断）。
+ *
+ * 对齐鸿蒙 modelCapsuleText()：与 PC composer 同口径——用户看到的是模型目录里的
+ * 友好名（如「DeepSeek Chat」），不是「deepseek/deepseek-chat」这种裸 id。
+ */
 private fun modelCapsuleText(capabilities: Capabilities?, model: ModelSelection?): String {
-    if (model != null) return model.display()
     val models = capabilities?.models.orEmpty()
+    if (model != null) {
+        val hit = models.firstOrNull { it.provider == model.provider && it.model == model.model }
+        if (hit != null) return hit.name.ifEmpty { hit.model }
+        // 目录里没有该模型（宿主目录变了）→ provider/model 截断显示
+        val ref = "${model.provider}/${model.model}"
+        return if (ref.length > 24) ref.substring(0, 24) + "…" else ref
+    }
     val def = models.firstOrNull { it.id == capabilities?.defaultModelId } ?: models.firstOrNull()
-    return def?.let { "${it.provider}/${it.model}" } ?: "默认模型"
+    return def?.let { it.name.ifEmpty { it.model } } ?: "模型"
+}
+
+/**
+ * 思考强度的**显示名**（对齐鸿蒙 modelEffortText()，与 PC 同口径）。
+ *
+ *  - 强度 id = 会话显式选择 > 所选模型的默认强度；
+ *  - 显示名 = 该模型 efforts 里对应 id 的 name（目录里没有就原样显示 id）；
+ *  - 没有强度 → 空串（胶囊里不显示这一段）。
+ */
+private fun modelEffortText(capabilities: Capabilities?, model: ModelSelection?): String {
+    val models = capabilities?.models.orEmpty()
+    val option: ModelOption? = if (model != null) {
+        models.firstOrNull { it.provider == model.provider && it.model == model.model }
+    } else {
+        models.firstOrNull { it.id == capabilities?.defaultModelId } ?: models.firstOrNull()
+    }
+    var effortId = model?.reasoningEffort.orEmpty()
+    if (effortId.isEmpty() && option != null) effortId = option.reasoningEffort.orEmpty()
+    if (effortId.isEmpty()) return ""
+    val efforts = option?.efforts.orEmpty()
+    return efforts.firstOrNull { it.id == effortId }?.name ?: effortId
 }
 
 /** 权限胶囊文案（"custom" 是派生态，只展示）。 */

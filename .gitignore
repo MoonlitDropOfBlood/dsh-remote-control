@@ -1,0 +1,56 @@
+# 依赖与产物
+node_modules/
+oh_modules/
+.pnpm-store/
+*.tsbuildinfo
+
+# 构建输出
+build/
+**/build/
+.cxx/
+**/.cxx/
+hvigor/hvigor-wrapper/
+**/hvigor-wrapper/
+**/.hvigor/
+**/.idea/
+**/.gitignore
+
+# 本地签名 / 密钥 / 配对信息
+*.p12
+*.p7b
+*.cer
+*.pem
+*.key
+*.keystore
+*.jks
+*.pfx
+local.properties
+**/local.properties
+remote-control-config.json
+
+# 工具缓存
+.lint/
+.tmpdocs/
+**/.dsh/
+
+# HarmonyOS 构建产物（devecocli/hvigor）
+app/entry/build/
+app/**/build/
+app/**/oh_modules/
+app/.hvigor/
+app/linter-cache/
+
+# Android 构建产物（Gradle/AGP）
+app-android/.gradle/
+app-android/**/build/
+app-android/.kotlin/
+app-android/captures/
+app-android/.externalNativeBuild/
+app-android/.cxx/
+
+# 调试截屏（本地排障产物）
+e2e/shot*.jpeg
+.cache/
+
+# 插件包内的市场索引副本（发布时由 market/sync-into-plugin.mjs 生成）
+plugin/market/

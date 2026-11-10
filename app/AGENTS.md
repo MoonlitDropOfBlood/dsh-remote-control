@@ -483,7 +483,7 @@ List {
 - 回归：`node live-order-node-test.mjs` 新增尾部幽灵判定 8 例（已定稿思考/步骤要被接管；
   流式思考、running 步骤、直播消息不得被清）+ 回前台对账/等待列表的接线断言。
 
-### 2026-11-10 复现补充：幽灵组变成「出现又消失」（v1.3.2）
+### 2026-11-10 复现补充：幽灵组变成「出现又消失」（v1.3.1）
 
 - 真机日志（首次修复后）：`Ability onForeground` → 重连 online → 历史合并时打印
   `finalized stale streaming blocks after history load (turn.end likely lost)` →
@@ -495,7 +495,7 @@ List {
   期间缓存的帧在重连后**大量解密失败**（日志 `decrypt failed seq=… err=17630001`，
   一次 100+ 帧）——旧连接/旧对端的 sid 与纪元已变，replay 无意义。故回前台**只能**
   靠 `session.list` + `session.history` 权威拉取，别指望中继缓存补 `turn.end`。
-- v1.3.2 收尾（`model/sessionstore.ets`）：
+- v1.3.1 收尾（`model/sessionstore.ets`）：
   - `beginHideLiveTail()`：回前台（`onAppForeground` 第一帧）与重连对账入口进场时，
     若活动会话缓存里有直播思考块，**只在分组投影**隐藏它们（`hidingLiveTail` 只作用于
     `applyTimeline` 的 `groupTimeline` 入参，原始 `timeline` 数据不动）。

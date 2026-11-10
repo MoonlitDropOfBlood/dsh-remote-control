@@ -90,7 +90,7 @@ class MainActivity : ComponentActivity() {
 fun PocketNavHost() {
     val vm: PocketViewModel = viewModel()
     val nav = rememberNavController()
-    // v1.3.2：回前台做一次权威对账（后台丢 turn.end 时靠它收编尾部残留；
+    // v1.3.1：回前台做一次权威对账（后台丢 turn.end 时靠它收编尾部残留；
     // 对齐 HarmonyOS 版 EntryAbility.onForeground）。
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner, vm) {

@@ -438,7 +438,7 @@ class PocketViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     /**
-     * 回前台（v1.3.2）：store 内部先拉 `session.list`（running 真值）再拉最新历史，
+     * 回前台（v1.3.1）：store 内部先拉 `session.list`（running 真值）再拉最新历史，
      * 并对账窗口内隐藏尾部残留思考块；对齐 HarmonyOS 版 onAppForeground。
      */
     fun onAppForeground() {

@@ -351,7 +351,7 @@ class HistoryErrorOwnershipTest {
 }
 
 /**
- * 回前台/重连的尾部幽灵思考块（v1.3.2，对齐 ArkTS 版 285fb18 的 dropLiveReasoning）：
+ * 回前台/重连的尾部幽灵思考块（v1.3.1，对齐 ArkTS 版 285fb18 的 dropLiveReasoning）：
  *
  * 后台丢 `turn.end` 留下一个**还在 streaming** 的思考块；历史合并时 `dropFinalized`
  * 只覆盖已定稿项 → 它活下来，被 groupTimeline 归成最终消息后多出来的「工作步骤」组。

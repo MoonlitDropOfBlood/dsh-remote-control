@@ -293,7 +293,7 @@ class SessionStore(
 
     private val lock = Any()
 
-    /** 回前台/重连对账窗口内隐藏尾部直播思考块（v1.3.2；只影响分组投影）。 */
+    /** 回前台/重连对账窗口内隐藏尾部直播思考块（v1.3.1；只影响分组投影）。 */
     @Volatile
     private var hideLiveTail = false
     private var hideLiveTailSid: String? = null
@@ -888,7 +888,7 @@ class SessionStore(
     // =================================================================================
 
     /**
-     * 回前台（Activity ON_RESUME 调用，v1.3.2）。
+     * 回前台（Activity ON_RESUME 调用，v1.3.1）。
      *
      * 后台冻结期间 `turn.end` 常常丢失，而套接字又常停在 ONLINE（不会触发重连），
      * 因此回前台必须主动做一次权威对账（`session.list` running 真值 → 最新历史）；
@@ -1213,7 +1213,7 @@ class SessionStore(
     /** 时间线整体替换 + 同步过程分组投影（分组必须在**数据侧**算好）。 */
     private fun publishTimeline(items: List<TimelineItem>) {
         _timeline.value = items
-        // v1.3.2：隐藏窗口只过滤**分组投影**，原始时间线数据不动（权威页一到就能恢复）。
+        // v1.3.1：隐藏窗口只过滤**分组投影**，原始时间线数据不动（权威页一到就能恢复）。
         val forGroups = if (hideLiveTail) items.filterNot { it is TimelineReasoning && it.seqOf() < 0 } else items
         _entries.value = buildEntries(forGroups)
     }
@@ -2044,7 +2044,7 @@ internal fun mergeTimelineItems(
             }
         }
     }
-    // v1.3.2：宿主空闲时权威页就是最终投影——遗留的直播思考块（可能还停在 streaming、
+    // v1.3.1：宿主空闲时权威页就是最终投影——遗留的直播思考块（可能还停在 streaming、
     // dropFinalized 覆盖不到）同样必须退出；否则它会在最终消息之后拼出多出来的
     // 「工作步骤」过程组，要等下一次对账才消失。
     if (dropFinalized) {

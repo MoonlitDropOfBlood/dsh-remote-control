@@ -482,3 +482,27 @@ List {
   - 硬约束：`session.list` 与 `session.history` **不得再并行**（历史最新页不得在列表在途时抢跑）。
 - 回归：`node live-order-node-test.mjs` 新增尾部幽灵判定 8 例（已定稿思考/步骤要被接管；
   流式思考、running 步骤、直播消息不得被清）+ 回前台对账/等待列表的接线断言。
+
+### 2026-11-10 复现补充：幽灵组变成「出现又消失」（v1.3.2）
+
+- 真机日志（首次修复后）：`Ability onForeground` → 重连 online → 历史合并时打印
+  `finalized stale streaming blocks after history load (turn.end likely lost)` →
+  **1.2s 后**才 `settle reconcile ...`。即：后台丢 `turn.end` 留下的
+  **streaming 思考块**先被 `groupTimeline()` 归成一个「工作步骤」组渲染出来；
+  `dropFinalized` 只覆盖已定稿项，合并当下它还是 streaming → 覆盖不到 →
+  要等下一次权威页才退出（用户看到「出现又消失」）。
+- 另一个真机事实（与隐藏窗口无关但必须知道）：加固模式（AAD 绑 sid）下，中继在断线
+  期间缓存的帧在重连后**大量解密失败**（日志 `decrypt failed seq=… err=17630001`，
+  一次 100+ 帧）——旧连接/旧对端的 sid 与纪元已变，replay 无意义。故回前台**只能**
+  靠 `session.list` + `session.history` 权威拉取，别指望中继缓存补 `turn.end`。
+- v1.3.2 收尾（`model/sessionstore.ets`）：
+  - `beginHideLiveTail()`：回前台（`onAppForeground` 第一帧）与重连对账入口进场时，
+    若活动会话缓存里有直播思考块，**只在分组投影**隐藏它们（`hidingLiveTail` 只作用于
+    `applyTimeline` 的 `groupTimeline` 入参，原始 `timeline` 数据不动）。
+    权威页落地（`mergeHistory`）或 3s 兜底即恢复；任何 `assistant.delta` /
+    `reasoningDelta` / `tool.call` 到达立刻结束隐藏（证明回合真在跑，不能压住生成内容）。
+  - `mergeHistory` 在宿主空闲时**当场** `dropLiveReasoning()` 摘掉遗留直播思考块，
+    不再依赖 1.2s 的补发扫描（扫描保留，只作迟到补发的兜底）。
+  - 切会话 / 断链时隐藏窗口作废（`openSession` / `onLinkState('stopped'|'idle')`）。
+- 回归：`node live-order-node-test.mjs` 增加 `hidingLiveTail`、投影过滤、空闲当场摘除、
+  `reasoningDelta` 结束隐藏的接线断言。

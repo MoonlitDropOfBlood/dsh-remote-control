@@ -163,4 +163,17 @@ assert.match(storeSource, /return hasTrailingSettledLiveProcess\(shape\)/,
 assert.match(abilitySource, /sessionStore\.onAppForeground\(\)/,
   'EntryAbility.onForeground 必须触发存仓对账');
 
+// v1.3.2 回前台「出现又消失」：对账窗口内先隐藏尾部直播思考块（只影响分组投影），
+// 空闲权威页落地时直接摘掉，不再等 1.2s 的补发扫描。
+assert.match(storeSource, /@Trace hidingLiveTail: boolean = false/,
+  '隐藏窗口必须是可观察状态（重画才能生效）');
+assert.match(storeSource, /this\.beginHideLiveTail\(this\.activeId\);/,
+  '回前台第一帧就要开始隐藏');
+assert.match(storeSource, /const forGroups: TimelineItem\[\] = this\.hidingLiveTail \? this\.withoutLiveReasoning\(items\) : items;/,
+  '隐藏只作用于分组投影，不动原始 timeline 数据');
+assert.match(storeSource, /merged = this\.dropLiveReasoning\(merged\);/,
+  '空闲权威页必须当场摘掉遗留直播思考块（否则隐藏结束又出现）');
+assert.match(storeSource, /private appendReasoningDelta[\s\S]*?this\.finishHideLiveTail\(false\);/,
+  '新回合的思考增量必须立刻结束隐藏，不能压住正在生成的内容');
+
 console.log('live-order-node-test: 7 behavior groups + completion/foreground reconcile wiring assertions passed');

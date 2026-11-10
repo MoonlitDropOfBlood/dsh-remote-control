@@ -99,6 +99,11 @@ const IMAGE_CACHE_MAX: number = 24;
  * 且时间线尾部仍有直播过程项，再拉一次权威页把它们接管（单次，不轮询）。
  */
 const SETTLE_RECONCILE_DELAY_MS: number = 1200;
+/**
+ * 回前台/重连对账窗口内「隐藏尾部直播思考块」的最长时间（ms，v1.3.2）。
+ * 权威页一到就立即恢复；超时兜底只防「链路一直连不上」时一直不显示。
+ */
+const HIDE_LIVE_TAIL_MAX_MS: number = 3000;
 
 /** 会话列表一行（契约 §5.3 SessionSummary 的可观察形态；v1.0.4 补 subagent/blank，
  *  v1.0.7 补 archived——Host 权威的 Workspace 归档标记）。 */
@@ -521,6 +526,17 @@ export class SessionStore {
    * 这样 Repeat 同 key 复用节点时能收到 @Trace 更新（否则运行中分组不刷新）。
    */
   @Trace processGroups: TimelineEntry[] = [];
+  /**
+   * 回前台/重连对账窗口内隐藏尾部直播思考块（v1.3.2）。
+   *
+   * 后台冻结丢 `turn.end` 时，遗留的 streaming 思考块会先渲染成一个「工作步骤」分组，
+   * 要等权威页回包（dropFinalized）才被清掉 → 用户看到「出现又消失」。
+   * 隐藏窗口内只影响**分组投影**（原始 timeline 数据不动），权威页落地即恢复。
+   */
+  @Trace hidingLiveTail: boolean = false;
+  /** 隐藏窗口归属的会话 / 兜底定时器（v1.3.2）。 */
+  private hideLiveTailSid: string = '';
+  private hideLiveTailTimer: number = -1;
   // ---- 历史消息（契约 §5.1 session.history，v1.0.4；活动会话投影）----
   @Trace historyLoading: boolean = false;
   /** 历史请求在途时被合并的尾随刷新：sid → 是否向前翻页（最新页优先）。 */
@@ -651,6 +667,7 @@ export class SessionStore {
       this.reconcileActiveSession();
     }
     if (s === 'stopped' || s === 'idle') {
+      this.finishHideLiveTail(false); // v1.3.2：断链/切远程，隐藏窗口作废
       this.pendingHistory.clear();
       this.historyErrorSessionId = '';
       this.historyErrorMessage = '';
@@ -690,6 +707,10 @@ export class SessionStore {
    * onLinkState('online') 的同一入口。
    */
   onAppForeground(): void {
+    // v1.3.2：回前台的**第一帧**就先藏掉尾部直播思考块（后台丢 turn.end 时它们会
+    // 渲染成一个多余「工作步骤」组）。此时可能还在重连，权威页要稍后才到；
+    // 只要真的还有新回合在跑，第一个 delta 就会立刻结束隐藏（见 appendDelta）。
+    this.beginHideLiveTail(this.activeId);
     if (this.link.getState() !== 'online') {
       return;
     }
@@ -706,6 +727,9 @@ export class SessionStore {
    * 列表已在途时 refreshSessions 合并同一个 Promise，不重复请求。
    */
   private reconcileActiveSession(): void {
+    // v1.3.2：对账窗口内先隐藏尾部直播思考块——后台丢 turn.end 时它们是「先出现、
+    // 后消失」的多余分组；隐藏只影响投影，权威页落地就恢复真实内容。
+    this.beginHideLiveTail(this.activeId);
     const list: Promise<SessionRefreshResult> = this.refreshSessions();
     list.then((): void => {
       if (this.link.getState() !== 'online' || this.activeId.length === 0) {
@@ -1006,6 +1030,8 @@ export class SessionStore {
     if (this.activeId === sid) {
       return;
     }
+    // v1.3.2：切会话时上一个会话的「回前台隐藏」窗口作废（不重画旧会话）。
+    this.finishHideLiveTail(false);
     this.activeId = sid;
     this.projectSubagents(sid);
     // v1.0.8：投影该会话当前模型（缓存里没有 → null，UI 回退目录默认）
@@ -1533,14 +1559,22 @@ export class SessionStore {
       }
     }
     const body: TimelineItem[] = prepend ? pageItems.concat(durableKept) : durableKept.concat(pageItems);
-    const merged: TimelineItem[] = body.concat(liveKept);
-    this.cache.set(sid, merged);
+    let merged: TimelineItem[] = body.concat(liveKept);
     // v1.0.9 自愈：turn.end 事件若在断线窗口丢失，流式光标（▍）会残留在已结束的
     // 消息上。宿主侧该会话已不在运行（running=false）时不可能存在进行中的流——
     // 拉到历史后一律定稿所有 streaming 块，下次打开/刷新即自愈。
     if (!this.runningOf(sid)) {
       this.finalizeStaleStreaming(sid, merged);
+      // v1.3.2：空闲最新页是最终权威投影——遗留的直播思考块（因快照竞态还是
+      // streaming、dropFinalized 覆盖不到）同样必须退出；否则它就是最终消息后
+      // 多出来的「工作步骤」组，要等下一次对账才消失（用户看到的「出现又消失」）。
+      merged = this.dropLiveReasoning(merged);
     }
+    // 权威页已落地：结束隐藏窗口（随后的 notifyActive 一并重画，不多画一帧）。
+    if (sid === this.hideLiveTailSid) {
+      this.finishHideLiveTail(false);
+    }
+    this.cache.set(sid, merged);
     this.notifyActive(sid);
   }
 
@@ -1750,6 +1784,8 @@ export class SessionStore {
     if (sid.length === 0) {
       return;
     }
+    // v1.3.2：新的正文增量 = 确实还有回合在生成，立刻结束「回前台隐藏」窗口。
+    this.finishHideLiveTail(false);
     const items: TimelineItem[] = this.cacheOf(sid);
     const last: TimelineItem | undefined = items.length > 0 ? items[items.length - 1] : undefined;
     if (last !== undefined && last.isMessage() && last.role === 'assistant' && last.streaming) {
@@ -1774,6 +1810,8 @@ export class SessionStore {
     if (sid.length === 0) {
       return;
     }
+    // v1.3.2：新的思考增量 = 确实还有回合在生成，立刻结束「回前台隐藏」窗口。
+    this.finishHideLiveTail(false);
     const items: TimelineItem[] = this.cacheOf(sid);
     const last: TimelineItem | undefined = items.length > 0 ? items[items.length - 1] : undefined;
     if (last !== undefined && last.kind === 'reasoning' && last.streaming) {
@@ -2000,10 +2038,95 @@ export class SessionStore {
    * 时间线整体替换 + 同步过程分组投影（v1.2.2）。
    * 分组必须在**数据侧**算好：页面 build 里现算会拿到新实例，
    * 而 Repeat 同 key 不重跑 item builder → 屏幕绑旧实例 → 不刷新。
+   *
+   * v1.3.2：回前台对账窗口内（hidingLiveTail）只对**分组投影**过滤掉直播思考块，
+   * 原始 `timeline` 数据不动——权威页一到就能原地恢复（见 beginHideLiveTail）。
    */
   private applyTimeline(items: TimelineItem[]): void {
     this.timeline = items;
-    this.processGroups = groupTimeline(items);
+    const forGroups: TimelineItem[] = this.hidingLiveTail ? this.withoutLiveReasoning(items) : items;
+    this.processGroups = groupTimeline(forGroups);
+  }
+
+  // ---- 回前台尾巴隐藏（v1.3.2）----
+
+  /** 时间线里是否有直播思考块（seq=-1 的 reasoning，含仍在 streaming 的）。 */
+  private hasLiveReasoning(sid: string): boolean {
+    const items: TimelineItem[] = this.cacheOf(sid);
+    for (let i: number = 0; i < items.length; i++) {
+      const it: TimelineItem = items[i];
+      if (it.seq < 0 && it.isReasoning()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * 开始隐藏尾部直播思考块（v1.3.2）——回前台/重连对账的**入口**调用。
+   *
+   * 只在活动会话、且缓存里确实存在直播思考块时生效：后台冻结丢 turn.end 时，
+   * 这些块会先被 groupTimeline 归成一个「工作步骤」组，用户看到「出现又消失」。
+   * 隐藏只影响投影，权威页落地（mergeHistory）或 3s 兜底后立即恢复。
+   */
+  private beginHideLiveTail(sid: string): void {
+    if (sid.length === 0 || sid !== this.activeId || !this.hasLiveReasoning(sid)) {
+      return;
+    }
+    this.hideLiveTailSid = sid;
+    this.hidingLiveTail = true;
+    if (this.hideLiveTailTimer >= 0) {
+      clearTimeout(this.hideLiveTailTimer);
+    }
+    this.hideLiveTailTimer = setTimeout((): void => {
+      this.hideLiveTailTimer = -1;
+      this.finishHideLiveTail(true);
+    }, HIDE_LIVE_TAIL_MAX_MS);
+    this.notifyActive(sid); // 立刻按隐藏后的投影重画（不等下一帧数据变化）
+  }
+
+  /**
+   * 结束隐藏窗口（v1.3.2）。`render`=true 时主动重画活动会话；
+   * mergeHistory 自己随后会 notifyActive，故那条路径传 false 避免多画一帧。
+   */
+  private finishHideLiveTail(render: boolean): void {
+    if (this.hideLiveTailTimer >= 0) {
+      clearTimeout(this.hideLiveTailTimer);
+      this.hideLiveTailTimer = -1;
+    }
+    const sid: string = this.hideLiveTailSid;
+    this.hideLiveTailSid = '';
+    const wasHidden: boolean = this.hidingLiveTail;
+    this.hidingLiveTail = false;
+    if (render && wasHidden && sid.length > 0) {
+      this.notifyActive(sid);
+    }
+  }
+
+  /** 投影副本：去掉直播思考块（顺序/实例保持，消息与步骤不动）。 */
+  private withoutLiveReasoning(items: TimelineItem[]): TimelineItem[] {
+    const out: TimelineItem[] = [];
+    for (let i: number = 0; i < items.length; i++) {
+      const it: TimelineItem = items[i];
+      if (it.seq < 0 && it.isReasoning()) {
+        continue;
+      }
+      out.push(it);
+    }
+    return out;
+  }
+
+  /** 空闲权威页落地后，从时间线里真正摘掉直播思考块（恢复不能把它们再放回来）。 */
+  private dropLiveReasoning(items: TimelineItem[]): TimelineItem[] {
+    const out: TimelineItem[] = [];
+    for (let i: number = 0; i < items.length; i++) {
+      const it: TimelineItem = items[i];
+      if (it.seq < 0 && it.isReasoning()) {
+        continue;
+      }
+      out.push(it);
+    }
+    return out;
   }
 
   /** 会话被移除后清缓存；活动会话被删则退回空。 */
@@ -2307,6 +2430,8 @@ export class SessionStore {
         break;
       }
       case TOPIC_TOOL_CALL: {
+        // v1.3.2：新的工具调用 = 回合仍在跑，结束「回前台隐藏」窗口。
+        this.finishHideLiveTail(false);
         // 契约 §5.7 v1.0.6：工具调用开始 → 工作步骤（running）
         const sidT: string = data.sessionId !== undefined ? data.sessionId : '';
         this.upsertStep(sidT,

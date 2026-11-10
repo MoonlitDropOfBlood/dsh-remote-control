@@ -5,7 +5,7 @@
 
 - bundleName：`com.dukedsh.remotecontrol`
 - 应用显示名：`dsh-remote-control`（AppScope 字符串资源 `app_name`）
-- API level / SDK：**26**（`targetSdkVersion` / `compatibleSdkVersion` = `26.0.0`，runtimeOS=HarmonyOS）
+- API level / SDK：**20**（`targetSdkVersion` / `compatibleSdkVersion` = `6.0.0(20)`，runtimeOS=HarmonyOS）
 - 设备形态：phone
 
 > 阶段划分：
@@ -277,8 +277,9 @@ devecocli run --module entry --device <serial>          # 构建 + 安装 + 启�
    （或命令行 `devecocli auth login && devecocli signature generate --type debug`）。
    签名配置写入 `build-profile.json5` 的 `signingConfigs` 后，`devecocli build` 产出 signed HAP。
 4. 运行：选择真机/模拟器，点 Run；或 `devecocli run --module entry --device <serial>`。
-5. SDK 版本：确认 Project Structure 中 SDK 为 API 26（与 `oh-package.json5` 的 `modelVersion: 26.0.0`
-   一致）；不要手工降级，`devecocli create` 按本机 SDK 自动选的 26。
+5. SDK 版本：`build-profile.json5` 的 `targetSdkVersion` / `compatibleSdkVersion` 固定为
+   `6.0.0(20)`（API 20）——本 App 只用 ≤ API 20 的能力，装 API 20 设备也要能跑；
+   **不要手工升到 26**（用户 2026-11-10 明确要求）。
 
 ## 5. 模型层要点（契约 v1.0.2 对齐）
 

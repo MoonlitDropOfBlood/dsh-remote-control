@@ -358,11 +358,14 @@ grep -rnE "@State|@Prop|@Link|@ObjectLink|@Observed[^V]|@Provide|@Consume|@Watch
 
 ### 构建配置
 
-- `compatibleSdkVersion` **保持 `"26.0.0"`**（发版口径）。只有在**模拟器**上跑时才临时降到
-  `"6.0.0(20)"`——模拟器镜像最高 API 20，装不上 API 26 的包；降到 20 后真机（API 26）与
-  模拟器都能跑，构建无 API 越界报错。改法：`app/build-profile.json5` 的
-  `compatibleSdkVersion`（语法：API≥26 用 `"26.0.0"` 字符串，API 10~25 用 `"6.0.0(20)"`
-  这种带系统版本号的字符串）。**发版前必须改回 26.0.0**，别把临时降级带进发布包。
+- **SDK 版本 = API 20（用户 2026-11-10 明确要求）**：本 App 没有使用 API 20 以上的能力，
+  装到 API 20 设备也必须能跑。`app/build-profile.json5` 的 `targetSdkVersion` 与
+  `compatibleSdkVersion` **两者都**是 `"6.0.0(20)"`（语法：API 10~25 用 `"6.0.0(20)"`
+  这种带系统版本号的字符串，API≥26 才是 `"26.0.0"`）。**不要再改回 26**，除非用户明确要求；
+  新增能力前先确认它 ≤ API 20。自检：构建产物
+  `entry/build/default/intermediates/package/default/module.json` 里的
+  `minAPIVersion` / `targetAPIVersion` 都是 `60000020`（26.0.0 才是 `260000026`）。
+  （历史：v1.2.1 时曾为模拟器临时降到 20，现在 20 就是发版口径。）
 
 ## v1.2.2：「工作步骤」改成 DSH 式过程分组（2026-11-06，真机实测）
 

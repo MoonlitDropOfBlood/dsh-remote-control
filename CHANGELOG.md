@@ -3,6 +3,37 @@
 本仓库的版本说明。发版时（推 `v*` 标签）release workflow 会抽取对应版本段落作为
 GitHub Release 的正文——**bump 版本时必须同步补一段 `## [版本]`**，否则发布失败。
 
+## [1.3.1] - 2026-11-10
+
+修复手机端「回合完成后从后台切回前台，时间线末尾多出一个工作步骤组」的幽灵残留（两端同步），
+并把 HarmonyOS 包的 SDK 目标降到 API 20。**线协议、KAT、中继与加密格式均不变**；
+插件与中继本次无行为变更，仅版本号同步 bump。
+
+### App（HarmonyOS + Android）
+
+- 回前台 / 重连做权威对账：**先 `session.list`（running 真值）再拉最新历史**；宿主空闲时
+  当场摘掉遗留的直播思考块（含仍停在 streaming 的），最终助手消息后不再出现多余
+  「工作步骤」过程组。
+- HarmonyOS 额外在回前台第一帧到权威页落地之间**隐藏**尾部直播思考块（只影响分组投影，
+  原始数据不动）：新的正文/思考增量或工具调用一到立刻恢复，消除「出现又消失」的闪动；
+  权威页落地（或 3s 兜底）后本体也被摘除，不会回头。
+- Android 对齐：`Activity ON_RESUME` 触发同一对账入口；`mergeTimelineItems` 在宿主空闲时
+  当场丢弃 `seq<0` 的思考块；运行中 / 向前翻页仍原样保留。
+
+### App（HarmonyOS）
+
+- `targetSdkVersion` / `compatibleSdkVersion` 由 `26.0.0` 调整为 `6.0.0(20)`（API 20）：
+  本 App 未使用 API 20 以上的能力，装 API 20 设备也能运行；产物 `module.json` 的
+  `minAPIVersion` / `targetAPIVersion` 均为 `60000020`。
+
+### 门禁
+
+- HarmonyOS：`devecocli build` BUILD SUCCESSFUL（API 20 口径）；
+  `live-order-node-test` / `session-detail-contract-test` / `attachment-contract-test` /
+  `process-activity-contract-test` 全绿。
+- Android：`./gradlew :core:test`（含新增 `LiveReasoningReconcileTest` 4 例）、
+  `:app:assembleDebug` 通过。
+
 ## [1.3.0] - 2026-11-09
 
 新增 Android 版 DSH Pocket（与 HarmonyOS 版共用同一份线协议契约），并把两端 UI 对齐。

@@ -126,6 +126,45 @@ export function collectCoveredLiveStepIds(durable: DshrcDurableStep[], live: Dsh
   return covered;
 }
 
+/** 尾部过程项判定的最小形状（只取对账用到的字段）。 */
+export interface DshrcTrailingProcessItem {
+  seq: number;
+  kind: string; // 'step' | 'reasoning' | 'message'
+  streaming: boolean;
+  /** step 的 status：'running' | 'ok' | 'error'。 */
+  status: string;
+}
+
+/**
+ * 时间线尾部是否只剩**已定稿**的直播过程项（seq=-1 的思考/步骤，且不在生成中）。
+ *
+ * 用途：回前台/重连的权威对账之后，中继离线缓存可能补发迟到事件，在最终消息
+ * 之后重新拼出过程项；若宿主已空闲，就该再对账一次交给持久历史（否则尾部会
+ * 多出一段「工作步骤」分组，重启 App 才消失）。
+ *
+ * 安全边界：只要尾部还有 streaming 思考、status='running' 的步骤，或任意直播
+ * **消息**（可能是用户刚发出的新回合），一律返回 false —— 这时对账会把新回合
+ * 正在生成的内容清掉（session.status running:true 可能还没到达）。
+ */
+export function hasTrailingSettledLiveProcess(items: DshrcTrailingProcessItem[]): boolean {
+  for (let i: number = items.length - 1; i >= 0; i--) {
+    const it: DshrcTrailingProcessItem = items[i];
+    if (it.seq >= 0) {
+      return false; // 最后一条是 durable 消息/步骤：尾部没有直播过程项
+    }
+    if (it.kind === 'message') {
+      return false; // 直播消息 = 可能刚开始的新回合，不能动
+    }
+    if (it.kind === 'reasoning') {
+      return !it.streaming;
+    }
+    if (it.kind === 'step') {
+      return it.status !== 'running';
+    }
+  }
+  return false;
+}
+
 /**
  * 找出可被持久历史覆盖的**附件-only 乐观消息**（契约 §5.11.4 v1.2.0）。
  *

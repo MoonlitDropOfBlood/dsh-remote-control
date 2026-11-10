@@ -18,7 +18,9 @@ assert.match(protocol, /TOPIC_SESSION_PERMISSION_CHANGED: string = 'session\.per
 assert.match(link, /sessionPermission\(sessionId: string\): Promise<string \| null>/);
 assert.match(link, /sessionSelectPermission\(sessionId: string, permission: string\): Promise<string>/);
 assert.match(store, /case TOPIC_SESSION_PERMISSION_CHANGED:/);
-assert.match(store, /this\.loadSessionPermission\(this\.activeId\)/,
+assert.match(store, /if \(s === 'online'\) \{[\s\S]*?this\.reconcileActiveSession\(\);/,
+  '断线恢复必须走统一权威对账入口');
+assert.match(store, /private reconcileActiveSession\(\): void \{[\s\S]*?this\.loadSessionPermission\(sid\)/,
   '断线恢复必须补拉当前权限');
 
 const loadCalls = page.match(/this\.store\.loadSessionPermission\(this\.sessionId\)/g) ?? [];

@@ -118,6 +118,11 @@ export default class EntryAbility extends UIAbility {
 
   onForeground(): void {
     logDshrc(TAG, 'info', 'Ability onForeground');
+    // v1.3.1：回前台先做一次权威对账（session.list → 活动会话最新页）。
+    // 后台冻结期间 turn.end 等收尾事件可能丢失，而套接字常常「看起来还在线」→
+    // kickReconnect 不会触发重连，于是没有任何对账；已结束回合的残留直播步骤
+    // 会留在最终消息之后（时间线尾部多出来的「工作步骤」分组）。
+    sessionStore.onAppForeground();
     // v1.0.9：回前台若正在退避重连等待，跳过剩余退避立即试一次
     //（真机场景：扫码后一直「重连中」，切几次前后台才连上）。
     dshrcLink.kickReconnect();

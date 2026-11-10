@@ -454,3 +454,28 @@ List {
 - `collectCoveredLiveStepIds`：运行中/向前翻页仍按 callId 去重；**非 prepend 最新页 + Host 空闲**
   接管全部 live steps，包括没进入本页的 orphan，防止它们统一挪到最终消息后形成幽灵组。
 - 回归：`node live-order-node-test.mjs` 覆盖 orphan step 的运行中保留、空闲清理及两条完成触发路径。
+
+## 2026-11-10：回前台/重连后的尾巴幽灵工作步骤（协议不变）
+
+- 症状（用户实测，2026-11-08 那次修复后仍复现）：回合完成后把 App 切到后台、再切回前台，
+  **最终助手消息之后仍多出一个「工作步骤」分组**；重启 App 才消失。
+- 根因（两个缺口叠加）：
+  1. 后台冻结窗口里 `turn.end` 常丢，`row.running` 停在 true；而 WS 又常停在 `online`
+     （`kickReconnect` 只对 `reconnecting` 生效）→ 回前台既没有重连、也没有权威对账。
+  2. 即便重连，旧代码在 `onLinkState('online')` 里**并行**发 `session.list` 与
+     `session.history`：历史先回包时用残留的 `running=true` 判 authoritativeIdle=false，
+     mergeHistory 对非空闲页只按 callId 去重 → 已结束回合的残留 live 步骤/思考留在尾部；
+     列表随后把 running 改回 false，但**没有任何再次对账** → 幽灵挂到重启。
+- 修复（`model/sessionstore.ets` + `entryability/EntryAbility.ets`）：
+  - 新增 `onAppForeground()`（`EntryAbility.onForeground` 调用）与唯一对账入口
+    `reconcileActiveSession()`：**先 `session.list`（running 真值）→ 再历史/队列/模型/权限/子代理**；
+    重连与回前台共用同一入口，禁止再各写一份口径。
+  - `loadHistory(sid, prepend, listWaited)`：最新页请求遇 `pendingRefresh` 在途时**先等列表落地**
+    再发历史，保证 authoritativeIdle 读的是新鲜真值（详情页首次进入/回落路径同样受益）。
+  - 追加一次 1.2s 的「迟到补发」扫描（`scheduleSettleReconcile`）：宿主空闲、且尾部只剩
+    **已定稿**的直播过程项时再拉一页权威历史；流式思考 / status=running 步骤 / 直播消息
+    一律不动（可能是回前台后刚开始的新回合）。判定抽到纯 TS
+    `timeline-reconcile.hasTrailingSettledLiveProcess`（node 回归共用）。
+  - 硬约束：`session.list` 与 `session.history` **不得再并行**（历史最新页不得在列表在途时抢跑）。
+- 回归：`node live-order-node-test.mjs` 新增尾部幽灵判定 8 例（已定稿思考/步骤要被接管；
+  流式思考、running 步骤、直播消息不得被清）+ 回前台对账/等待列表的接线断言。

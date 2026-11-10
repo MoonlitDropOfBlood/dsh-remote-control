@@ -32,7 +32,9 @@ import {
   DshrcDurableText,
   DshrcLiveAttachments,
   DshrcLiveStep,
-  DshrcLiveText
+  DshrcLiveText,
+  DshrcTrailingProcessItem,
+  hasTrailingSettledLiveProcess
 } from './timeline-reconcile';
 import { AttachmentCaps, normalizeAttachmentCaps } from './attachment-plan';
 import { DraftAttachment } from './attachments';
@@ -91,6 +93,12 @@ const IMAGE_FETCH_MAX_EDGE: number = 4096;
 const IMAGE_FETCH_TIMEOUT_MS: number = 20000;
 /** 大图内存缓存条目上限（超出按插入序淘汰最旧）。 */
 const IMAGE_CACHE_MAX: number = 24;
+/**
+ * 回前台/重连对账后的「迟到补发」扫描延迟（ms，v1.3.1）。
+ * 中继离线缓存按 seq 补发，可能晚于本次 session.history 回包；1.2s 后若宿主已空闲
+ * 且时间线尾部仍有直播过程项，再拉一次权威页把它们接管（单次，不轮询）。
+ */
+const SETTLE_RECONCILE_DELAY_MS: number = 1200;
 
 /** 会话列表一行（契约 §5.3 SessionSummary 的可观察形态；v1.0.4 补 subagent/blank，
  *  v1.0.7 补 archived——Host 权威的 Workspace 归档标记）。 */
@@ -629,27 +637,18 @@ export class SessionStore {
   private onLinkState(s: LinkState): void {
     this.linkState = s;
     if (s === 'online') {
-      this.refreshSessions();
       this.reportPush();
       this.loadCapabilities();
       // v1.1.2 断线恢复（权威拉取，不依赖中继缓存）：中继的离线缓存只覆盖
       // 「手机掉线但中继活着」的短窗——而中继跑在插件下，DSH 重启/插件重载会把它
       // 一起带走，缓存清零；超过 256 条也会 FIFO 丢旧。宿主会话日志才是唯一事实源：
-      // 重连时把**正在看的活动会话**重拉一遍（历史 + 排队快照 + 子代理目录），
+      // 重连时把**正在看的活动会话**重拉一遍（列表 + 历史 + 排队快照 + 子代理目录），
       // 错过的消息/步骤/图片/交付物/队列变动全部补齐，中继缓存退化为流畅性优化。
-      if (this.activeId.length > 0) {
-        this.loadHistory(this.activeId, false);
-        this.loadQueue(this.activeId);
-        // v1.1.4 修复：模型也要补拉。此前只补历史/排队/子代理——App 从后台切回时
-        // 若 WS 正在重连，aboutToAppear 里那次 session.model 恰好落在断链窗口
-        // 静默失败，链路恢复后**永不重试** → 手机端一直显示目录默认模型。
-        this.loadSessionModel(this.activeId);
-        this.loadSessionPermission(this.activeId);
-        const row: SessionRow | undefined = this.findRow(this.activeId);
-        if (row !== undefined && row.parentSessionId.length === 0) {
-          this.loadSubagents(this.activeId);
-        }
-      }
+      // v1.3.1：必须「先 session.list、后 session.history」——列表带回 running 真值，
+      // 历史合并的 authoritativeIdle 依赖它；两者并行会让历史先回包，用后台期间
+      // 残留的 running=true 判定「仍在运行」，把已结束回合的遗留直播步骤留在最终
+      // 消息之后（幽灵工作步骤组）。故统一走 reconcileActiveSession() 串行入口。
+      this.reconcileActiveSession();
     }
     if (s === 'stopped' || s === 'idle') {
       this.pendingHistory.clear();
@@ -677,6 +676,100 @@ export class SessionStore {
     if (s === 'error') {
       this.lastError = '连接错误（详见链路日志）';
     }
+  }
+
+  /**
+   * 回前台（v1.3.1，EntryAbility.onForeground 调用）。
+   *
+   * 后台期间系统会冻结 JS/定时器，甚至挂起套接字——`turn.end` 这类收尾事件常常
+   * 丢在冻结窗口里；而链路状态又经常仍停在 `online`（`kickReconnect` 只在
+   * `reconnecting` 时生效）。于是前台回来既不会重连、也不会做权威对账：
+   * 已结束回合的残留直播步骤（或迟到的 reasoning 块）留在最终消息之后，
+   * 在时间线尾部拼出多出来的「工作步骤」分组，要重启 App 才消失。
+   * 故回前台主动补一次「列表 → 活动会话最新页」对账；断链情况下交给
+   * onLinkState('online') 的同一入口。
+   */
+  onAppForeground(): void {
+    if (this.link.getState() !== 'online') {
+      return;
+    }
+    this.reconcileActiveSession();
+  }
+
+  /**
+   * 权威对账（v1.3.1）：先 `session.list`（拿 running 真值），再拉活动会话的
+   * 历史最新页 / 排队快照 / 模型 / 权限 / 子代理目录。
+   *
+   * 「先列表」是硬约束：历史合并用 `runningOf(sid)` 判定 authoritativeIdle，
+   * 旧值会让已结束回合的残留直播步骤活下来（见 loadHistory 的等待逻辑）。
+   * 只保留这一个入口，避免重连对账与回前台对账两份口径漂移；
+   * 列表已在途时 refreshSessions 合并同一个 Promise，不重复请求。
+   */
+  private reconcileActiveSession(): void {
+    const list: Promise<SessionRefreshResult> = this.refreshSessions();
+    list.then((): void => {
+      if (this.link.getState() !== 'online' || this.activeId.length === 0) {
+        return;
+      }
+      const sid: string = this.activeId;
+      this.loadHistory(sid, false);
+      this.loadQueue(sid);
+      // v1.1.4 修复：模型也要补拉。此前只补历史/排队/子代理——App 从后台切回时
+      // 若 WS 正在重连，aboutToAppear 里那次 session.model 恰好落在断链窗口
+      // 静默失败，链路恢复后**永不重试** → 手机端一直显示目录默认模型。
+      this.loadSessionModel(sid);
+      this.loadSessionPermission(sid);
+      const row: SessionRow | undefined = this.findRow(sid);
+      if (row !== undefined && row.parentSessionId.length === 0) {
+        this.loadSubagents(sid);
+      }
+      this.scheduleSettleReconcile(sid);
+    });
+  }
+
+  /**
+   * 对账后的迟到补发扫描（v1.3.1）。
+   *
+   * 中继的离线缓存按 seq 补发，可能晚于本次 `session.history` 回包；迟到的
+   * `tool.call` / `assistant.reasoningDelta` 会在最终消息后重新拼出过程项。
+   * 1.2s 后若宿主已空闲、且尾部只剩**已定稿**的直播过程项（幽灵），再拉一次最新页
+   * 让权威历史接管——单次、幂等、不轮询。
+   *
+   * 为什么只认「已定稿」：还在流式的思考块 / status=running 的步骤可能是回前台后
+   * 刚开始的新回合（session.status running:true 尚未到达）；这时拉权威页会把新回合
+   * 正在生成的内容清掉。宿主在跑（running=true）时同样不动。
+   */
+  private scheduleSettleReconcile(sid: string): void {
+    setTimeout((): void => {
+      if (this.link.getState() !== 'online' || sid !== this.activeId) {
+        return;
+      }
+      if (this.runningOf(sid) || !this.hasTrailingSettledLiveProcess(sid)) {
+        return;
+      }
+      logDshrc(TAG, 'info', 'settle reconcile after foreground/reconnect: ' + sid.slice(0, 20));
+      this.loadHistory(sid, false);
+    }, SETTLE_RECONCILE_DELAY_MS);
+  }
+
+  /**
+   * 时间线尾部是否只剩**已定稿**的直播过程项（seq=-1，且非流式思考 / 非 running 步骤）。
+   * 判定规则见 timeline-reconcile.hasTrailingSettledLiveProcess（纯 TS，node 回归共用）。
+   */
+  private hasTrailingSettledLiveProcess(sid: string): boolean {
+    const items: TimelineItem[] = this.cacheOf(sid);
+    const shape: DshrcTrailingProcessItem[] = [];
+    for (let i: number = 0; i < items.length; i++) {
+      const it: TimelineItem = items[i];
+      const row: DshrcTrailingProcessItem = {
+        seq: it.seq,
+        kind: it.kind,
+        streaming: it.streaming,
+        status: it.status
+      };
+      shape.push(row);
+    }
+    return hasTrailingSettledLiveProcess(shape);
   }
 
   private appendLog(line: string): void {
@@ -1212,13 +1305,22 @@ export class SessionStore {
     this.historyErrorMessage = message;
   }
 
-  loadHistory(sid: string, prepend: boolean): Promise<void> {
+  loadHistory(sid: string, prepend: boolean, listWaited: boolean = false): Promise<void> {
     if (sid.length === 0) {
       return Promise.resolve();
     }
     if (this.link.getState() !== 'online') {
       this.setHistoryError(sid, '加载历史失败：未连接主机');
       return Promise.resolve();
+    }
+    // v1.3.1：最新页的 authoritativeIdle 判定读 runningOf(sid)，而回前台/重连时
+    // session.list 常在途中（且它才是 running 真值来源）。先等列表落地再发历史，
+    // 否则会拿后台期间残留的 running=true 当「仍在运行」，把已结束回合的遗留
+    // 直播步骤/思考留在最终消息之后，形成尾部多出来的「工作步骤」分组。
+    // 列表失败（Promise 仍 resolve，ok=false）时照旧继续，不阻塞时间线。
+    if (!prepend && !listWaited && this.pendingRefresh !== null) {
+      const waiting: Promise<SessionRefreshResult> = this.pendingRefresh;
+      return waiting.then((): Promise<void> => this.loadHistory(sid, prepend, true));
     }
     if (this.historyLoading) {
       // 不丢刷新意图：当前页可能是在 queue 项被消费前发出的，直接跳过会永远

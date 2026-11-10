@@ -22,10 +22,14 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
@@ -86,6 +90,16 @@ class MainActivity : ComponentActivity() {
 fun PocketNavHost() {
     val vm: PocketViewModel = viewModel()
     val nav = rememberNavController()
+    // v1.3.2：回前台做一次权威对账（后台丢 turn.end 时靠它收编尾部残留；
+    // 对齐 HarmonyOS 版 EntryAbility.onForeground）。
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner, vm) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) vm.onAppForeground()
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
     // 扫码解析结果（只用于回填配对表单，不自动连接）
     var scannedPair by remember { mutableStateOf<PairUriResult?>(null) }
 

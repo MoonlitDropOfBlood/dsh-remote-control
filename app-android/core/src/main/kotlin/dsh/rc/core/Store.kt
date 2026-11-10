@@ -293,6 +293,12 @@ class SessionStore(
 
     private val lock = Any()
 
+    /** 回前台/重连对账窗口内隐藏尾部直播思考块（v1.3.2；只影响分组投影）。 */
+    @Volatile
+    private var hideLiveTail = false
+    private var hideLiveTailSid: String? = null
+    private var hideLiveTailJob: Job? = null
+
     /** 全部会话（含 subagent / blank，按 sessionId 索引）。 */
     private val allSessions = LinkedHashMap<String, SessionSummary>()
 
@@ -390,7 +396,10 @@ class SessionStore(
         if (!changed) return
         when (state) {
             LinkState.ONLINE -> scope.launch { onLinkOnline() }
-            LinkState.IDLE, LinkState.STOPPED -> clearHostState()
+            LinkState.IDLE, LinkState.STOPPED -> {
+                finishHideLiveTail(render = false) // 断链：隐藏窗口作废
+                clearHostState()
+            }
             LinkState.ERROR -> setLastError("连接错误（详见链路日志）")
             else -> Unit
         }
@@ -524,6 +533,7 @@ class SessionStore(
      * 打开会话：切投影 + 拉权威数据（history + queue + subagents + model + permission）。
      */
     suspend fun openSession(sessionId: String) {
+        finishHideLiveTail(render = false) // 切会话：上一个会话的隐藏窗口作废
         synchronized(lock) {
             _activeSessionId.value = sessionId
             _sessionModel.value = modelCache[sessionId]
@@ -878,6 +888,57 @@ class SessionStore(
     // =================================================================================
 
     /**
+     * 回前台（Activity ON_RESUME 调用，v1.3.2）。
+     *
+     * 后台冻结期间 `turn.end` 常常丢失，而套接字又常停在 ONLINE（不会触发重连），
+     * 因此回前台必须主动做一次权威对账（`session.list` running 真值 → 最新历史）；
+     * 对账窗口内同时隐藏尾部直播思考块，避免它先渲染成一个多余「工作步骤」组、
+     * 随后才被清掉（用户看到的「出现又消失」）。
+     */
+    fun onAppForeground() {
+        beginHideLiveTail()
+        if (link.getState() != LinkState.ONLINE) return
+        scope.launch { onLinkOnline() }
+    }
+
+    /** 时间线里是否有直播思考块（seq<0 的 reasoning，含仍在 streaming 的）。 */
+    private fun hasLiveReasoning(sessionId: String): Boolean {
+        val items = synchronized(lock) { itemCache[sessionId] } ?: return false
+        return items.any { it is TimelineReasoning && it.seqOf() < 0 }
+    }
+
+    /** 开始隐藏尾部直播思考块（只影响分组投影，权威页落地/超时即恢复）。 */
+    private fun beginHideLiveTail() {
+        val sid = _activeSessionId.value ?: return
+        if (!hasLiveReasoning(sid)) return
+        synchronized(lock) {
+            hideLiveTail = true
+            hideLiveTailSid = sid
+        }
+        hideLiveTailJob?.cancel()
+        hideLiveTailJob = scope.launch {
+            delay(HIDE_LIVE_TAIL_MAX_MS)
+            finishHideLiveTail(render = true)
+        }
+        notifyActive(sid)
+    }
+
+    /** 结束隐藏窗口；render=true 时主动重画活动会话（merge 后由调用方重画）。 */
+    private fun finishHideLiveTail(render: Boolean) {
+        val sid: String?
+        val was: Boolean
+        synchronized(lock) {
+            was = hideLiveTail
+            sid = hideLiveTailSid
+            hideLiveTail = false
+            hideLiveTailSid = null
+            hideLiveTailJob?.cancel()
+            hideLiveTailJob = null
+        }
+        if (render && was && sid != null) notifyActive(sid)
+    }
+
+    /**
      * 断线恢复 = **权威拉取**：对活动会话重拉 history + queue + subagents + model + permission。
      * 中继的离线缓存只覆盖「手机掉线但中继活着」的短窗，不能当事实源。
      */
@@ -1132,6 +1193,9 @@ class SessionStore(
         )
         items.clear()
         items.addAll(merged)
+        if (sessionId == synchronized(lock) { hideLiveTailSid }) {
+            finishHideLiveTail(render = false) // 权威页已落地，随后的 notifyActive 统一重画
+        }
         notifyActive(sessionId)
     }
 
@@ -1149,7 +1213,9 @@ class SessionStore(
     /** 时间线整体替换 + 同步过程分组投影（分组必须在**数据侧**算好）。 */
     private fun publishTimeline(items: List<TimelineItem>) {
         _timeline.value = items
-        _entries.value = buildEntries(items)
+        // v1.3.2：隐藏窗口只过滤**分组投影**，原始时间线数据不动（权威页一到就能恢复）。
+        val forGroups = if (hideLiveTail) items.filterNot { it is TimelineReasoning && it.seqOf() < 0 } else items
+        _entries.value = buildEntries(forGroups)
     }
 
     /**
@@ -1507,10 +1573,12 @@ class SessionStore(
             }
 
             Protocol.TOPIC_ASSISTANT_DELTA -> {
+                finishHideLiveTail(render = false) // 确有回合在生成：立即恢复
                 appendDelta(data.str("sessionId"), data.str("text"))
             }
 
             Protocol.TOPIC_ASSISTANT_REASONING_DELTA -> {
+                finishHideLiveTail(render = false) // 确有回合在生成：立即恢复
                 appendReasoningDelta(data.str("sessionId"), data.str("text"))
             }
 
@@ -1520,6 +1588,7 @@ class SessionStore(
             }
 
             Protocol.TOPIC_TOOL_CALL -> {
+                finishHideLiveTail(render = false) // 新的工具调用：结束隐藏窗口
                 upsertStep(
                     sessionId = data.str("sessionId"),
                     callId = data.str("callId"),
@@ -1706,6 +1775,9 @@ private const val LINK_POLL_INTERVAL_MS = 250L
 private const val IMAGE_FETCH_DEFAULT_MAX_EDGE = 1600
 private const val IMAGE_FETCH_MAX_EDGE = 4096
 private const val IMAGE_CACHE_MAX = 24
+
+/** 回前台对账窗口隐藏尾部直播思考块的最长时间（ms）；权威页落地即提前恢复。 */
+private const val HIDE_LIVE_TAIL_MAX_MS = 3_000L
 private const val LOG_KEEP = 80
 
 /** 历史错误文案前缀（归属到会话，不写全局 lastError）。 */
@@ -1971,6 +2043,12 @@ internal fun mergeTimelineItems(
                 else -> it
             }
         }
+    }
+    // v1.3.2：宿主空闲时权威页就是最终投影——遗留的直播思考块（可能还停在 streaming、
+    // dropFinalized 覆盖不到）同样必须退出；否则它会在最终消息之后拼出多出来的
+    // 「工作步骤」过程组，要等下一次对账才消失。
+    if (dropFinalized) {
+        merged = merged.filterNot { it is TimelineReasoning && it.seqOf() < 0 }
     }
     return merged
 }

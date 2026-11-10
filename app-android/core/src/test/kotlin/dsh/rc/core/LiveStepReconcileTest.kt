@@ -349,3 +349,95 @@ class HistoryErrorOwnershipTest {
         }
     }
 }
+
+/**
+ * 回前台/重连的尾部幽灵思考块（v1.3.2，对齐 ArkTS 版 285fb18 的 dropLiveReasoning）：
+ *
+ * 后台丢 `turn.end` 留下一个**还在 streaming** 的思考块；历史合并时 `dropFinalized`
+ * 只覆盖已定稿项 → 它活下来，被 groupTimeline 归成最终消息后多出来的「工作步骤」组。
+ * 空闲权威页必须在合并当下就把它摘掉（宿主在跑时才保留）。
+ */
+class LiveReasoningReconcileTest {
+
+    private fun liveReasoning(key: String, streaming: Boolean = true) = TimelineReasoning(
+        key = key,
+        id = key,
+        text = "thinking",
+        ts = 1_700_000_000_000L,
+        seq = -1,
+        streaming = streaming
+    )
+
+    private fun durableMessage(seq: Long = 3L) = TimelineMessage(
+        key = "m1",
+        id = "m1",
+        role = "assistant",
+        text = "done",
+        ts = 1_700_000_000_000L,
+        seq = seq
+    )
+
+    private fun pageMessage(seq: Long = 3L) = ChatMessage(
+        id = "m1",
+        role = "assistant",
+        text = "done",
+        ts = 1_700_000_000_000L,
+        seq = seq
+    )
+
+    private fun merge(
+        old: List<TimelineItem>,
+        prepend: Boolean,
+        dropFinalized: Boolean
+    ): List<TimelineItem> = mergeTimelineItems(
+        oldItems = old,
+        messages = listOf(pageMessage()),
+        steps = emptyList(),
+        prepend = prepend,
+        dropFinalized = dropFinalized,
+        finalizeStreaming = dropFinalized
+    )
+
+    @Test
+    fun `空闲最新页当场摘掉遗留直播思考块`() {
+        val merged = merge(listOf(durableMessage(), liveReasoning("r1")), prepend = false, dropFinalized = true)
+        assertTrue(
+            merged.none { it is TimelineReasoning },
+            "宿主空闲时遗留直播思考块不得留在最终消息之后（否则就是幽灵工作步骤组）"
+        )
+    }
+
+    @Test
+    fun `已定稿或仍在流式的直播思考块都要摘掉`() {
+        val settled = merge(
+            listOf(durableMessage(), liveReasoning("r2", streaming = false)),
+            prepend = false,
+            dropFinalized = true
+        )
+        assertTrue(settled.none { it is TimelineReasoning }, "已定稿的迟到思考块同样要退出")
+        val streaming = merge(
+            listOf(durableMessage(), liveReasoning("r3", streaming = true)),
+            prepend = false,
+            dropFinalized = true
+        )
+        assertTrue(streaming.none { it is TimelineReasoning }, "空闲时不可能还在生成思考 → 必须清掉")
+    }
+
+    @Test
+    fun `宿主运行中保留直播思考块`() {
+        val merged = merge(listOf(durableMessage(), liveReasoning("r4")), prepend = false, dropFinalized = false)
+        assertTrue(
+            merged.any { it is TimelineReasoning && it.seq < 0 },
+            "运行中的直播思考块是当前回合的真实内容，不能被对账清掉"
+        )
+    }
+
+    @Test
+    fun `向前翻页不清直播思考块`() {
+        val merged = merge(listOf(durableMessage(), liveReasoning("r5")), prepend = true, dropFinalized = false)
+        assertTrue(
+            merged.any { it is TimelineReasoning && it.seq < 0 },
+            "prepend 只补旧页，直播项必须原样保留"
+        )
+    }
+}

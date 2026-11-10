@@ -167,3 +167,25 @@ JCA 加密是同步的 → 发送侧用 `sendLock` 临界区完成「seq 分配 
   - 附件草稿**新建页与详情页各有一份**（ArkTS 是页面级字段）：共用一张表会把
     A 会话暂存的附件串到 B 会话（文件发到错的会话）。
 
+
+## 2026-11-10：回前台幽灵工作步骤（v1.3.2，对齐 ArkTS 285fb18）
+
+- 症状（HarmonyOS 真机先复现，Android 同源）：回合完成后把 App 切后台再切回前台，
+  最终助手消息后**多出一个「工作步骤」过程组**；HarmonyOS 上一版修完还残留
+  「先出现、1.2s 后才消失」。根因是后台冻结丢 `turn.end` 时留下一个**还在 streaming
+  的思考块**：`dropFinalized` 只收编已定稿项，合并当下覆盖不到 → 被 `groupTimeline`
+  归组成多余分组。
+- Android 侧另外两个缺口：① 没有前台回调（套接字仍报 ONLINE 时不会重连，也就没人对账）；
+  ② 合并到空闲历史后没有「当场摘掉遗留直播思考块」。
+- 修复（core/Store.kt + app）：
+  - `onAppForeground()`（`MainActivity` 用 `LifecycleEventObserver` 监听 `ON_RESUME`
+    调用，ViewModel 透传）：在线时 `scope.launch { onLinkOnline() }` —— 该入口本来就是
+    **先 `loadSessions()`（running 真值）再 `refreshHistory`**，顺序正确，不要改成并行。
+  - `beginHideLiveTail()`：回前台第一帧起隐藏尾部直播思考块，`publishTimeline` 只过滤
+    **分组投影**（`_entries`），原始 `_timeline` 数据不动；权威页落地 / 3s 兜底即恢复，
+    任何 `assistant.delta` / `reasoningDelta` / `tool.call` 到达立刻结束隐藏
+    （证明回合真在跑）。切会话 / 断链时窗口作废。
+  - `mergeTimelineItems`：`dropFinalized=true`（宿主空闲）时**当场** `filterNot`
+    掉 `TimelineReasoning` 且 `seq<0` 的项；运行中 / 向前翻页不动。
+- 回归：`core/src/test/kotlin/dsh/rc/core/LiveStepReconcileTest.kt` 新增
+  `LiveReasoningReconcileTest` 4 例（空闲摘除 / 流式与已定稿都摘 / 运行中保留 / prepend 保留）。

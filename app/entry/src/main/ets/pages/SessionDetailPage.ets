@@ -19,19 +19,26 @@
 import { MarkdownController } from '@luvi/lv-markdown-in';
 import { pasteboard } from '@kit.BasicServicesKit';
 import { common } from '@kit.AbilityKit';
-import { promptAction } from '@kit.ArkUI';
+import { promptAction, ShowDialogSuccessResponse } from '@kit.ArkUI';
+import { EventPost } from 'eventpost';
 import { HRouter } from 'hrouter';
+import { EVT_SESSION_STATE_CHANGED } from '../model/events';
 import { dshrcLink } from '../model/link';
 import {
   DshrcEffortOption,
   DshrcFileRef,
+  DshrcGoalAction,
+  DshrcGoalBlockedReason,
+  DshrcGoalWire,
   DshrcImageRef,
   DshrcModelOption,
   DshrcModelSelection,
   DshrcPermissionOption,
   DshrcPromptResult,
-  DshrcQueueItem
+  DshrcQueueItem,
+  DshrcTodoItem
 } from '../model/protocol';
+import { TodoCounts, goalPhaseLabel, todoStatusLabel } from '../model/interaction-plan';
 import {
   AttachmentPickResult,
   DraftAttachment,
@@ -42,6 +49,7 @@ import {
   uploadDraftAttachment
 } from '../model/attachments';
 import { AttachmentCaps, AttachmentCheck, formatAttachmentSize } from '../model/attachment-plan';
+import { logDshrc } from '../model/logger';
 import { SessionDetailParam, goBack, openSessionDetail } from '../model/routes';
 import {
   ApprovalCard,
@@ -72,6 +80,7 @@ import {
   SP_6
 } from '../model/theme';
 import { ApprovalRepeatCard, QuestionRepeatCard } from './AskCards';
+import { GoalBar, TodoCard, TodoRowView } from './GoalTodoPanels';
 import { ProcessGroup, TimelineMessage } from './TimelineView';
 
 
@@ -119,6 +128,9 @@ struct SubagentChip {
 /** 「接近底部」判定阈值（vp）：距底部不超过该值即视为用户仍在底部（可继续跟随）。 */
 const NEAR_BOTTOM_VP: number = 32;
 
+/** 日志 tag（临时调试用）。 */
+const TAG: string = 'dshrc-session-detail';
+
 // hrouter 编译期扫描标记（注释形式：ArkTS 不允许 struct 上挂非框架装饰器）。
 // @Route({ name: 'session_detail' })
 @ComponentV2
@@ -150,6 +162,31 @@ export struct SessionDetailPage {
   /** 上传中：send 按钮禁用 + 显示进度文案（如「正在上传附件 2/3…」）。 */
   @Local uploading: boolean = false;
   @Local uploadLabel: string = '';
+  /** v1.3.0（契约 §5.13）：Todo 折叠卡的展开态（放页面，不放子组件——节点回收后 @Local 会丢）。 */
+  @Local todoExpanded: boolean = false;
+  // ---- v1.3.1：本页渲染用的**状态快照**（来自 store 的 Map/版本号，见 syncSessionState）----
+  /** 本会话的目标（null = 无目标）。 */
+  @Local goalSnap: DshrcGoalWire | null = null;
+  /** 本会话的目标激活态（'armed' / 'disarmed'；'' = 未知）。 */
+  @Local goalActivationSnap: string = '';
+  /** 本会话宿主是否支持目标（false → 隐藏目标条）。 */
+  @Local goalSupportedSnap: boolean = true;
+  /** 本会话宿主允许的目标动作子集。 */
+  @Local goalActionsSnap: DshrcGoalAction[] = [];
+  /** 本会话 Todo 展示行。 */
+  @Local todoRowsSnap: TodoRowView[] = [];
+  /** 本会话是否无清单（显示「暂无任务」）。 */
+  @Local todoEmptySnap: boolean = true;
+  /** 本会话 Todo 计数摘要。 */
+  @Local todoCountsSnap: string = '';
+  /** 本会话 Todo 是否宿主支持（false → 隐藏清单区）。 */
+  @Local todoSupportedSnap: boolean = true;
+  /** 本会话排队消息（只显示排队项）。 */
+  @Local queueSnap: DshrcQueueItem[] = [];
+  /** 本会话待答提问卡。 */
+  @Local pendingQuestionsSnap: QuestionCard[] = [];
+  /** 本会话待审批卡。 */
+  @Local pendingApprovalsSnap: ApprovalCard[] = [];
   private scroller: Scroller = new Scroller();
   /** 首次进入是否已完成贴底（timeline 有缓存 / 历史异步到达两种都要滚到底）。 */
   private pendingInitialScroll: boolean = true;
@@ -256,6 +293,14 @@ export struct SessionDetailPage {
     this.setupMarkdownTheme();
     // 路由参数由 hrouter 传递（routes.openSessionDetail 的 param → 本页 getParams）。
     this.readRouteParams();
+    // v1.3.1：会话状态快照（待答 / 排队 / Todo / Goal）订阅——store 广播变化，
+    // 本页把数据搬进 @Local，页面状态变化才会真正触发重渲染。
+    EventPost.getDefault().onFromComponent(EVT_SESSION_STATE_CHANGED, this, (sid: string): void => {
+      if (sid.length === 0 || sid === this.sessionId) {
+        this.syncSessionState();
+      }
+    });
+    this.syncSessionState();
     if (this.sessionId.length > 0) {
       this.store.openSession(this.sessionId);
       this.restoreFirstPromptDraft();
@@ -286,6 +331,7 @@ export struct SessionDetailPage {
             this.store.loadSessionPermission(this.sessionId);
           }
         }
+        this.syncSessionState();
       },
       onShown: (): void => {
         if (this.sessionId.length > 0) {
@@ -297,6 +343,7 @@ export struct SessionDetailPage {
           this.store.loadSessionPermission(this.sessionId);
           this.maybeLoadSubagents();
         }
+        this.syncSessionState();
       }
     });
     // 首次进入贴底：等首屏内容布局完成后再滚到底（timeline 有缓存 / 历史异步到达都走这里兜底）。
@@ -1336,6 +1383,265 @@ export struct SessionDetailPage {
     .padding({ left: SP_4, right: SP_4, top: SP_4, bottom: SP_6 })
   }
 
+  // ---- v1.3.0：Goal / Todo 只读面板（契约 §5.13 / §5.14）----
+  //
+  // v1.3.1：这些数据在 store 里是「Map + 版本号」。**页面不直接读 store**，
+  // 而是由 syncSessionState() 把快照搬进本页的 @Local（见该方法注释）。
+
+  /**
+   * 把 store 的会话状态搬进本页的 @Local 快照（v1.3.1）。
+   *
+   * 为什么必须这样：待答交互 / 排队 / Todo / Goal 在 store 里是 Map + 版本号，
+   * 页面在 build 里「读一次版本号」**不会**建立渲染依赖——真机实测症状：
+   * 排队项不消失（残留）、回前台后提问卡不弹出、目标操作后目标条不刷新。
+   * ⇒ store 在这些数据变化时广播 EVT_SESSION_STATE_CHANGED，页面收到后搬快照；
+   * 页面自己的 @Local 变化一定会触发重渲染（V2 最基本机制），行为确定。
+   */
+  private syncSessionState(): void {
+    const sid: string = this.sessionId;
+    if (sid.length === 0) {
+      return;
+    }
+    this.goalSnap = this.store.goalFor(sid);
+    this.goalActivationSnap = this.store.goalActivationFor(sid);
+    this.goalSupportedSnap = this.store.goalSupportedFor(sid);
+    this.goalActionsSnap = this.store.goalActionsFor(sid);
+    const todos: DshrcTodoItem[] | null = this.store.todosFor(sid);
+    this.todoRowsSnap = this.buildTodoRows(todos);
+    this.todoEmptySnap = todos === null || todos.length === 0;
+    this.todoSupportedSnap = this.store.todosSupportedFor(sid);
+    const counts: TodoCounts = this.store.todoCountsFor(sid);
+    this.todoCountsSnap = counts.completed.toString() + '/' + counts.total.toString() + ' 已完成';
+    this.queueSnap = this.store.queueItems(sid);
+    this.pendingQuestionsSnap = this.store.questionsFor(sid);
+    this.pendingApprovalsSnap = this.store.approvalsFor(sid);
+  }
+
+  /** 目标条是否渲染（宿主不支持 → 整块不渲染）。 */
+  private goalVisible(): boolean {
+    return this.goalSupportedSnap;
+  }
+
+  /** 当前目标（null = 无目标）。 */
+  private currentGoal(): DshrcGoalWire | null {
+    return this.goalSnap;
+  }
+
+  /** 目标描述。 */
+  private goalObjective(): string {
+    const goal: DshrcGoalWire | null = this.currentGoal();
+    return goal === null ? '' : goal.objective;
+  }
+
+  /**
+   * 目标状态短文案（桌面 GoalBar 的 activeLabel 口径，但手机窄 → 去掉「的目标」）：
+   * active+armed/未知 → 进行中；active+disarmed → 已暂停；paused → 已暂停；blocked → 受阻。
+   */
+  private goalStatusShort(): string {
+    const goal: DshrcGoalWire | null = this.currentGoal();
+    if (goal === null) {
+      return '';
+    }
+    if (goal.phase === 'active' && this.goalActivationSnap === 'disarmed') {
+      return '已暂停';
+    }
+    return goalPhaseLabel(goal.phase);
+  }
+
+  /** 目标轮次文案（已用/上限；上限未知就不显示）。 */
+  private goalRoundsText(): string {
+    const goal: DshrcGoalWire | null = this.currentGoal();
+    if (goal === null || goal.maxGoalRounds <= 0) {
+      return '';
+    }
+    return goal.roundsStarted.toString() + '/' + goal.maxGoalRounds.toString();
+  }
+
+  /** 目标受阻原因（仅 blocked 阶段）。 */
+  private goalBlockedText(): string {
+    const goal: DshrcGoalWire | null = this.currentGoal();
+    if (goal === null || goal.phase !== 'blocked' || goal.blockedReason === undefined) {
+      return '';
+    }
+    const reason: DshrcGoalBlockedReason = goal.blockedReason;
+    const text: string = reason.message.length > 0 ? reason.message : reason.code;
+    return text.length > 0 ? '受阻：' + text : '受阻';
+  }
+
+  /** 目标操作是否给出（子代理只读 → 一律不给）。 */
+  private goalCanOperate(): boolean {
+    return !this.isSubagentView();
+  }
+
+  /** 宿主允许的目标动作集合（空列表时按契约全集兜底；**永远不含 block**）。 */
+  private goalActionList(): DshrcGoalAction[] {
+    const fromHost: DshrcGoalAction[] = this.goalActionsSnap;
+    if (fromHost.length > 0) {
+      return fromHost;
+    }
+    const fallback: DshrcGoalAction[] = ['create', 'edit', 'pause', 'resume', 'complete', 'clear'];
+    return fallback;
+  }
+
+  /** 某个目标动作当前是否可用。 */
+  private goalHasAction(action: string): boolean {
+    if (!this.goalCanOperate()) {
+      return false;
+    }
+    const actions: DshrcGoalAction[] = this.goalActionList();
+    for (let i: number = 0; i < actions.length; i++) {
+      if (actions[i] === action) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** 新建（仅在没有目标时）。 */
+  private goalCanCreate(): boolean {
+    return this.goalHasAction('create') && this.currentGoal() === null;
+  }
+
+  /** 编辑（有目标且未完成；Host 不接受对 complete 目标的编辑）。 */
+  private goalCanEdit(): boolean {
+    const goal: DshrcGoalWire | null = this.currentGoal();
+    return this.goalHasAction('edit') && goal !== null && goal.phase !== 'complete';
+  }
+
+  /** 暂停（仅 active 且进程内续跑已 armed；与桌面 GoalBar 同口径）。 */
+  private goalCanPause(): boolean {
+    const goal: DshrcGoalWire | null = this.currentGoal();
+    return this.goalHasAction('pause') && goal !== null && goal.phase === 'active' &&
+      this.goalActivationSnap === 'armed';
+  }
+
+  /**
+   * 恢复：paused / blocked，或 active 但未 armed（桌面 GoalBar 的 showResume 口径）。
+   * 未知 activation 的 active 目标也给出恢复入口，由 Host 决定是否有效。
+   */
+  private goalCanResume(): boolean {
+    const goal: DshrcGoalWire | null = this.currentGoal();
+    if (goal === null || goal.phase === 'complete' || !this.goalHasAction('resume')) {
+      return false;
+    }
+    if (goal.phase === 'paused' || goal.phase === 'blocked') {
+      return true;
+    }
+    return goal.phase === 'active' && this.goalActivationSnap !== 'armed';
+  }
+
+  /** 清除（仅在有目标时）。 */
+  private goalCanClear(): boolean {
+    return this.goalHasAction('clear') && this.currentGoal() !== null;
+  }
+
+  /** 新建目标（契约 §5.14：create 不带 expected）。 */
+  private onCreateGoal(objective: string, maxGoalRounds: number): void {
+    this.store.createGoal(this.sessionId, objective, maxGoalRounds > 0 ? maxGoalRounds : undefined)
+      .then((): void => {
+        this.toast('目标已创建');
+      })
+      .catch((e: Error): void => {
+        this.toast('创建目标失败：' + e.message);
+      });
+  }
+
+  /** 编辑目标（objective + maxGoalRounds）。 */
+  private onEditGoal(objective: string, maxGoalRounds: number): void {
+    this.store.editGoal(this.sessionId, objective, maxGoalRounds > 0 ? maxGoalRounds : undefined)
+      .then((): void => {
+        this.toast('目标已更新');
+      })
+      .catch((e: Error): void => {
+        this.toast('更新目标失败：' + e.message);
+      });
+  }
+
+  /** 暂停目标。 */
+  private onPauseGoal(): void {
+    this.store.pauseGoal(this.sessionId).then((): void => {
+      this.toast('目标已暂停');
+    }).catch((e: Error): void => {
+      this.toast('暂停目标失败：' + e.message);
+    });
+  }
+
+  /** 恢复目标。 */
+  private onResumeGoal(): void {
+    this.store.resumeGoal(this.sessionId).then((): void => {
+      this.toast('目标已恢复');
+    }).catch((e: Error): void => {
+      this.toast('恢复目标失败：' + e.message);
+    });
+  }
+
+  /** 清除目标：**二次确认**（契约 §5.14）。 */
+  private onClearGoal(): void {
+    const buttons: promptAction.Button[] = [
+      { text: '取消', color: $r('app.color.label_secondary') },
+      { text: '清除', color: $r('app.color.state_error') }
+    ];
+    promptAction.showDialog({
+      title: '清除目标',
+      message: '确定清除当前目标？目标进度将被丢弃，此操作不可撤销。',
+      buttons: buttons
+    }).then((res: ShowDialogSuccessResponse): void => {
+      if (res.index === 1) {
+        this.store.clearGoal(this.sessionId).then((): void => {
+          this.toast('目标已清除');
+        }).catch((e: Error): void => {
+          this.toast('清除目标失败：' + e.message);
+        });
+      }
+    }).catch((e: Error): void => {
+      this.toast('确认失败：' + e.message);
+    });
+  }
+
+  /** Todo 卡是否渲染（宿主不支持 → 整块不渲染；null 与 unsupported 严格区分）。 */
+  private todoVisible(): boolean {
+    // v1.3.1（用户要求）：任务清单**没数据就整行隐藏**——不显示「暂无任务」的空行，
+    // 免得输入区上方常驻一条没信息量的条。宿主不支持同样不渲染。
+    return this.todoSupportedSnap && this.todoRowsSnap.length > 0;
+  }
+
+  /** 本回合是否没有清单条目（null / 空表 → 显示「暂无任务」）。 */
+  private todoEmpty(): boolean {
+    return this.todoEmptySnap;
+  }
+
+  /** Todo 三态计数摘要。 */
+  private todoCountsText(): string {
+    return this.todoCountsSnap;
+  }
+
+  /** Todo 展示行（key = 内容 + 同名序号，避免 Repeat key 重复）。 */
+  private todoRows(): TodoRowView[] {
+    return this.todoRowsSnap;
+  }
+
+  /** 由清单条目算展示行（key = 内容 + 同名序号，避免 Repeat key 重复）。 */
+  private buildTodoRows(items: DshrcTodoItem[] | null): TodoRowView[] {
+    const rows: TodoRowView[] = [];
+    if (items === null) {
+      return rows;
+    }
+    const seen: Map<string, number> = new Map<string, number>();
+    for (let i: number = 0; i < items.length; i++) {
+      const content: string = items[i].content;
+      const count: number = seen.get(content) ?? 0;
+      seen.set(content, count + 1);
+      const row: TodoRowView = {
+        key: content + '#' + count.toString(),
+        content: content,
+        statusLabel: todoStatusLabel(items[i].status),
+        done: items[i].status === 'completed'
+      };
+      rows.push(row);
+    }
+    return rows;
+  }
+
   // ---- v1.1.1：发送模式（session.prompt 的 mode）+ 待执行消息列表（session.queue）----
 
   /** agent 是否正在运行（决定是否显示发送模式胶囊）。 */
@@ -1345,17 +1651,13 @@ export struct SessionDetailPage {
 
   /**
    * 待执行消息（宿主 session.queue 事件，契约 §5.2 v1.1.1）。
-   * 读 store.queueVersion（@Trace）建立响应式依赖——队列内容存在 store 内部 Map 里，
-   * 版本号一变即触发本页重渲染；宿主说「没有待执行消息」→ 空数组（不显示该区）。
+   * v1.3.1：内容来自本页快照（queueSnap，由 EVT_SESSION_STATE_CHANGED 驱动刷新）——
+   * 之前靠 store.queueVersion 建立依赖，真机上排队项消失后**残留在页面上不消失**。
    * v1.1.2：**只显示排队项**（target='next-turn'）；已插入当前 turn 的（next-step）
    * 不在排队信息里显示（用户反馈）——已交给当前任务，等它消费即可。
    */
   private pendingQueue(): DshrcQueueItem[] {
-    const version: number = this.store.queueVersion;
-    if (version < 0) {
-      return [];
-    }
-    const all: DshrcQueueItem[] = this.store.queueItems(this.sessionId);
+    const all: DshrcQueueItem[] = this.queueSnap;
     const queued: DshrcQueueItem[] = [];
     for (let i: number = 0; i < all.length; i++) {
       if (all[i].target !== 'next-step') {
@@ -2011,16 +2313,17 @@ export struct SessionDetailPage {
       .layoutWeight(1)
 
       // 本会话的审批 / 提问卡片（输入条上方；resolved / answered 后消失）
-      if (this.store.approvalsFor(this.sessionId).length > 0 ||
-        this.store.questionsFor(this.sessionId).length > 0) {
+      // v1.3.1：卡片列表来自本页快照（pendingApprovalsSnap / pendingQuestionsSnap），
+      // 卡片自身字段（倒计时等）仍是 @ObservedV2 → 原地更新即时生效。
+      if (this.pendingApprovalsSnap.length > 0 || this.pendingQuestionsSnap.length > 0) {
         Scroll() {
           Column() {
-            Repeat(this.store.approvalsFor(this.sessionId))
+            Repeat(this.pendingApprovalsSnap)
               .each((cell: RepeatItem<ApprovalCard>): void => {
                 ApprovalRepeatCard({ cell: cell, sessionTitle: '' })
               })
               .key((c: ApprovalCard): string => c.askId)
-            Repeat(this.store.questionsFor(this.sessionId))
+            Repeat(this.pendingQuestionsSnap)
               .each((cell: RepeatItem<QuestionCard>): void => {
                 QuestionRepeatCard({ cell: cell, sessionTitle: '' })
               })
@@ -2045,6 +2348,59 @@ export struct SessionDetailPage {
       .width('100%')
       .alignItems(VerticalAlign.Center)
       .padding({ left: SP_3, right: SP_3, top: SP_2, bottom: SP_1 })
+
+      // v1.3.0（契约 §5.14 / §5.13）：Goal 单行条 → Todo 折叠卡 → 排队消息 → 附件 → 输入框。
+      // 无数据不渲染（宿主不支持 = 整块不出现）；子代理不显示目标操作（canOperate=false）。
+      if (this.goalVisible() || this.todoVisible()) {
+        Column() {
+          if (this.goalVisible()) {
+            GoalBar({
+              visible: true,
+              hasGoal: this.currentGoal() !== null,
+              objective: this.goalObjective(),
+              phaseLabel: this.goalStatusShort(),
+              roundsText: this.goalRoundsText(),
+              blockedText: this.goalBlockedText(),
+              canOperate: this.goalCanOperate(),
+              canCreate: this.goalCanCreate(),
+              canEdit: this.goalCanEdit(),
+              canPause: this.goalCanPause(),
+              canResume: this.goalCanResume(),
+              canClear: this.goalCanClear(),
+              onCreate: (objective: string, maxGoalRounds: number): void => {
+                this.onCreateGoal(objective, maxGoalRounds);
+              },
+              onEdit: (objective: string, maxGoalRounds: number): void => {
+                this.onEditGoal(objective, maxGoalRounds);
+              },
+              onPause: (): void => {
+                this.onPauseGoal();
+              },
+              onResume: (): void => {
+                this.onResumeGoal();
+              },
+              onClear: (): void => {
+                this.onClearGoal();
+              }
+            })
+            .margin({ bottom: SP_2 })
+          }
+          if (this.todoVisible()) {
+            TodoCard({
+              visible: true,
+              expanded: this.todoExpanded,
+              empty: this.todoEmpty(),
+              countsText: this.todoCountsText(),
+              rows: this.todoRows(),
+              onToggle: (): void => {
+                this.todoExpanded = !this.todoExpanded;
+              }
+            })
+          }
+        }
+        .width('100%')
+        .padding({ left: SP_3, right: SP_3, bottom: SP_2 })
+      }
 
       // 输入条：one-shot 子代理只读（契约 §5.6：一次性子代理不能发消息），其余正常
       if (this.isSubagentView() && this.subagentMode() === 'one-shot') {

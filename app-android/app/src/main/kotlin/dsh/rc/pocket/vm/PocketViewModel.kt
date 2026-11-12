@@ -12,6 +12,8 @@
  *  - §3.4.1 会话纪元「先持久化再使用」：链路的纪元回调里**同步**落盘再返回。
  *  - §3.5   配对信息只存本机（RemoteRepo），不进日志。
  *  - §5.11  附件分块上传（begin → chunk* → commit），**不把 base64 塞进 prompt**。
+ *  - §5.13  Todo 只读展示（整表快照，手机不写清单）。
+ *  - §5.14  Goal 展示 + 人类操作（create/edit/pause/resume/complete/clear，带 CAS）。
  *  - §5     断线恢复由 SessionStore.onLinkOnline() 负责，UI 不自己重复拉。
  */
 package dsh.rc.pocket.vm
@@ -28,6 +30,8 @@ import dsh.rc.core.DraftAttachment
 import dsh.rc.core.DshrcLink
 import dsh.rc.core.EpochState
 import dsh.rc.core.FetchedImage
+import dsh.rc.core.GoalAction
+import dsh.rc.core.GoalWire
 import dsh.rc.core.HostInfo
 import dsh.rc.core.LinkConfig
 import dsh.rc.core.LinkState
@@ -41,6 +45,7 @@ import dsh.rc.core.TimelineEntry
 import dsh.rc.core.TimelineItem
 import dsh.rc.core.TimelineReasoning
 import dsh.rc.core.TimelineStep
+import dsh.rc.core.TodoState
 import dsh.rc.core.jsonOf
 import dsh.rc.core.int
 import dsh.rc.core.str
@@ -234,6 +239,28 @@ class PocketViewModel(application: Application) : AndroidViewModel(application) 
 
     /** 待答提问。 */
     val questions = store.questions
+
+    // ---- v1.3.0：Todo / Goal（契约 §5.13 / §5.14） ----
+
+    /**
+     * 当前会话的 Todo 快照（契约 §5.13）。
+     *
+     * `null` = 宿主不支持 / 还没拉过（隐藏清单入口）；
+     * `TodoState(supported=true, todos=null)` = 宿主支持但本回合没有清单（显示「暂无任务」）。
+     */
+    val todos: StateFlow<TodoState?> = store.todos
+
+    /** 当前会话的 Goal（契约 §5.14；null = 当前没有目标）。 */
+    val goal: StateFlow<GoalWire?> = store.goal
+
+    /** Goal 续跑激活态（armed | disarmed | null = 读不到 → 不得显示「自动续跑中」）。 */
+    val goalActivation: StateFlow<String?> = store.goalActivation
+
+    /** 宿主是否支持 Goal（false = 隐藏目标入口）。 */
+    val goalSupported: StateFlow<Boolean> = store.goalSupported
+
+    /** 宿主允许的 Goal 人类操作子集（空 = 不限制）。 */
+    val goalActions: StateFlow<List<String>> = store.goalActions
 
     /** 本地日志（关于页）。 */
     val logs = app.logs
@@ -565,6 +592,56 @@ class PocketViewModel(application: Application) : AndroidViewModel(application) 
     } catch (e: Exception) {
         notify("图片拉取失败：${e.message}")
         null
+    }
+
+    // ------------------------------------------------------------------
+    // Todo / Goal（契约 §5.13 / §5.14，v1.3.0）
+    // ------------------------------------------------------------------
+
+    /** 重新拉该会话的 Todo 快照（手机**只读**）。 */
+    fun loadTodos(sessionId: String) {
+        viewModelScope.launch { store.loadSessionTodos(sessionId) }
+    }
+
+    /** 重新拉该会话的 Goal 快照。 */
+    fun loadGoal(sessionId: String) {
+        viewModelScope.launch { store.loadSessionGoal(sessionId) }
+    }
+
+    /**
+     * Goal 人类操作（契约 §5.14）：新建 / 编辑 / 暂停 / 恢复 / 完成 / 清除。
+     *
+     * - 除 create 外，core 会自动带上手机当前看到的 `{id, revision}` 做 Host CAS；
+     * - 宿主回 `GOAL_STALE_REVISION` → core 重拉 `session.goal` 并把错误透出（**不自动覆盖**）；
+     * - 子代理会话只读（core 直接拒绝）。
+     */
+    fun goalAction(
+        sessionId: String,
+        action: GoalAction,
+        objective: String? = null,
+        maxGoalRounds: Int? = null,
+    ) {
+        viewModelScope.launch {
+            val ok = store.goalAction(sessionId, action, objective, maxGoalRounds)
+            if (ok) {
+                notify(goalActionToast(action))
+            } else {
+                notify(store.lastError.value.ifEmpty { "目标操作失败" })
+            }
+        }
+    }
+
+    /** 该会话是否允许操作 Goal（子代理只读）。 */
+    fun canOperateGoal(sessionId: String): Boolean = store.canOperateGoal(sessionId)
+
+    /** Goal 操作成功提示文案。 */
+    private fun goalActionToast(action: GoalAction): String = when (action) {
+        GoalAction.CREATE -> "目标已创建"
+        GoalAction.EDIT -> "目标已更新"
+        GoalAction.PAUSE -> "目标已暂停"
+        GoalAction.RESUME -> "目标已恢复"
+        GoalAction.COMPLETE -> "目标已完成"
+        GoalAction.CLEAR -> "目标已清除"
     }
 
     /**

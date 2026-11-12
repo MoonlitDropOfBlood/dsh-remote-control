@@ -506,3 +506,161 @@ List {
   - 切会话 / 断链时隐藏窗口作废（`openSession` / `onLinkState('stopped'|'idle')`）。
 - 回归：`node live-order-node-test.mjs` 增加 `hidingLiveTail`、投影过滤、空闲当场摘除、
   `reasoningDelta` 结束隐藏的接线断言。
+
+## v1.3.0：待答交互快照 + Todo + Goal（2026-11-12，契约 §5.12 / §5.13 / §5.14）
+
+契约冻结为 v1.3.0 后手机端补齐三块只读/人类面能力。**wire 文本一字未改**，
+只新增契约已定义的请求/事件与字段。
+
+### ① hello 能力声明（契约 §5.1）
+
+- 业务 hello 的 payload 增 `features: ["session-state-v1"]`（`protocol.ets` 的
+  `CLIENT_FEATURES`）。声明后插件对本客户端启用：`pending.interactions` 恢复通道、
+  Todo 只读、Goal 人类面 CAS、timed 超时后的 `question.request{state:"continued"}` 补答。
+- 未声明的旧客户端：插件按旧语义发 `question.resolved`，**不**重发 continued（§5.12.6）。
+
+### ② 待答交互（契约 §5.12）：按 askId 幂等 + 快照合并
+
+- `QuestionCard` 增 `state`(open/continued) / `callId` / `expiresAt` / `answerable`；
+  `ApprovalCard` 增 `expiresAt` / `answerable`。
+- **live 事件不再是「一次性内存事件」**：`question.request` / `approval.request` 走
+  `upsertQuestion` / `upsertApproval`——同 `askId` **原地更新既有卡片**（不叠加、不换实例），
+  Repeat 按 askId 复用节点时也能收到 @Trace 更新。
+- **恢复通道**：`pending.interactions` 是只读快照，**读取失败按空数组处理，绝不阻塞瀑布**。
+  拉取时机：`onAppForeground()` / `onLinkState('online')` 对账 / `openSession()` /
+  相关 live 事件（question/approval request·resolved）后各拉一次；在途请求不排队。
+- **合并而不是丢 live 项**（规则见 `model/interaction-plan.ts` 的 `planPendingMerge`）：
+  1. 快照项按 askId 幂等 upsert；
+  2. 范围内（scope=该会话）、**在请求发出之前就存在**却不在快照里的卡片 → 移除（已失效）；
+  3. **请求发出之后**才到达的 live 卡片 → 保留（旧快照不得误删刚到的卡）。
+     实现上：live 事件处理时先取 `pendingSeq` 快照基准再 upsert，新卡 bornSeq 更大 → 不会被删。
+- `submitQuestion` 的 `applied:false` **不再断言「桌面端已处理」**（可能是已失效，也可能
+  是另一端刚回答）→ 提示「正在重新核对」并**重拉待答快照**。
+- `continued` 卡片**仍可作答**（`canSubmit()`）：倒计时归零显示「可补答」；
+  `answerable=false`（宿主已不可答）则禁用按钮并显示「已失效」（§5.12.5）。
+
+### ③ Todo（契约 §5.13）：只读整表
+
+- `session.todos` 拉取 + `session.todosChanged` 事件 → **整表替换**（`todo/write` 覆盖，
+  `turn/start` 清 `null`），客户端不自行合并。
+- **null 与 unsupported 严格区分**：`supported=false` → **隐藏**清单区；
+  `todos=null` → 显示「暂无任务」。清单内容存 store 内部 Map，用 `@Trace todosVersion`
+  暴露变化（Map 不可观察，与 queueVersion 同一套路）。
+
+### ④ Goal（契约 §5.14）：人类面 CAS
+
+- `session.goal` 拉取 + `session.goalChanged` / `session.goalActivationChanged` 事件。
+- 动作：create / edit / pause / resume / complete / clear。
+  **除 create 外每个动作必须带当前 `{id,revision}`**（Host 做 CAS）；
+  Host 回 `GOAL_STALE_REVISION` → **重拉 `session.goal`** 并提示「已被另一端更新」，**不覆盖**。
+- **手机不提供 block**（类型里就没有该动作）；完成/清除在手机端**二次确认**。
+- `activation` 是进程内状态，读不到就**不显示**「自动续跑中」。
+- **子代理只读**：目标操作只给根会话（`canOperate = !isSubagentView()`）。
+
+### ⑤ UI（`pages/GoalTodoPanels.ets`，V2 组件）
+
+- 输入区上方渲染顺序：**Goal 单行条 → Todo 折叠卡 → 排队消息 → 附件 → 输入框**；
+  无数据各自隐藏（宿主不支持 = 整块不渲染）。
+- 组件参数**只用基本类型**（V2 的 @Param 对对象/数组是深拷贝，传可变对象会「引用没变 →
+  子组件不刷新」）；折叠态放**页面** @Local（节点被回收后子组件 @Local 会丢）。
+- Todo 展开显示三态（待办/进行中/已完成）与计数，只读；key = 内容 + 同名序号（防 Repeat key 重复）。
+
+### 回归
+
+- `node v13-contract-test.mjs`：队列整表替换（空快照清缓存）、askId 幂等、待答快照合并、
+  Todo null vs unsupported、Goal CAS 引用与 stale 重拉、UI 调用路径与渲染顺序、V1 装饰器 0 命中。
+- `node attachment-contract-test.mjs` 的 CONTRACT_VERSION 断言随契约升到 v1.3.1。
+
+## v1.3.1（应用侧，协议不变）：状态快照刷新 —— 别指望「读版本号」能刷新页面
+
+### 症状（真机/模拟器实测，2026-11-12）
+
+三处**数据明明变了、页面就是不刷新**：
+
+1. 排队消息被宿主消费后，**残留在输入框上方**（用户原话「subagent 会话残留是只消息排队残留」）；
+2. App 从后台切回前台，**最后一条提问不弹提问卡**（流程卡住）；
+3. 目标操作（暂停 / 完成 / 清除）后，**目标条纹丝不动**。
+
+### 根因：ArkUI V2 里「经辅助方法读 store 的 @Trace」不建立渲染依赖
+
+store 里这些数据是 **Map + 版本号**（`queueVersion` / `todosVersion` / `goalVersion`），
+页面在 build 里写 `const v = this.store.queueVersion;`（哪怕就在 build 里）来「建立依赖」——
+**实测不生效**：store 改了值，页面**不重渲染**（用 build 计数器 + hilog 验证：页面只 build 过一次）。
+只有**卡片自身 @ObservedV2 对象的 @Trace 字段**（如提问卡倒计时）才会原地刷新。
+
+⚠️ 别再写「读一次版本号建立依赖」这套（v1.1.2 / v1.3.0 的注释就是这个错的口径，已被本节推翻）。
+⚠️ 也别指望 store 的 `@Trace` 数组（`questions` / `approvals`）被页面读到就会重渲染。
+
+### 修法：事件驱动 + 页面自己的 @Local 快照
+
+- `model/events.ets` 新增 `EVT_SESSION_STATE_CHANGED`（载荷：sessionId；空串 = 全体）。
+- `model/sessionstore.ets` 在这些数据落地时广播它：排队表写入、Todo 快照落地、
+  Goal 快照/事件/动作响应、待答卡 upsert / 移除 / 快照合并。
+- 页面用 `onFromComponent(EVT_SESSION_STATE_CHANGED, this, …)` 订阅（组件销毁自动反注册），
+  收到后把数据**搬进自己的 @Local 快照**，渲染只读快照：
+  - `SessionDetailPage`：`goalSnap / goalActivationSnap / goalSupportedSnap / goalActionsSnap /
+    todoRowsSnap / todoEmptySnap / todoCountsSnap / todoSupportedSnap / queueSnap /
+    pendingQuestionsSnap / pendingApprovalsSnap`（`syncSessionState()` 一次搬完）；
+  - `ApprovalQueuePage`：`approvalsSnap / questionsSnap`；
+  - `Index`：`pendingCountSnap`（首页横幅数字）。
+- 页面**自己的 @Local 变化一定会触发重渲染**（V2 最基本机制），行为确定、可回归。
+- 页面在 `aboutToAppear` / `HRouter.registerLifecycle` 的 `onAppear` / `onShown` 也要
+  `syncSessionState()`（首屏 + 回前台 + 重进页面都要对齐一次）。
+
+### 回归
+
+- `node v13-contract-test.mjs` 新增「状态快照刷新」断言：事件契约、store 各落地点的广播、
+  三个页面的订阅与快照字段、以及**渲染路径不得再直接读 store 的 Map / 版本号**。
+
+### 顺带
+
+- 审批队列页 / 首页横幅同病同治（它们也只读 store 的 helper 结果）。
+
+## v1.3.1（应用侧续）：Goal 行对齐桌面 + 唤醒消息触发卡 + Todo 空行隐藏
+
+真机验收（HUAWEI Mate 70，真实插件 + 真实中继 + 真实宿主）驱动的四处修正：
+
+### ① Goal 行布局（对齐桌面 GoalBar）
+
+桌面 `dsh-client-ui-goal` 的 GoalBar 顺序是
+**目标图标 → 状态 → 目标文案 → 三个小图标按钮（恢复/暂停、编辑、删除）**，
+手机照抄（窄屏把状态词缩短，**不带「的目标」**）：
+
+```
+[目标] 进行中 6/12  [目标文案（省略号）]  [⏸/▶] [✎] [🗑]
+```
+
+- 状态：`active+armed/未知` → `进行中`；`active+disarmed` → `已暂停`；`paused` → `已暂停`；
+  `blocked` → `受阻`（`complete` 的条不渲染，桌面亦如此）。
+- 轮次紧跟状态（手机额外保留，桌面没有）。
+- 操作**只用图标按钮**（`SymbolGlyph` + 文字按钮全删）；**不再有「完成」**（桌面也没有，
+  完成由 Agent 产生；协议仍保留 `complete`）。
+- ⚠️ `SymbolGlyph.fontColor(...)` 必须传**数组**（`.fontColor([$r('app.color.x')])`），
+  传单个 Resource 直接编译失败（`No overload matches`）。
+- 目标编辑面板**不提供轮次输入**（`maxGoalRounds` 由 Agent 控制，恒不提交）。
+
+### ② 唤醒消息触发卡（契约 §5.3 v1.3.1）
+
+宿主唤醒回合的消息（`source.kind !== "user"`）桌面渲染成「触发卡」，手机同口径：
+
+- `ChatMessage.trigger`（goal/agent/team/subagent/webhook/schedule/job/plugin）→
+  `TimelineItem.trigger`（`@Trace`，`transferTimelineFields` 必须搬运）；
+- 渲染：`TimelineView.MessageBubble` 里 `item.trigger.length > 0` →
+  一行小胶囊（图标 + `继续执行目标` 等桌面同款词条），**不画气泡、不显示注入的原始正文**。
+- 修之前手机**整段看不到 Goal 轮次提示**（旧 `mapHistoryMessages` 直接丢掉非 user 来源）。
+
+### ③ 任务清单没数据 → 整行隐藏
+
+`todoVisible() = supported && rows.length > 0`：`todos:null` / 空数组不再画「暂无任务」空行
+（用户要求；契约 §5.13 渲染口径同步改成「没数据就不显示」，协议字段语义不变）。
+
+### ④ 目标轮次不更新（真实宿主不推轮次事件）
+
+宿主只在 `goal/change` 发事件；**轮次推进**（`goal-round-driver` 写 `user/message`、
+`source.kind="goal"`）**不发事件** → 插件补广播 `session.goalChanged{operation:"round"}`
+（见 plugin/AGENTS.md）。手机端 handler 无需特判（operation 只用于展示）。
+
+### 回归
+
+- `node v13-contract-test.mjs` 新增：Goal 行顺序/图标按钮/无「完成」、编辑面板无轮次、
+  Todo 空行隐藏、触发卡分支与 `trigger` 映射/搬运。

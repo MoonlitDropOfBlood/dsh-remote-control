@@ -17,6 +17,8 @@ import {
   SP_4
 } from '../model/theme';
 import { ApprovalCard, QuestionCard, SessionStore, sessionStore } from '../model/sessionstore';
+import { EVT_SESSION_STATE_CHANGED } from '../model/events';
+import { EventPost } from 'eventpost';
 import { goBack } from '../model/routes';
 import { ApprovalRepeatCard, QuestionRepeatCard } from './AskCards';
 
@@ -25,6 +27,27 @@ import { ApprovalRepeatCard, QuestionRepeatCard } from './AskCards';
 @ComponentV2
 export struct ApprovalQueuePage {
   @Local store: SessionStore = sessionStore;
+  /**
+   * v1.3.1：待答卡片列表快照。
+   * store 里的卡片数组存在 Map/@Trace 数组里，页面**经 helper 方法读不会建立渲染依赖**
+   * （真机症状：新提问卡不出现、答完的卡不消失）→ 改由 store 广播
+   * EVT_SESSION_STATE_CHANGED，页面把列表搬进自己的 @Local。
+   */
+  @Local approvalsSnap: ApprovalCard[] = [];
+  @Local questionsSnap: QuestionCard[] = [];
+
+  aboutToAppear(): void {
+    EventPost.getDefault().onFromComponent(EVT_SESSION_STATE_CHANGED, this, (): void => {
+      this.syncQueue();
+    });
+    this.syncQueue();
+  }
+
+  /** 把 store 的待答列表搬进本页 @Local。 */
+  private syncQueue(): void {
+    this.approvalsSnap = this.store.pendingApprovals();
+    this.questionsSnap = this.store.pendingQuestions();
+  }
 
   @Builder
   topBar() {
@@ -48,7 +71,7 @@ export struct ApprovalQueuePage {
         .fontColor($r('app.color.label_primary'))
         .margin({ left: SP_3 })
         .layoutWeight(1)
-      Text('待处理 ' + this.store.pendingCount().toString())
+      Text('待处理 ' + (this.approvalsSnap.length + this.questionsSnap.length).toString())
         .fontSize(FS_CAPTION)
         .fontColor($r('app.color.state_warn'))
         .padding({ left: 8, right: 8, top: 3, bottom: 3 })
@@ -85,10 +108,10 @@ export struct ApprovalQueuePage {
       this.topBar()
       Scroll() {
         Column() {
-          if (this.store.pendingCount() === 0) {
+          if (this.approvalsSnap.length === 0 && this.questionsSnap.length === 0) {
             this.emptyState()
           }
-          Repeat(this.store.pendingApprovals())
+          Repeat(this.approvalsSnap)
             .each((cell: RepeatItem<ApprovalCard>): void => {
               ApprovalRepeatCard({
                 cell: cell,
@@ -96,7 +119,7 @@ export struct ApprovalQueuePage {
               })
             })
             .key((c: ApprovalCard): string => c.askId)
-          Repeat(this.store.pendingQuestions())
+          Repeat(this.questionsSnap)
             .each((cell: RepeatItem<QuestionCard>): void => {
               QuestionRepeatCard({
                 cell: cell,

@@ -1,19 +1,44 @@
 /*
  * Copyright (c) 2026 dukedsh.
- * dsh-remote-control-app 协议层：常量 / 消息类型 / KAT 向量（契约 v1.2.0）。
- * 契约来源（只读）：仓库根 docs/PROTOCOL.md（dsh-remote-control，v1.2.0）
+ * dsh-remote-control-app 协议层：常量 / 消息类型 / KAT 向量（契约 v1.3.0）。
+ * 契约来源（只读）：仓库根 docs/PROTOCOL.md（dsh-remote-control，v1.3.0）
  * 本文件只描述“协议长什么样”，不做任何 IO 与加密运算。
+ *
+ * v1.3.0 增补（§5.12 / §5.13 / §5.14）：
+ *  - §5.12 待答交互：pending.interactions 快照 + PendingQuestion/PendingApproval；
+ *    question.request 增 state(open/continued)/callId/expiresAt/answerable。
+ *  - §5.13 Todo：session.todos 请求 + session.todosChanged 事件 + TodoItem。
+ *  - §5.14 Goal：session.goal / session.goalAction 请求 + session.goalChanged /
+ *    session.goalActivationChanged 事件 + GoalWire / GoalAction。
+ *  - session.capabilities 增 todos / goal / pendingInteractions 三个能力目录。
  */
 
 /** 协议版本（契约 §5.1 hello.proto）。 */
 export const PROTO_VERSION: number = 1;
 
-/** 协议契约文档版本（v1.2.0：§5.11 用户提示词附件——分块上传 + session.prompt uploads + ChatMessage.files；关于页展示用）。 */
-export const CONTRACT_VERSION: string = 'v1.2.0';
+/** 协议契约文档版本（v1.3.0：§5.12 待答交互与双端提问同步 + §5.13 Todo + §5.14 Goal；关于页展示用）。 */
+export const CONTRACT_VERSION: string = 'v1.3.1';
 
 /** 角色：host = PC 端 DSH 插件；client = 本 App。 */
 export const ROLE_HOST: string = 'host';
 export const ROLE_CLIENT: string = 'client';
+
+/**
+ * v1.3.0（契约 §5.1 hello.features）：客户端能力特性声明。
+ *
+ * `session-state-v1` = 本客户端支持：
+ *  - `pending.interactions` 待答快照恢复通道（§5.12）；
+ *  - `session.todos` 只读清单展示（§5.13）；
+ *  - `session.goal` / `session.goalAction` 人类面 CAS 操作（§5.14）；
+ *  - timed 超时后 `question.request{state:"continued"}` 的**补答**语义（§5.12.6）。
+ *
+ * 旧插件忽略该字段；未声明该特性的客户端，插件仍按旧事件语义处理
+ * （timed 超时时直接发 question.resolved，不会重发 continued）。
+ */
+export const FEATURE_SESSION_STATE_V1: string = 'session-state-v1';
+
+/** 本客户端在业务 hello 里声明的特性列表（契约 §5.1）。 */
+export const CLIENT_FEATURES: string[] = [FEATURE_SESSION_STATE_V1];
 
 /**
  * session.prompt 的发送模式（契约 §5.1 v1.1.1）：
@@ -105,6 +130,10 @@ export const MSG_SESSION_CANCEL: string = 'session.cancel';
 export const MSG_SESSION_RENAME: string = 'session.rename';
 export const MSG_APPROVAL_ANSWER: string = 'approval.answer';
 export const MSG_QUESTION_ANSWER: string = 'question.answer';
+export const MSG_PENDING_INTERACTIONS: string = 'pending.interactions'; // v1.3.0：待答交互快照（§5.12）
+export const MSG_SESSION_TODOS: string = 'session.todos'; // v1.3.0：读 Host todos 持久投影（§5.13）
+export const MSG_SESSION_GOAL: string = 'session.goal'; // v1.3.0：读 Host goal 持久投影（§5.14）
+export const MSG_SESSION_GOAL_ACTION: string = 'session.goalAction'; // v1.3.0：执行目标人类操作（§5.14）
 export const MSG_PUSH_REGISTER: string = 'push.register';
 export const MSG_PING: string = 'ping';
 
@@ -133,6 +162,9 @@ export const TOPIC_APPROVAL_REQUEST: string = 'approval.request';
 export const TOPIC_APPROVAL_RESOLVED: string = 'approval.resolved';
 export const TOPIC_QUESTION_REQUEST: string = 'question.request';
 export const TOPIC_QUESTION_RESOLVED: string = 'question.resolved';
+export const TOPIC_SESSION_TODOS_CHANGED: string = 'session.todosChanged'; // v1.3.0：整表覆盖 / 清空（§5.13）
+export const TOPIC_SESSION_GOAL_CHANGED: string = 'session.goalChanged'; // v1.3.0：目标变更（§5.14）
+export const TOPIC_SESSION_GOAL_ACTIVATION_CHANGED: string = 'session.goalActivationChanged'; // v1.3.0：目标 armed/disarmed（§5.14）
 export const TOPIC_PUSH_STATE: string = 'push.state';
 export const TOPIC_ERROR: string = 'error';
 
@@ -165,6 +197,11 @@ export interface DshrcPayload {
   hostName?: string;
   dshVersion?: string;
   pluginVersion?: string;
+  /**
+   * v1.3.0（契约 §5.1 hello.features）：客户端能力特性声明。
+   * 旧插件忽略该字段；未声明该特性的客户端插件按旧事件语义处理。
+   */
+  features?: string[];
   // session.*（§5.1）
   sessions?: DshrcSessionSummary[];
   sessionId?: string;
@@ -225,6 +262,19 @@ export interface DshrcPayload {
   applied?: boolean;
   answers?: DshrcAnswers;
   freeText?: string;
+  // v1.3.0：question.request 增字段（§5.2）：状态机 + Host callId + 绝对过期时间 + 可答标记
+  state?: string; // 'open' | 'continued'
+  callId?: string; // Host 侧 callId（与桌面端同一个）
+  expiresAt?: number; // 绝对 Unix 毫秒
+  answerable?: boolean;
+  // v1.3.0：session.goalAction 请求（§5.14）
+  action?: DshrcGoalAction;
+  /** CAS 引用：除 create 外每个变更都必须带手机当前看到的 {id,revision}。 */
+  expected?: DshrcGoalRef;
+  objective?: string;
+  maxGoalRounds?: number;
+  /** v1.3.0：session.goalChanged 事件的 operation（create/edit/pause/resume/complete/block/clear）。 */
+  operation?: string;
   // event（§5.2）
   topic?: string;
   /**
@@ -279,6 +329,14 @@ export interface DshrcValue {
   // question.request（§5.2）
   questions?: DshrcQuestion[];
   multiSelect?: boolean;
+  // v1.3.0（§5.2/§5.12）：question.request 增字段——状态机 + 绝对过期时间 + 可答标记。
+  // state = 'open'（手机独占窗口内）| 'continued'（窗口结束但宿主仍可补答）。
+  state?: string;
+  expiresAt?: number;
+  answerable?: boolean;
+  // v1.3.0（§5.14）：session.goalChanged 事件的 operation
+  // （create/edit/pause/resume/complete/block/clear；block 由模型/策略产生，手机不提供）。
+  operation?: string;
   // push.state（§5.2）：推送通道是否可用；未开通推送服务时为 false 并附 reason
   enabled?: boolean;
   // session.history（§5.1 v1.0.4）：历史消息页
@@ -309,6 +367,16 @@ export interface DshrcValue {
   busyEnter?: string;
   // session.capabilities（§5.1 v1.2.0）：附件能力目录（缺省 = 宿主不支持）
   attachments?: DshrcAttachmentCaps;
+  // v1.3.0（§5.13）：Todo 整表快照。null = 本回合尚无清单/已清空；[] = 明确空清单。
+  todos?: DshrcTodoItem[] | null;
+  // v1.3.0（§5.13/§5.14）：宿主是否提供该能力（supported=false = 客户端隐藏对应 UI）。
+  supported?: boolean;
+  // v1.3.0（§5.14）：目标投影与激活态
+  goal?: DshrcGoalWire | null;
+  activation?: string | null;
+  actions?: DshrcGoalAction[];
+  // v1.3.0（§5.12）：pending.interactions 响应的审批待答项（提问项走独立响应接口）。
+  approvals?: DshrcPendingApproval[];
   // session.create（§5.1 v1.0.7）：模型选择与设置结果
   model?: DshrcModelSelection;
   modelError?: string;
@@ -359,6 +427,13 @@ export interface DshrcChatMessage {
   images?: DshrcImageRef[];
   /** v1.2.0：用户消息里的文件（§5.11.4）——旧插件不返该字段时按空数组处理。 */
   files?: DshrcFileRef[];
+  /**
+   * v1.3.1（§5.3）：**唤醒消息**的触发来源（宿主自动唤醒一回合，不是用户手打）。
+   * goal / agent / team / subagent / webhook / schedule / job / plugin。
+   * 带该字段时 text 为空串（注入的原始正文由客户端隐藏），渲染成触发卡
+   * （与桌面端一致，例如「继续执行目标」）。旧插件不返该字段 → 保持旧行为。
+   */
+  trigger?: string;
 }
 
 /**
@@ -521,6 +596,152 @@ export interface DshrcCapabilities {
    * 客户端据此隐藏附件入口（旧插件没有该字段，不得报错）。
    */
   attachments?: DshrcAttachmentCaps;
+  /**
+   * v1.3.0（§5.13）：Todo 能力目录——**缺省 = 宿主不支持**（客户端隐藏清单卡）。
+   */
+  todos?: DshrcTodosCaps;
+  /**
+   * v1.3.0（§5.14）：Goal 能力目录——**缺省 = 宿主不支持**（客户端隐藏目标条）。
+   * `actions` 是宿主可执行的人类操作子集（手机不得触发 block）。
+   */
+  goal?: DshrcGoalCaps;
+  /**
+   * v1.3.0（§5.12）：待答交互能力目录——**缺省 = 宿主不支持**（客户端不做快照对账）。
+   */
+  pendingInteractions?: DshrcPendingInteractionsCaps;
+}
+
+/** v1.3.0（§5.13）：Todo 能力目录。 */
+export interface DshrcTodosCaps {
+  supported: boolean;
+}
+
+/** v1.3.0（§5.14）：Goal 能力目录。 */
+export interface DshrcGoalCaps {
+  /** 宿主是否可读目标投影（false → 客户端隐藏目标条）。 */
+  read: boolean;
+  /** 宿主允许的人类操作子集（create/edit/pause/resume/complete/clear；**不含 block**）。 */
+  actions: DshrcGoalAction[];
+}
+
+/** v1.3.0（§5.12）：待答交互能力目录。 */
+export interface DshrcPendingInteractionsCaps {
+  /** 宿主是否有提问投影（true 时 open 超时会推进到 continued，仍可补答）。 */
+  questions: boolean;
+  /** 宿主是否有审批投影（通常没有；审批只恢复插件仍持有的未决项）。 */
+  approvals: boolean;
+  /** 宿主启用 timed 模式（手机独占窗口结束后问题仍可补答）。 */
+  hostContinued: boolean;
+}
+
+/** v1.3.0（§5.13）：Todo 条目三态。 */
+export type DshrcTodoStatus = 'pending' | 'in_progress' | 'completed';
+
+/** v1.3.0（§5.14）：目标阶段。 */
+export type DshrcGoalPhase = 'active' | 'paused' | 'blocked' | 'complete';
+
+/** v1.3.0（§5.14）：目标激活态（进程内状态，不持久；读不到就是未知）。 */
+export type DshrcGoalActivation = 'armed' | 'disarmed';
+
+/**
+ * v1.3.0（§5.14）：手机可执行的人类操作。
+ * **不含 block**——blocked 由模型/策略负责，契约明令禁止手机触发。
+ */
+export type DshrcGoalAction = 'create' | 'edit' | 'pause' | 'resume' | 'complete' | 'clear';
+
+/** v1.3.0（§5.13）：Todo 条目（契约 §5.13 TodoItem）。 */
+export interface DshrcTodoItem {
+  content: string;
+  status: string; // 'pending' | 'in_progress' | 'completed'
+}
+
+/** v1.3.0（§5.14）：目标被阻塞的原因（仅 phase='blocked' 时有值）。 */
+export interface DshrcGoalBlockedReason {
+  code: string;
+  message: string;
+}
+
+/** v1.3.0（§5.14）：目标投影（契约 §5.14 GoalWire）。 */
+export interface DshrcGoalWire {
+  id: string;
+  /** CAS 版本号：每次变更 +1；手机变更必须带当前 {id,revision}。 */
+  revision: number;
+  objective: string;
+  phase: string; // 'active' | 'paused' | 'blocked' | 'complete'
+  blockedReason?: DshrcGoalBlockedReason;
+  maxGoalRounds: number;
+  roundsStarted: number;
+  createdAt: number;
+  updatedAt: number;
+  /** 已知时的激活态（未知就省略，客户端不得显示「自动续跑中」）。 */
+  activation?: string;
+}
+
+/** v1.3.0（§5.14）：CAS 引用——手机看到的 {id,revision}。 */
+export interface DshrcGoalRef {
+  id: string;
+  revision: number;
+}
+
+/**
+ * v1.3.0（§5.12）：待答快照里的单个提问（契约 §5.12 PendingQuestion）。
+ * `state:'continued'` = 手机独占等待窗口已结束，但 Host 仍可回答（可补答）。
+ */
+export interface DshrcPendingQuestion {
+  askId: string;
+  sessionId: string;
+  /** Host 侧 callId（与桌面端同一个；没有时为空串）。 */
+  callId: string;
+  questions: DshrcQuestion[];
+  state: string; // 'open' | 'continued'
+  answerable: boolean;
+  source: string; // 'plugin' | 'host'
+  /** 绝对 Unix 毫秒；缺省 = 无限期/continued（0 = 未知）。 */
+  expiresAt: number;
+  /** 兼容旧客户端的等待窗口长度（可省略）。 */
+  timeoutMs: number;
+  multiSelect: boolean;
+}
+
+/** v1.3.0（§5.12）：待答快照里的单个审批（契约 §5.12 PendingApproval）。 */
+export interface DshrcPendingApproval {
+  askId: string;
+  sessionId: string;
+  toolName: string;
+  reason: string;
+  argsPreview: string;
+  answerable: boolean;
+  source: string;
+  /** 绝对 Unix 毫秒；缺省 = 未知（0）。 */
+  expiresAt: number;
+}
+
+/**
+ * v1.3.0（§5.12）：pending.interactions 响应值。
+ * 字段可选：旧插件 / 读取失败一律按空数组处理（**绝不阻塞瀑布**）。
+ */
+export interface DshrcPendingInteractions {
+  questions?: DshrcPendingQuestion[];
+  approvals?: DshrcPendingApproval[];
+}
+
+/** v1.3.0（§5.13）：session.todos 响应值。 */
+export interface DshrcTodosSnapshot {
+  sessionId: string;
+  /** null = 本回合尚无清单/已清空（与 supported=false 严格区分）。 */
+  todos: DshrcTodoItem[] | null;
+  supported: boolean;
+}
+
+/** v1.3.0（§5.14）：session.goal 响应值。 */
+export interface DshrcGoalSnapshot {
+  sessionId: string;
+  goal: DshrcGoalWire | null;
+  /** 'armed' | 'disarmed' | null（未知为 null，不得显示「自动续跑中」）。 */
+  activation: string | null;
+  supported: boolean;
+  /** 宿主允许的人类操作子集。 */
+  actions: DshrcGoalAction[];
 }
 
 /**
@@ -640,6 +861,22 @@ export interface DshrcPeerProof {
 export interface DshrcRelayPeers {
   host: boolean;
   client: boolean;
+}
+
+/**
+ * v1.3.0（§5.12）：解析 pending.interactions 的响应值。
+ *
+ * wire 上 `questions` 这个键在两处出现，元素形状不同：
+ *  - §5.2 question.request **事件** → Question[]（id / question / options）
+ *  - §5.12 pending.interactions **响应** → PendingQuestion[]（askId / state / answerable）
+ * `DshrcValue` 是宽松袋子（一个字段无法同时表达两种形状），故对响应值做一次
+ * JSON 往返后按 PendingInteractions 解析——载荷很小，成本可忽略，
+ * 且 **wire 文本一个字都不改**。
+ */
+export function parsePendingInteractions(value: DshrcValue): DshrcPendingInteractions {
+  const raw: string = JSON.stringify(value);
+  const parsed: DshrcPendingInteractions = JSON.parse(raw) as DshrcPendingInteractions;
+  return parsed;
 }
 
 /** 构造一条业务消息信封（id 用 uuid v4，ts 为毫秒时间戳）。 */

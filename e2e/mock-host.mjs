@@ -11,6 +11,15 @@
 // v1.0.7：追加模型目录（capabilities.models / defaultModelId）、真实归档
 // （session.archive / session.unarchive / session.archives 广播 / list 的 archived）、
 // 以及思考过程（assistant.reasoningDelta 事件 + 历史 role:"reasoning" 消息）。
+// v1.3.0（契约 §5.12/§5.13/§5.14）：
+//   - session.queue 权威快照（Host inbox 投影，按 itemId 出队，空快照=清空）；
+//   - pending.interactions 待答恢复快照（live plugin pending + Host continued 合并）；
+//   - question.request 新字段（askId/callId/state/answerable/expiresAt）；
+//   - question.answer 路由 live / continued；timeout 不清 continued 卡片；
+//   - session.todos / session.goal / session.goalAction（CAS + GOAL_STALE_REVISION）；
+//   - session.todosChanged / session.goalChanged / session.goalActivationChanged 事件；
+//   - capabilities 增补 todos / goal / pendingInteractions。
+//   演示：node mock-host.mjs <relay> <channel> <secret> --demo（预置 TODO/Goal/待答）。
 import { pathToFileURL } from "node:url";
 import { createHash } from "node:crypto";
 import { RelayLink, msg } from "./link.mjs";
@@ -74,6 +83,15 @@ export const MOCK_ATTACHMENT_CAPS = {
   chunkBytes: 256 * 1024,
   imageMediaTypes: ["image/png", "image/jpeg", "image/webp", "image/gif"],
 };
+
+/**
+ * v1.3.0（契约 §5.14）：手机可执行的 Goal 人类操作。
+ * **不含 `block`**——blocked 由模型/策略负责，手机不得触发（§5.14）。
+ */
+export const MOCK_GOAL_ACTIONS = ["create", "edit", "pause", "resume", "complete", "clear"];
+
+/** v1.3.0（契约 §5.12）：待答快照里的问题状态。 */
+export const MOCK_QUESTION_STATES = ["open", "continued"];
 
 function resultOf(m, value) {
   return msg("result", { id: m.id, ok: true, value });
@@ -258,11 +276,20 @@ export function mockHistory(session) {
 
 /**
  * 建一个 mock host（可注入任意 link：RelayLink 或 LoopbackLink）。
- * @param {{link:{send:(m:any,urgent?:boolean)=>any}, log?:(s:string)=>void}} deps
+ *
+ * v1.3.0 的宿主能力开关（用于验证「客户端隐藏入口 vs 显示空态」的区分）：
+ * @param {{link:{send:(m:any,urgent?:boolean)=>any}, log?:(s:string)=>void,
+ *          todosSupported?:boolean, goalSupported?:boolean, pendingSupported?:boolean}} deps
  */
 export function createMockHost(deps) {
   const link = deps.link;
   const log = deps.log ?? (() => {});
+  /** v1.3.0（§5.13）：宿主是否提供 todos 能力；false → supported:false（客户端隐藏 UI）。 */
+  const todosSupported = deps.todosSupported !== false;
+  /** v1.3.0（§5.14）：宿主是否提供 goal 能力。 */
+  const goalSupported = deps.goalSupported !== false;
+  /** v1.3.0（§5.12）：宿主是否提供待答恢复快照。 */
+  const pendingSupported = deps.pendingSupported !== false;
   const sessions = new Map([
     [
       "s-demo-1",
@@ -296,6 +323,55 @@ export function createMockHost(deps) {
         ],
         // v1.1.2（§5.1）：当前待执行消息（全量快照）
         queue: [],
+        // v1.3.0（§5.12/§5.13/§5.14）：权威 inbox 投影 / todo 清单 / goal
+        inbox: new Map(),
+        todos: null,
+        goal: null,
+        goalActivation: null,
+      },
+    ],
+    // v1.3.0：子代理会话是**独立会话**（origin:"subagent"），
+    // 按 §5.3 不出现在 session.list，只在父会话的 session.subagents 目录里。
+    [
+      "s-demo-1:sub-1",
+      {
+        sessionId: "s-demo-1:sub-1",
+        title: "fix-login",
+        cwd: "D:/demo",
+        running: false,
+        updatedAt: Date.now() - 60_000,
+        origin: "subagent",
+        parentSessionId: "s-demo-1",
+        agentPreset: MOCK_DEFAULT_PRESET,
+        permission: MOCK_DEFAULT_PERMISSION,
+        events: [],
+        subagents: [],
+        queue: [],
+        inbox: new Map(),
+        todos: null,
+        goal: null,
+        goalActivation: null,
+      },
+    ],
+    [
+      "s-demo-1:sub-2",
+      {
+        sessionId: "s-demo-1:sub-2",
+        title: "",
+        cwd: "D:/demo",
+        running: false,
+        updatedAt: Date.now() - 30_000,
+        origin: "subagent",
+        parentSessionId: "s-demo-1",
+        agentPreset: MOCK_DEFAULT_PRESET,
+        permission: MOCK_DEFAULT_PERMISSION,
+        events: [],
+        subagents: [],
+        queue: [],
+        inbox: new Map(),
+        todos: null,
+        goal: null,
+        goalActivation: null,
       },
     ],
   ]);
@@ -313,6 +389,30 @@ export function createMockHost(deps) {
   const consumedUploads = new Set();
   let uploadSeq = 0;
   const ATTACHMENT_IMAGE_TYPES = MOCK_ATTACHMENT_CAPS.imageMediaTypes;
+
+  // -------------------------------------------------------------------------
+  // v1.3.0（契约 §5.12 / §5.13 / §5.14）状态
+  // -------------------------------------------------------------------------
+  /**
+   * 插件仍持有的待答项（对应插件内存里的 `#pending`）：
+   * askId -> {kind:"question"|"approval", sessionId, meta, expiresAt, resolve}
+   * 快照里 source 恒为 "plugin"、state 恒为 "open"、answerable 恒为 true。
+   */
+  const pluginPending = new Map();
+  /**
+   * Host `userQuestions` 投影的 active 行（契约 §5.12）：askId(=callId) -> wire。
+   * state:"open" → answerable=false（手机只能经插件 live 瀑布回答）；
+   * state:"continued" → answerable=true（手机可经 Host 官方 answer 补答）。
+   */
+  const hostQuestions = new Map();
+  /**
+   * v1.3.0：客户端在 `hello.features` 里声明的能力（§5.12 不变量 6）。
+   * 只有声明了 `session-state-v1` 的客户端才收 `question.request{state:"continued"}`
+   * 的状态重发（旧 UI 会把重发当新卡）；旧客户端保持旧语义（超时即发 resolved 清卡）。
+   */
+  const clientFeatures = new Set();
+  /** mock 收到的最近一次 question.answer（联调观察用）。 */
+  let lastAnswer = null;
 
   /** 图片尺寸（PNG/GIF/JPEG 最小解析；失败回 0×0）。 */
   const imageDimensions = (buf, mediaType) => {
@@ -416,24 +516,380 @@ export function createMockHost(deps) {
   const knownModel = (provider, model) =>
     MOCK_MODELS.find((x) => x.provider === provider && x.model === model);
 
+  // -------------------------------------------------------------------------
+  // v1.3.0 helper：权威队列 / 待答 / todo / goal
+  // -------------------------------------------------------------------------
+
+  /** 会话摘要（剔除 mock 内部字段，形状对齐 §5.3 SessionSummary）。 */
+  const summaryOf = (s) => {
+    const { events, inbox, todos, goal, goalActivation, queue, ...rest } = s;
+    return { ...rest, queue: queueItemsOf(s), archived: archivedSessionIds.has(s.sessionId) };
+  };
+
+  /**
+   * 权威队列快照（契约 §5.1 v1.3.0 权威口径）：
+   * 以 Host 消息 `id`（wire `itemId`）为主键；出队按 itemId 精确删除。
+   * 空数组 = 没有待执行消息（客户端据此**清空**排队列表）。
+   */
+  const queueItemsOf = (s) =>
+    s.inbox instanceof Map ? [...s.inbox.values()].map((x) => ({ ...x })) : [];
+
+  /** 队列变化广播（§5.2：事件只负责实时更新；`session.queue` 拉取负责权威对账）。 */
+  const broadcastQueue = (s) => {
+    link.send(
+      msg("event", {
+        topic: "session.queue",
+        data: { sessionId: s.sessionId, items: queueItemsOf(s) },
+      }),
+    );
+  };
+
+  /** 入队（模拟宿主 `agent/inbox/spliced`）。 */
+  const enqueueItem = (s, item) => {
+    if (!(s.inbox instanceof Map)) s.inbox = new Map();
+    const itemId =
+      typeof item?.itemId === "string" && item.itemId !== ""
+        ? item.itemId
+        : "msg-" + Math.random().toString(36).slice(2, 10);
+    const target = item?.target === "next-step" ? "next-step" : "next-turn";
+    s.inbox.set(itemId, { itemId, text: typeof item?.text === "string" ? item.text : "", target });
+    broadcastQueue(s);
+    return itemId;
+  };
+
+  /** 出队（按 itemId 精确删除；宿主消费消息即出队）。 */
+  const consumeItem = (s, itemId) => {
+    if (!(s.inbox instanceof Map)) return false;
+    const existed = s.inbox.delete(itemId);
+    broadcastQueue(s);
+    return existed;
+  };
+
+  /** 清空队列（权威空快照）。 */
+  const clearQueue = (s) => {
+    if (!(s.inbox instanceof Map)) s.inbox = new Map();
+    const n = s.inbox.size;
+    s.inbox.clear();
+    broadcastQueue(s);
+    return n;
+  };
+
+  /** 整表覆盖 todo（契约 §5.13：`todo/write` 覆盖；`turn/start` 清为 null）。 */
+  const setTodos = (s, todos) => {
+    const list = Array.isArray(todos)
+      ? todos
+          .filter(
+            (t) =>
+              t &&
+              typeof t.content === "string" &&
+              t.content !== "" &&
+              ["pending", "in_progress", "completed"].includes(t.status),
+          )
+          .map((t) => ({ content: t.content, status: t.status }))
+      : null;
+    s.todos = list;
+    link.send(
+      msg("event", {
+        topic: "session.todosChanged",
+        data: { sessionId: s.sessionId, todos: list === null ? null : list.map((t) => ({ ...t })) },
+      }),
+    );
+    return list;
+  };
+
+  /** Goal 读回形状（§5.14：activation 已知时带上）。 */
+  const goalResponseOf = (s) => {
+    if (!s.goal) return null;
+    const out = { ...s.goal };
+    if (s.goalActivation === "armed" || s.goalActivation === "disarmed") {
+      out.activation = s.goalActivation;
+    }
+    return out;
+  };
+
+  /** `session.goalChanged` 事件（§5.2：goal 载荷**不含 activation**）。 */
+  const emitGoalChanged = (s, operation) => {
+    link.send(
+      msg("event", {
+        topic: "session.goalChanged",
+        data: { sessionId: s.sessionId, goal: s.goal ? { ...s.goal } : null, operation },
+      }),
+    );
+  };
+
+  /** `session.goalActivationChanged` 事件（§5.2：进程内状态，无当前目标时不发）。 */
+  const emitGoalActivation = (s, activation) => {
+    if (!s.goal) return;
+    link.send(
+      msg("event", {
+        topic: "session.goalActivationChanged",
+        data: {
+          sessionId: s.sessionId,
+          id: s.goal.id,
+          revision: s.goal.revision,
+          activation,
+        },
+      }),
+    );
+  };
+
+  /** Host `userQuestions` 投影行 → wire PendingQuestion（对齐插件 #hostQuestionWire）。 */
+  const hostQuestionWire = (sessionId, row) => {
+    const callId = typeof row?.callId === "string" ? row.callId : "";
+    if (callId === "") return null;
+    const questions = Array.isArray(row?.questions) ? row.questions : [];
+    if (questions.length === 0) return null;
+    const continued = row?.state === "continued";
+    return {
+      askId: callId,
+      sessionId,
+      callId,
+      questions: questions.map((q) => ({ ...q })),
+      state: continued ? "continued" : "open",
+      answerable: continued,
+      source: "host",
+      multiSelect: questions.some((q) => q.multiSelect === true),
+    };
+  };
+
+  /**
+   * 开一个「live plugin pending」问题（手机独占窗口内的待答）。
+   * `hostBacked:true` 时同时登记一条 Host 投影行（timed 模式），
+   * 这样超时后能推进到 continued 而不是直接结束。
+   * @returns {string} askId
+   */
+  const openPluginQuestion = (s, opts) => {
+    const callId =
+      typeof opts?.callId === "string" && opts.callId !== ""
+        ? opts.callId
+        : "call-" + Math.random().toString(36).slice(2, 10);
+    const questions = Array.isArray(opts?.questions) ? opts.questions.map((q) => ({ ...q })) : [];
+    const timeoutMs = Number(opts?.timeoutMs) || 120000;
+    const expiresAt = Date.now() + timeoutMs;
+    const multiSelect = questions.some((q) => q.multiSelect === true);
+    pluginPending.set(callId, {
+      kind: "question",
+      sessionId: s.sessionId,
+      meta: { callId, questions, timeoutMs, multiSelect },
+      expiresAt,
+      resolve: typeof opts?.resolve === "function" ? opts.resolve : null,
+    });
+    if (opts?.hostBacked === true) {
+      hostQuestions.set(callId, hostQuestionWire(s.sessionId, { callId, questions, state: "open" }));
+    }
+    link.send(
+      msg(
+        "event",
+        {
+          topic: "question.request",
+          data: {
+            askId: callId,
+            sessionId: s.sessionId,
+            callId,
+            state: "open",
+            answerable: true,
+            source: "plugin",
+            questions,
+            timeoutMs,
+            multiSelect,
+            expiresAt,
+          },
+        },
+        true,
+      ),
+    );
+    return callId;
+  };
+
+  /** 开一条 Host 投影问题（§5.12：source:"host"，state 可为 open/continued）。 */
+  const openHostQuestion = (s, opts) => {
+    const callId =
+      typeof opts?.callId === "string" && opts.callId !== ""
+        ? opts.callId
+        : "call-" + Math.random().toString(36).slice(2, 10);
+    const questions = Array.isArray(opts?.questions) ? opts.questions.map((q) => ({ ...q })) : [];
+    const wire = hostQuestionWire(s.sessionId, {
+      callId,
+      questions,
+      state: opts?.state === "continued" ? "continued" : "open",
+    });
+    if (wire === null) return "";
+    hostQuestions.set(callId, wire);
+    // 只有声明 session-state-v1 的客户端才收 Host 投影的状态重发（§5.12 不变量 6）。
+    if (clientFeatures.has("session-state-v1")) {
+      link.send(
+        msg("event", { topic: "question.request", data: { ...wire, questions: wire.questions.map((q) => ({ ...q })) } }, true),
+      );
+    }
+    return callId;
+  };
+
+  /**
+   * 开一个「待答审批」（契约 §5.12：审批没有 Host 投影，只恢复插件仍持有的未决项）。
+   * @returns {string} askId
+   */
+  const openPluginApproval = (s, opts) => {
+    const askId =
+      typeof opts?.askId === "string" && opts.askId !== ""
+        ? opts.askId
+        : "ask-" + Math.random().toString(36).slice(2, 10);
+    const timeoutMs = Number(opts?.timeoutMs) || 120000;
+    const expiresAt = Date.now() + timeoutMs;
+    const meta = {
+      toolName: typeof opts?.toolName === "string" ? opts.toolName : "bash",
+      reason: typeof opts?.reason === "string" ? opts.reason : "mock: 运行一条命令",
+      argsPreview: typeof opts?.argsPreview === "string" ? opts.argsPreview : 'echo "hello"',
+    };
+    pluginPending.set(askId, {
+      kind: "approval",
+      sessionId: s.sessionId,
+      meta,
+      expiresAt,
+      resolve: typeof opts?.resolve === "function" ? opts.resolve : null,
+    });
+    link.send(
+      msg(
+        "event",
+        {
+          topic: "approval.request",
+          data: { askId, sessionId: s.sessionId, ...meta, timeoutMs, expiresAt },
+        },
+        true,
+      ),
+    );
+    return askId;
+  };
+
+  /**
+   * 手机独占窗口超时（契约 §5.12 不变量 ② / ⑥）：
+   * - 声明了 `session-state-v1` 的客户端：**不发** resolved（卡片不得删除），
+   *   随后以 `question.request{state:"continued"}` 重发（客户端替换而非叠加）。
+   * - 未声明（旧客户端）：保持旧语义 → 发 `question.resolved{source:"timeout"}`，
+   *   **不**重发 continued（旧 UI 会重复建卡）。
+   * - 没有 Host 投影（legacy）：问题真的交给桌面端，手机卡片结束（fail-open）。
+   */
+  const timeoutQuestion = (askId, opts) => {
+    const declared = clientFeatures.has("session-state-v1");
+    const emitResolved = opts?.emitResolved ?? !declared;
+    const host = hostQuestions.get(askId);
+    if (host !== undefined) {
+      host.state = "continued";
+      host.answerable = true;
+      pluginPending.delete(askId);
+      if (emitResolved) {
+        link.send(msg("event", { topic: "question.resolved", data: { askId, source: "timeout" } }));
+      }
+      if (declared) {
+        link.send(
+          msg(
+            "event",
+            { topic: "question.request", data: { ...host, questions: host.questions.map((q) => ({ ...q })) } },
+            true,
+          ),
+        );
+      }
+      return { state: "continued", kept: declared };
+    }
+    const entry = pluginPending.get(askId);
+    if (entry !== undefined) {
+      pluginPending.delete(askId);
+      if (emitResolved) {
+        link.send(msg("event", { topic: "question.resolved", data: { askId, source: "timeout" } }));
+      }
+      return { state: "ended", kept: false };
+    }
+    return { state: "unknown", kept: false };
+  };
+
+  /**
+   * 预置演示数据（v1.3.0）：让手机端（REPL 或真机）能看到
+   * TODO 清单 / Goal / 待答恢复（live plugin pending + host continued）。
+   */
+  const seedDemo = () => {
+    const s = sessions.get("s-demo-1");
+    if (!s) return null;
+    setTodos(s, [
+      { content: "读契约 §5.12/§5.13/§5.14", status: "completed" },
+      { content: "实现 mock-host v1.3.0", status: "in_progress" },
+      { content: "跑 auto-test 回归", status: "pending" },
+    ]);
+    enqueueItem(s, { itemId: "msg-demo-1", text: "排队中的消息 A", target: "next-turn" });
+    enqueueItem(s, { itemId: "msg-demo-2", text: "排队中的消息 B", target: "next-step" });
+    const now = Date.now();
+    s.goal = {
+      id: "goal-demo-1",
+      revision: 1,
+      objective: "完成 v1.3.0 的 e2e 覆盖",
+      phase: "active",
+      maxGoalRounds: 12,
+      roundsStarted: 2,
+      createdAt: now,
+      updatedAt: now,
+    };
+    s.goalActivation = "armed";
+    // live plugin pending（手机独占窗口内可答）
+    openPluginQuestion(s, {
+      callId: "call-demo-live",
+      hostBacked: true,
+      questions: [
+        {
+          id: "q1",
+          question: "要继续往下做吗？",
+          multiSelect: false,
+          options: [
+            { label: "继续", description: "接着做" },
+            { label: "停止", description: "先收工" },
+          ],
+        },
+      ],
+    });
+    // host continued（手机窗口已过，仍可补答）
+    openHostQuestion(s, {
+      callId: "call-demo-continued",
+      state: "continued",
+      questions: [
+        {
+          id: "q2",
+          question: "补答：选一个部署环境",
+          multiSelect: false,
+          options: [
+            { label: "测试环境", description: "" },
+            { label: "生产环境", description: "" },
+          ],
+        },
+      ],
+    });
+    return s.sessionId;
+  };
+
   const handle = async (m) => {
     const p = m.payload ?? {};
     switch (m.type) {
       case "hello":
+        // v1.3.0（§5.1）：客户端可在 hello 里声明 features（如 "session-state-v1"）。
+        // 旧客户端不带该字段 → 插件按旧事件语义处理（§5.12 不变量 6）。
+        clientFeatures.clear();
+        if (Array.isArray(p.features)) {
+          for (const f of p.features) {
+            if (typeof f === "string" && f !== "") clientFeatures.add(f);
+          }
+        }
         return link.send(resultOf(m, { hostName: "mock-host", dshVersion: "0.2.x-mock", pluginVersion: "1.0.0-mock" }));
       case "ping":
         return link.send(resultOf(m, { pong: Date.now() }));
       case "session.list":
+        // 契约 §5.3：列表只显示**根会话**（无 parentSessionId 且 origin!=="subagent"）；
+        // 子代理不出现在列表，只在父会话详情页的 session.subagents 目录里。
         return link.send(
           resultOf(m, {
-            sessions: [...sessions.values()].map((s) => ({
-              ...s,
-              archived: archivedSessionIds.has(s.sessionId),
-            })),
+            sessions: [...sessions.values()]
+              .filter((s) => s.origin !== "subagent" && !s.parentSessionId)
+              .map((s) => summaryOf(s)),
           }),
         );
       case "session.capabilities":
         // 契约 §5.8/§5.9：模式 + 权限 + 模型目录 + 归档能力标记
+        // v1.3.0：追加 todos / goal / pendingInteractions 三个能力目录。
         return link.send(
           resultOf(m, {
             presets: MOCK_PRESETS.map((x) => ({ ...x })),
@@ -444,6 +900,14 @@ export function createMockHost(deps) {
             defaultModelId: MOCK_DEFAULT_MODEL,
             archiveSupported: true,
             attachments: { ...MOCK_ATTACHMENT_CAPS, imageMediaTypes: [...MOCK_ATTACHMENT_CAPS.imageMediaTypes] },
+            // v1.3.0（§5.1）：字段缺省 = 旧宿主不支持；客户端隐藏对应入口。
+            todos: { supported: todosSupported },
+            goal: { read: goalSupported, actions: goalSupported ? [...MOCK_GOAL_ACTIONS] : [] },
+            pendingInteractions: {
+              questions: pendingSupported,
+              approvals: pendingSupported,
+              hostContinued: pendingSupported,
+            },
           }),
         );
       case "session.create": {
@@ -462,9 +926,16 @@ export function createMockHost(deps) {
           agentPreset: agentPreset !== "" ? agentPreset : MOCK_DEFAULT_PRESET,
           permission: typeof p.permission === "string" && p.permission !== "" ? p.permission : MOCK_DEFAULT_PERMISSION,
           events: [],
+          subagents: [],
+          queue: [],
+          // v1.3.0：权威 inbox 投影 / todo 清单 / goal
+          inbox: new Map(),
+          todos: null,
+          goal: null,
+          goalActivation: null,
         };
         sessions.set(id, s);
-        link.send(msg("event", { topic: "session.added", data: { session: s } }));
+        link.send(msg("event", { topic: "session.added", data: { session: summaryOf(s) } }));
         const value = { sessionId: id };
         if (agentPreset !== "") value.agentPreset = agentPreset;
         // v1.0.7：模型选择——未知模型**不回 error**（会话已创建），只附 modelError
@@ -513,11 +984,167 @@ export function createMockHost(deps) {
       }
       case "session.queue": {
         // v1.1.2（§5.1）：拉取该会话**当前**待执行消息的全量快照（断线重连补状态）
+        // v1.3.0：权威口径——以 Host 消息 id（wire itemId）为主键，
+        // 出队按 itemId 精确删除；items 为空 = 客户端必须**清空**排队列表。
         const sessionId = typeof p.sessionId === "string" ? p.sessionId : "";
         if (sessionId === "") return link.send(errorOf(m, "bad-params", "sessionId required"));
         const s = sessions.get(sessionId);
         if (!s) return link.send(errorOf(m, "not-found", "session not found"));
-        return link.send(resultOf(m, { sessionId, items: Array.isArray(s.queue) ? s.queue : [] }));
+        return link.send(resultOf(m, { sessionId, items: queueItemsOf(s) }));
+      }
+      case "pending.interactions": {
+        // v1.3.0（契约 §5.12）：只读恢复快照。
+        // 指定 sessionId → 插件仍持有的待答项 + 该会话 Host 投影的 open/continued；
+        // 未指定 → 只回插件仍持有的全局待答项（不做全量冷读）。
+        // 能发这个新请求本身就是能力声明（旧客户端不会发）→ 幂等补进 feature 集合。
+        clientFeatures.add("session-state-v1");
+        const sessionId = typeof p.sessionId === "string" ? p.sessionId : "";
+        const questions = [];
+        const approvals = [];
+        for (const [askId, entry] of pluginPending) {
+          if (sessionId !== "" && entry.sessionId !== sessionId) continue;
+          if (entry.kind === "approval") {
+            approvals.push({
+              ...entry.meta,
+              askId,
+              sessionId: entry.sessionId,
+              answerable: true,
+              source: "plugin",
+              ...(entry.expiresAt ? { expiresAt: entry.expiresAt } : {}),
+            });
+          } else {
+            questions.push({
+              ...entry.meta,
+              askId,
+              sessionId: entry.sessionId,
+              state: "open",
+              answerable: true,
+              source: "plugin",
+              ...(entry.expiresAt ? { expiresAt: entry.expiresAt } : {}),
+            });
+          }
+        }
+        if (sessionId !== "") {
+          for (const wire of hostQuestions.values()) {
+            if (wire.sessionId !== sessionId) continue;
+            if (questions.some((q) => q.askId === wire.askId)) continue;
+            questions.push({ ...wire, questions: wire.questions.map((q) => ({ ...q })) });
+          }
+        }
+        return link.send(resultOf(m, { questions, approvals }));
+      }
+      case "session.todos": {
+        // v1.3.0（契约 §5.13）：只读 Host todos 持久投影。
+        // supported:false = 宿主没有该能力（客户端隐藏 UI）；
+        // todos:null + supported:true = 本回合尚无清单（客户端显示「暂无任务」）。
+        const sessionId = typeof p.sessionId === "string" ? p.sessionId : "";
+        if (sessionId === "") return link.send(errorOf(m, "bad-params", "sessionId required"));
+        const s = sessions.get(sessionId);
+        if (!s) return link.send(errorOf(m, "not-found", "session not found"));
+        const todos = todosSupported && Array.isArray(s.todos) ? s.todos.map((t) => ({ ...t })) : null;
+        return link.send(resultOf(m, { sessionId, todos, supported: todosSupported }));
+      }
+      case "session.goal": {
+        // v1.3.0（契约 §5.14）：读持久投影 + 进程内 activation。
+        const sessionId = typeof p.sessionId === "string" ? p.sessionId : "";
+        if (sessionId === "") return link.send(errorOf(m, "bad-params", "sessionId required"));
+        const s = sessions.get(sessionId);
+        if (!s) return link.send(errorOf(m, "not-found", "session not found"));
+        const goal = goalResponseOf(s);
+        return link.send(
+          resultOf(m, {
+            sessionId,
+            goal,
+            activation: goal === null ? null : (s.goalActivation ?? null),
+            supported: goalSupported,
+            actions: goalSupported ? [...MOCK_GOAL_ACTIONS] : [],
+          }),
+        );
+      }
+      case "session.goalAction": {
+        // v1.3.0（契约 §5.14）：执行人类操作。create 之外必须带 CAS expected；
+        // 陈旧 revision 回 GOAL_STALE_REVISION（客户端必须重拉，不得覆盖新状态）。
+        const sessionId = typeof p.sessionId === "string" ? p.sessionId : "";
+        const action = typeof p.action === "string" ? p.action : "";
+        if (sessionId === "" || !MOCK_GOAL_ACTIONS.includes(action)) {
+          return link.send(errorOf(m, "bad-params", "sessionId and a valid action required"));
+        }
+        if (!goalSupported) {
+          return link.send(errorOf(m, "service-unavailable", "goals service unavailable"));
+        }
+        const s = sessions.get(sessionId);
+        if (!s) return link.send(errorOf(m, "not-found", "session not found"));
+        const objective = typeof p.objective === "string" ? p.objective.trim() : "";
+        const hasRounds = p.maxGoalRounds !== undefined && p.maxGoalRounds !== null;
+        if (hasRounds && (!Number.isInteger(p.maxGoalRounds) || p.maxGoalRounds < 1)) {
+          return link.send(errorOf(m, "bad-params", "maxGoalRounds must be a positive integer"));
+        }
+        if (action === "create") {
+          if (objective === "") return link.send(errorOf(m, "bad-params", "objective required for create"));
+          if (s.goal) return link.send(errorOf(m, "bad-params", "goal already exists"));
+          const now = Date.now();
+          s.goal = {
+            id: "goal-" + Math.random().toString(36).slice(2, 10),
+            revision: 1,
+            objective,
+            phase: "active",
+            maxGoalRounds: hasRounds ? p.maxGoalRounds : 12,
+            roundsStarted: 0,
+            createdAt: now,
+            updatedAt: now,
+          };
+          s.goalActivation = "armed";
+          emitGoalChanged(s, "create");
+          emitGoalActivation(s, "armed");
+          return link.send(resultOf(m, { sessionId, goal: goalResponseOf(s) }));
+        }
+        const raw = p.expected;
+        if (!raw || typeof raw.id !== "string" || !Number.isInteger(raw.revision) || raw.revision < 1) {
+          return link.send(errorOf(m, "bad-params", "expected {id, revision} required"));
+        }
+        if (!s.goal) return link.send(errorOf(m, "not-found", "no active goal"));
+        if (raw.id !== s.goal.id || raw.revision !== s.goal.revision) {
+          return link.send(
+            errorOf(
+              m,
+              "GOAL_STALE_REVISION",
+              `stale goal revision: expected ${raw.revision}, current ${s.goal.revision}`,
+            ),
+          );
+        }
+        if (action === "edit" && objective === "" && !hasRounds) {
+          return link.send(errorOf(m, "bad-params", "edit requires objective or maxGoalRounds"));
+        }
+        const now = Date.now();
+        if (action === "edit") {
+          if (objective !== "") s.goal.objective = objective;
+          if (hasRounds) s.goal.maxGoalRounds = p.maxGoalRounds;
+          s.goal.revision += 1;
+          s.goal.updatedAt = now;
+          emitGoalChanged(s, "edit");
+          return link.send(resultOf(m, { sessionId, goal: goalResponseOf(s) }));
+        }
+        if (action === "clear") {
+          s.goal = null;
+          s.goalActivation = null;
+          emitGoalChanged(s, "clear");
+          return link.send(resultOf(m, { sessionId, goal: null }));
+        }
+        if (action === "pause") {
+          s.goal.phase = "paused";
+          s.goalActivation = "disarmed";
+        } else if (action === "resume") {
+          s.goal.phase = "active";
+          s.goalActivation = "armed";
+        } else if (action === "complete") {
+          s.goal.phase = "complete";
+          s.goalActivation = "disarmed";
+        }
+        s.goal.revision += 1;
+        s.goal.updatedAt = now;
+        emitGoalChanged(s, action);
+        emitGoalActivation(s, s.goalActivation);
+        return link.send(resultOf(m, { sessionId, goal: goalResponseOf(s) }));
       }
       case "session.subagents": {
         // v1.0.5（§5.6）：父会话的直接子代理目录
@@ -689,16 +1316,28 @@ export function createMockHost(deps) {
         // 文本含 "approve" 触发一次审批问答演示
         if (/approve/i.test(promptText)) {
           const askId = "ask-" + ++askSeq;
-          link.send(msg("event", { topic: "approval.request", data: { askId, sessionId: s.sessionId, toolName: "bash", reason: "mock: 运行一条命令", argsPreview: 'echo "hello"', timeoutMs: 120000 } }), true);
+          const timeoutMs = 120000;
+          const expiresAt = Date.now() + timeoutMs;
+          // v1.3.0（§5.12）：审批与提问共用同一快照通道 → 审批也进 pluginPending。
+          pluginPending.set(askId, {
+            kind: "approval",
+            sessionId: s.sessionId,
+            meta: { toolName: "bash", reason: "mock: 运行一条命令", argsPreview: 'echo "hello"' },
+            expiresAt,
+            resolve: null,
+          });
+          link.send(msg("event", { topic: "approval.request", data: { askId, sessionId: s.sessionId, toolName: "bash", reason: "mock: 运行一条命令", argsPreview: 'echo "hello"', timeoutMs, expiresAt } }), true);
           const decision = await new Promise((resolve) => {
             pendingAsks.set(askId, resolve);
             setTimeout(() => {
               if (pendingAsks.has(askId)) {
                 pendingAsks.delete(askId);
+                pluginPending.delete(askId);
                 resolve("timeout");
               }
             }, 120000);
           });
+          pluginPending.delete(askId);
           link.send(msg("event", { topic: "approval.resolved", data: { askId, decision: decision === "timeout" ? "pending" : decision, source: decision === "timeout" ? "timeout" : "phone" } }));
           link.send(msg("event", { topic: "assistant.delta", data: { sessionId: s.sessionId, text: `\n[审批结果: ${decision}]` } }));
         }
@@ -786,11 +1425,55 @@ export function createMockHost(deps) {
         const resolve = pendingAsks.get(p.askId);
         if (resolve === undefined) return link.send(resultOf(m, { applied: false }));
         pendingAsks.delete(p.askId);
+        // v1.3.0：审批收束后从待答快照移除（手机重拉快照不再看到它）。
+        pluginPending.delete(p.askId);
         resolve(p.decision);
         return link.send(resultOf(m, { applied: true }));
       }
-      case "question.answer":
+      case "question.answer": {
+        // v1.3.0（契约 §5.1/§5.12）：两条路由
+        //  ① askId 命中插件仍持有的待答项 → 原瀑布（live）；
+        //  ② 否则若该问题在 Host 投影中为 continued → Host 官方 answer（补答）。
+        // 都不命中 → applied:false（客户端随后重拉快照）。
+        const askId = typeof p.askId === "string" ? p.askId : "";
+        const answers = p.answers;
+        if (answers === null || typeof answers !== "object" || Array.isArray(answers)) {
+          return link.send(
+            errorOf(m, "bad-answers", "answers must be an object of questionId -> label(s)"),
+          );
+        }
+        const freeText = typeof p.freeText === "string" ? p.freeText : "";
+        const entry = askId === "" ? undefined : pluginPending.get(askId);
+        if (entry !== undefined && entry.kind === "question") {
+          pluginPending.delete(askId);
+          lastAnswer = { askId, sessionId: entry.sessionId, route: "live", answers, freeText };
+          link.send(msg("event", { topic: "question.resolved", data: { askId, source: "phone" } }));
+          if (typeof entry.resolve === "function") entry.resolve({ answers, freeText });
+          return link.send(resultOf(m, { applied: true }));
+        }
+        let hostQuestion = null;
+        for (const wire of hostQuestions.values()) {
+          if (wire.askId === askId || wire.callId === askId) {
+            hostQuestion = wire;
+            break;
+          }
+        }
+        if (hostQuestion === null || hostQuestion.state !== "continued") {
+          return link.send(resultOf(m, { applied: false }));
+        }
+        hostQuestions.delete(hostQuestion.askId);
+        lastAnswer = {
+          askId: hostQuestion.askId,
+          sessionId: hostQuestion.sessionId,
+          route: "continued",
+          answers,
+          freeText,
+        };
+        link.send(
+          msg("event", { topic: "question.resolved", data: { askId: hostQuestion.askId, source: "phone" } }),
+        );
         return link.send(resultOf(m, { applied: true }));
+      }
       case "push.register":
         return link.send(resultOf(m, { registered: true }));
       default:
@@ -798,7 +1481,45 @@ export function createMockHost(deps) {
     }
   };
 
-  return { handle, sessions, pendingAsks, log };
+  return {
+    handle,
+    sessions,
+    pendingAsks,
+    log,
+    // ---- v1.3.0 控制面（联调/自测用；不新增线协议 type）----
+    pluginPending,
+    hostQuestions,
+    /** 客户端在 hello.features 里声明的能力（§5.12 不变量 6）。 */
+    clientFeatures,
+    /** 最近一次 question.answer（观察 live / continued 路由）。 */
+    get lastAnswer() {
+      return lastAnswer;
+    },
+    enqueue: enqueueItem,
+    consume: consumeItem,
+    clearQueue,
+    setTodos,
+    openPluginQuestion,
+    openHostQuestion,
+    openPluginApproval,
+    timeoutQuestion,
+    seedDemo,
+    /** 模拟「另一端改了目标」→ revision 前进（客户端缓存的 expected 变陈旧）。 */
+    bumpGoalRevision(s, n = 1) {
+      if (!s.goal) return null;
+      s.goal.revision += n;
+      s.goal.updatedAt = Date.now();
+      emitGoalChanged(s, "edit");
+      return { ...s.goal };
+    },
+    /** 直接设置 goal（联调构造任意 phase）。 */
+    setGoal(s, goal) {
+      s.goal = goal === null ? null : { ...goal };
+      s.goalActivation = goal === null ? null : (s.goalActivation ?? "armed");
+      emitGoalChanged(s, "edit");
+      return goalResponseOf(s);
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -806,9 +1527,14 @@ export function createMockHost(deps) {
 // ---------------------------------------------------------------------------
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (isMain) {
-  const [relayUrl, channel, secret, token] = process.argv.slice(2);
+  const argv = process.argv.slice(2);
+  // v1.3.0：`--demo` 预置 TODO / Goal / 待答（live plugin pending + host continued），
+  // 让真机 App 在**回前台/重连**后能用 pending.interactions 恢复卡片。
+  const demoMode = argv.includes("--demo") || process.env.MOCK_DEMO === "1";
+  const positional = argv.filter((x) => !x.startsWith("--"));
+  const [relayUrl, channel, secret, token] = positional;
   if (!relayUrl || !channel || !secret) {
-    console.error("usage: node mock-host.mjs <relayUrl> <channel> <secret> [relayToken]");
+    console.error("usage: node mock-host.mjs <relayUrl> <channel> <secret> [relayToken] [--demo]");
     process.exit(1);
   }
 
@@ -833,5 +1559,9 @@ if (isMain) {
     },
   });
   const mock = createMockHost({ link, log: (s) => console.log("[host]", s) });
+  if (demoMode) {
+    const sid = mock.seedDemo();
+    console.log("[host] demo seeded (todos/goal/queue/pending) on session:", sid);
+  }
   console.log("[host] mock DSH host up. relay =", relayUrl, "channel =", channel);
 }

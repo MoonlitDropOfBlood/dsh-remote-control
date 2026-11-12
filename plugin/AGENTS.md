@@ -40,6 +40,8 @@ node scripts/verify-settings.mjs                                       # v1.1.x 
 node scripts/verify-relay-supervisor.mjs                               # v1.1.1 中继进程托管：决策/端口占用不抢/启停/看门狗/跨平台/bundle（无依赖，162 项）
 node scripts/verify-crypto.mjs                                          # v1.1.3 加密层/抗重放：KAT+AAD 两模式+sid 绑定+证明 v2+纪元单调性+接线层（无依赖，45 项）
 node scripts/verify-attachments.mjs                                    # v1.2.0 附件：分块状态机/canonical base64/limits/TTL/消费墓碑 + HostBridge 真接线 + 历史 files[]（无依赖，129 项）
+node scripts/verify-session-state.mjs                                  # v1.3.0 排队权威对账/pending.interactions/continued 补答/Todo/Goal/CAS（无依赖，31 项）
+node scripts/verify-host-api.mjs                                      # v1.3.0 插件对**真宿主** API 的假设（读本机 DSH 运行时源码核对；无宿主则 SKIP，35 项）
 node scripts/sync-client-icon.mjs                                      # 改了 icon.svg 后同步 client.js 的图标 data-uri
 ```
 
@@ -622,3 +624,73 @@ abort 幂等、并发上限、TTL、宿主失败可重试、消费墓碑）；Ho
 capabilities 有无降级、历史 files[]）；源码级断言（不直接塞 attachment ref、
 成功后才 markConsumed、日志不写文件名/字节）。
 `verify-images` / `verify-steps` 的 `[文件]` 占位断言已按 v1.2.0 更新。
+
+## v1.3.0：排队权威对账 / 双端提问 / Todo / Goal（2026-11-12）
+
+- **排队出队键**：`agent/inbox/spliced` 的 `inserted[].id` 就是 Host 消息身份；`user/message`
+  先按 `data.id === itemId` 出队，`source.rpcId` 只作旧宿主回退。子代理初始注入常常
+  `source.kind='user'` 却没有 `rpcId`，旧实现只认 rpcId → 消费后永久残留。
+- **`session.queue` 权威口径**：优先 `projections().values.inbox` 的 `next-turn/next-step`
+  重建；投影不可用才回退 `#queues` 事件缓存。事件只负责实时更新。
+- **`pending.interactions {sessionId?}`**：只读快照，合并 `#pending` 实时项与 Host
+  `userQuestions.active`（指定会话时）；失败必须回空，不影响 fail-open。
+  新 App 在 `hello.features` 声明 `session-state-v1`；旧 App 不声明时插件保持旧语义
+  （timed 超时仍发 `question.resolved`，且不重发 `continued` 的 question.request）。
+- **timed 提问身份**：`req.wait.callId` 作为稳定 `askId`；插件 `approvalTimeoutMs`
+  只结束独占窗口。Host 投影转 `continued` 后，手机回答走
+  `ctx.userQuestions.answer(agent, callId, answer)`；**绝不伪造 user/message**。
+  桌面端回答后由 `tool/result` / `user-question-reply` 对账并清掉手机卡。
+- **Todo**：`session.todos` 读 Host `todos` 投影；`todo/write` 整表覆盖，`turn/start`
+  清 null；`supported:false` 与 `todos:null` 分开。只读。
+- **Goal**：`session.goal` / `session.goalAction` 直连 Host `ctx.goals` 人类面；
+  非 create 必须带 `{id,revision}` CAS；`GOAL_STALE_REVISION` 原样回。
+  不暴露 `block`，不调用模型工具。`goal/activation-changed` 是进程内状态，事件转发；
+  查询时只有活 Agent 才读准确 activation，**不为查询激活冷会话**。
+- 门禁：`node scripts/verify-session-state.mjs`（31 项）。
+
+### 宿主 API 契约门禁（`scripts/verify-host-api.mjs`，2026-11-12 新增）
+
+**为什么必须有**：v1.3.0 的排队/待答/Todo/Goal 全靠插件**直连宿主的投影与服务**：
+
+| 插件用的东西 | 宿主真身 | 形状（DSH 0.2.2-rc.1 实测） |
+|---|---|---|
+| 排队权威 | `values.inbox` 投影（dsh-agent-loop） | `{"next-turn": UserMessage[], "next-step": UserMessage[]}`；由 `agent/inbox/spliced` 折叠 |
+| Todo | `values.todos` 投影（dsh-tool-todo） | `[{content, status:'pending'|'in_progress'|'completed'}] \| null`；`todo/write` 整表覆盖、`turn/start` 清 null |
+| Goal 读 | `values.goal` 投影（dsh-goal） | `{goal:{id,revision,objective,phase,maxGoalRounds,blockedReason?{code,message}}, roundsStarted, createdAt, updatedAt}` |
+| Goal 写 | `ctx.goals` 服务（dsh-goal） | `get/create/edit/pause/resume/complete/clear(agent, ref)`；CAS ref = `{id,revision}`；陈旧引用错误码 `GOAL_STALE_REVISION`；`assertLive(agent)` 要求**活的** agent 实例 |
+| 待答提问 | `values.userQuestions.active` + `ctx.userQuestions.answer` | `active:[{callId, questions:[{id,question,options?,multiSelect?}], state:'open'|'continued'}]`；`answer(agent, callId, {answers:[{id,selected[],custom?}]})`——**必须逐题点名**，且**只有 continued 能答** |
+
+**mock host 测不出这类问题**（mock 是我们自己按契约写的实现，两边一起错照样绿）。
+所以本门禁直接读**真宿主包源码**核对上述形状：DSH 升级改了投影 key / 字段 / 方法签名 / CAS ref → 立刻红。
+
+- 本机跑：读 `%APPDATA%/DeepSeek Harness Desktop/dsh/node_modules`（或 `DSH_RUNTIME=` 指定）；
+  **找不到宿主 → 打印 SKIP 并以 0 退出**（CI 无宿主也绿）。
+- CI 跑：`npm i` **钉住版本**（`0.2.2-rc.1`）——npm 的 `latest` 标签还停在旧版
+  （`dsh-goal@0.0.1-rc.1` 等，早于投影功能），装 latest 会**误报 FAIL**。
+- 结论：v1.3.0 的宿主侧接线已按真宿主逐项核对过（投影 key/state、服务方法签名、CAS ref、
+  错误码、答案 schema、activation 位置），mock 与真宿主**一致**。
+
+### v1.3.1：唤醒消息触发卡 + 轮次补广播 + 排队出队不再挑来源
+
+真机验收（真实中继/真实宿主）暴露的三个插件侧问题：
+
+1. **Goal 轮次提示整段丢失**：`mapHistoryMessages` 旧实现 `source.kind !== "user" → return []`
+   把宿主所有**唤醒消息**丢掉（Goal 轮次提示就是 `kind:"goal"` 的 `user/message`）。
+   现按桌面 `turnTriggerDetails` 的 source-family 映射成 `ChatMessage.trigger`
+   （goal/agent/team/subagent/webhook/schedule/job/plugin），**正文清空**（桌面同样不显示注入
+   prompt），未知来源仍跳过。空正文的唤醒消息也成条（否则看不到）。
+2. **目标轮次不更新**：Host 只在 `goal/change` 发事件；轮次推进（`goal-round-driver` 写
+   `user/message`）**不发事件** → 收到 `source.kind==="goal"` 的 `user/message` 时
+   `#emitGoalRound()` 重读投影并广播 `session.goalChanged {operation:"round"}`。
+3. **排队残留的第三种来源**：`#handleUserMessage` 旧实现开头 `source.kind !== "user" → return`
+   → 任何被跟踪的非 user 来源消息**永远出不了队**。现改为**按 Host 消息 id 出队**
+   （来源无关）；同时 `#handleInboxSpliced` 只跟踪**真人输入**（`source.kind` 缺省或 `"user"`），
+   Goal 轮次提示这类宿主自动注入的唤醒消息**不进手机「排队消息」**（由触发卡表达，
+   避免把注入的原始 prompt 漏到 UI、也避免看起来像残留）。
+   - 子代理初始注入仍是 `kind:"user"`（常常没有 `rpcId`）→ 照常进队、按 id 出队 ✓；
+     子代理完成唤醒是 `kind:"subagent-settled"` → 不进队、显示触发卡 ✓。
+
+门禁：`node scripts/verify-session-state.mjs` **43 项**（新增：trigger 映射/正文隐藏/未知来源跳过/
+手打消息无 trigger、轮次补广播 operation=round、goal 提示不进队 + 真人输入出队、
+子代理初始注入进出队、子代理完成唤醒不进队且成触发卡）；`verify-images` 的出队断言同步改成
+「同 id 不管来源都出队」。

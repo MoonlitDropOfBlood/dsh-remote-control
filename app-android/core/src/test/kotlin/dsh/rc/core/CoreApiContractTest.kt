@@ -55,6 +55,39 @@ class CoreApiContractTest {
             val approvals: StateFlow<List<ApprovalRequest>> = store.approvals
             val questions: StateFlow<List<QuestionRequest>> = store.questions
 
+            // ---- v1.3.0：待答交互 / Todo / Goal（契约 §5.12 / §5.13 / §5.14） ----
+            val todos: StateFlow<TodoState?> = store.todos
+            val goal: StateFlow<GoalWire?> = store.goal
+            val goalActivation: StateFlow<String?> = store.goalActivation
+            val goalSupported: StateFlow<Boolean> = store.goalSupported
+            val goalActions: StateFlow<List<String>> = store.goalActions
+
+            val loadPendingInteractions: suspend (String?) -> Unit = { store.loadPendingInteractions(it) }
+            val loadSessionTodos: suspend (String) -> Unit = { store.loadSessionTodos(it) }
+            val loadSessionGoal: suspend (String) -> Unit = { store.loadSessionGoal(it) }
+            val goalAction: suspend (String, GoalAction, String?, Int?) -> Boolean =
+                { sid, action, objective, rounds -> store.goalAction(sid, action, objective, rounds) }
+            val canOperateGoal: (String) -> Boolean = { store.canOperateGoal(it) }
+
+            // 默认参数也必须存在（调用方按契约写法编译得过）。
+            runBlocking {
+                runCatching { store.loadPendingInteractions() }
+                runCatching { store.loadPendingInteractions("s") }
+                runCatching { store.goalAction("s", GoalAction.CREATE, "目标", 12) }
+                runCatching { store.goalAction("s", GoalAction.PAUSE) }
+            }
+
+            assertNull(todos.value)
+            assertNull(goal.value)
+            assertNull(goalActivation.value)
+            assertFalse(goalSupported.value)
+            assertTrue(goalActions.value.isEmpty())
+            assertNotNull(loadPendingInteractions)
+            assertNotNull(loadSessionTodos)
+            assertNotNull(loadSessionGoal)
+            assertNotNull(goalAction)
+            assertNotNull(canOperateGoal)
+
             // ---- 历史错误归属 + 加载状态（2026-11-08） ----
             val historyError: StateFlow<SessionHistoryError?> = store.historyError
             val historyLoading: StateFlow<Boolean> = store.historyLoading
@@ -202,5 +235,62 @@ class CoreApiContractTest {
         entry.groupExpanded = true
         assertTrue(entry.groupExpanded, "groupExpanded 必须可写（UI 就地切换）")
         assertEquals(2, entry.members.size)
+    }
+
+    /**
+     * v1.3.1（契约 §5.3）：唤醒消息带 `trigger`，正文为空（隐藏注入的原始 prompt）。
+     * 旧插件不返该字段 → 空串 = 普通消息（行为不变）。
+     */
+    @Test
+    fun `唤醒消息 trigger 解析与默认值`() {
+        val waking = ChatMessage(
+            id = "m1",
+            role = "user",
+            text = "",
+            ts = 1L,
+            seq = 2L,
+            trigger = "goal"
+        )
+        assertEquals("goal", waking.trigger)
+        assertTrue(waking.text.isEmpty(), "唤醒消息不保留注入正文")
+        val plain = ChatMessage(id = "m2", role = "user", text = "hi", ts = 1L, seq = 3L)
+        assertEquals("", plain.trigger, "缺字段 → 空串（普通消息）")
+        val msg = TimelineMessage(
+            key = "m1",
+            id = "m1",
+            role = "user",
+            text = "",
+            ts = 1L,
+            seq = 2L,
+            trigger = "goal"
+        )
+        assertEquals("goal", msg.trigger)
+    }
+
+    /**
+     * v1.3.1：任务清单没有数据就**整行隐藏**（用户要求，两端同口径）。
+     *
+     * 纯函数语义不变（`HIDDEN` 宿主不支持 / `EMPTY` 无清单 / `LIST` 有条目），
+     * UI 口径改成「只有 LIST 才渲染」——`EMPTY` 不再画「暂无任务」空行。
+     */
+    @Test
+    fun `Todo 无数据时 UI 不可见`() {
+        assertEquals(TodoVisibility.HIDDEN, todoVisibility(null))
+        assertEquals(
+            TodoVisibility.HIDDEN,
+            todoVisibility(TodoState(supported = false, todos = null)),
+        )
+        assertEquals(
+            TodoVisibility.EMPTY,
+            todoVisibility(TodoState(supported = true, todos = emptyList())),
+        )
+        assertEquals(
+            TodoVisibility.EMPTY,
+            todoVisibility(TodoState(supported = true, todos = null)),
+        )
+        assertEquals(
+            TodoVisibility.LIST,
+            todoVisibility(TodoState(supported = true, todos = listOf(TodoItem("干活", "pending"))))
+        )
     }
 }

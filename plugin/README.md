@@ -52,7 +52,7 @@ dsh plugin add <本目录>        # 或 DSH 的 plugin_manager install_bundle（
 | `channel` / `secret` | 首启生成 | 配对信息 |
 | `interceptApprovals` | `true` | 手机在线时代理审批请求 |
 | `interceptQuestions` | `true` | 手机在线时代理用户提问 |
-| `approvalTimeoutMs` | `120000` | 手机应答超时（钳制 10s–600s）；**超时一律放行给桌面答案器** |
+| `approvalTimeoutMs` | `120000` | 手机独占应答窗口（钳制 10s–600s）。审批超时一律放行桌面答案器；提问在 Host `userQuestions` timed 模式下超时只转为 `continued`，快照仍可恢复。它与 Host ask 工具的 timeout 是两个计时器，建议保持一致 |
 | `push.*` | 关闭 | Push Kit（`appId` / `clientId` / `clientSecret` / `channelId` / `topic` / `notifyTurnEnd`） |
 
 ## 目录

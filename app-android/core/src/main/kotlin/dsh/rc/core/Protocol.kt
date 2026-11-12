@@ -1,8 +1,8 @@
 /*
  * Copyright (c) 2026 dukedsh.
- * DSH Pocket for Android —— 协议常量层（契约 v1.2.0）。
+ * DSH Pocket for Android —— 协议常量层（契约 v1.3.0）。
  *
- * 契约来源（只读）：仓库根 docs/PROTOCOL.md（dsh-remote-control，v1.2.0）——**唯一事实源**。
+ * 契约来源（只读）：仓库根 docs/PROTOCOL.md（dsh-remote-control，v1.3.0）——**唯一事实源**。
  * 本文件只描述「协议长什么样」，不做任何 IO 与加密运算。
  *
  * 与 HarmonyOS 版 app/entry/src/main/ets/model/protocol.ets **逐字对应**：
@@ -17,11 +17,25 @@ object Protocol {
     const val PROTO_VERSION: Int = 1
 
     /** 协议契约文档版本（关于页展示用）。 */
-    const val CONTRACT_VERSION: String = "v1.2.0"
+    const val CONTRACT_VERSION: String = "v1.3.1"
 
     /** 角色：host = PC 端 DSH 插件；client = 本 App。 */
     const val ROLE_HOST: String = "host"
     const val ROLE_CLIENT: String = "client"
+
+    // ---- §5.1 hello.features（v1.3.0） ----
+
+    /**
+     * 会话状态特性标记（契约 §5.1 v1.3.0 `hello.features`）。
+     *
+     * 声明它 = 本客户端支持 `pending.interactions` 快照、Todo / Goal、
+     * 以及 `question.request{state:"continued"}` 的**状态更新**语义；
+     * 未声明的旧客户端，插件仍按旧语义处理（不会重发 continued 状态）。
+     */
+    const val FEATURE_SESSION_STATE_V1: String = "session-state-v1"
+
+    /** 本客户端声明的能力特性（业务 hello 带上）。 */
+    val CLIENT_FEATURES: List<String> = listOf(FEATURE_SESSION_STATE_V1)
 
     // ---- §3 配对与密钥 ----
 
@@ -109,6 +123,22 @@ object Protocol {
     const val MSG_SESSION_PROMPT: String = "session.prompt"
     const val MSG_SESSION_CANCEL: String = "session.cancel"
     const val MSG_SESSION_RENAME: String = "session.rename"
+
+    /**
+     * 待答交互快照（契约 §5.1 v1.3.0 / §5.12）：**只读恢复通道**，绝不阻塞瀑布。
+     * 读取失败必须回空数组（fail-open）。
+     */
+    const val MSG_PENDING_INTERACTIONS: String = "pending.interactions"
+
+    /** Todo 清单快照（契约 §5.1 v1.3.0 / §5.13）：手机**只读**。 */
+    const val MSG_SESSION_TODOS: String = "session.todos"
+
+    /** Goal 目标快照（契约 §5.1 v1.3.0 / §5.14）。 */
+    const val MSG_SESSION_GOAL: String = "session.goal"
+
+    /** Goal 人类操作（契约 §5.1 v1.3.0 / §5.14）：create/edit/pause/resume/complete/clear。 */
+    const val MSG_SESSION_GOAL_ACTION: String = "session.goalAction"
+
     const val MSG_APPROVAL_ANSWER: String = "approval.answer"
     const val MSG_QUESTION_ANSWER: String = "question.answer"
     const val MSG_PUSH_REGISTER: String = "push.register"
@@ -129,6 +159,15 @@ object Protocol {
     const val TOPIC_SESSION_QUEUE: String = "session.queue"
     const val TOPIC_SESSION_MODEL_CHANGED: String = "session.modelChanged"
     const val TOPIC_SESSION_PERMISSION_CHANGED: String = "session.permissionChanged"
+
+    /** Todo 清单变化（契约 §5.2 v1.3.0 / §5.13）：**整表覆盖**，客户端不自行合并。 */
+    const val TOPIC_SESSION_TODOS_CHANGED: String = "session.todosChanged"
+
+    /** Goal 变化（契约 §5.2 v1.3.0 / §5.14）：clear 时 goal 为 null。 */
+    const val TOPIC_SESSION_GOAL_CHANGED: String = "session.goalChanged"
+
+    /** Goal 续跑激活态变化（契约 §5.2 v1.3.0）：进程内状态，无当前目标时不发。 */
+    const val TOPIC_SESSION_GOAL_ACTIVATION_CHANGED: String = "session.goalActivationChanged"
     const val TOPIC_ASSISTANT_DELTA: String = "assistant.delta"
     const val TOPIC_ASSISTANT_REASONING_DELTA: String = "assistant.reasoningDelta"
     const val TOPIC_ASSISTANT_IMAGE: String = "assistant.image"
@@ -145,6 +184,50 @@ object Protocol {
     /** 投递行为（契约 §5.1 v1.1.2）：queue = 排队；steer = 插话。 */
     const val MODE_QUEUE: String = "queue"
     const val MODE_STEER: String = "steer"
+
+    // ---- §5.12 待答交互（v1.3.0） ----
+
+    /** 待答状态：open = 手机独占窗口内；continued = 窗口已结束但**仍可补答**。 */
+    const val PENDING_STATE_OPEN: String = "open"
+    const val PENDING_STATE_CONTINUED: String = "continued"
+
+    /** 待答来源：plugin = 插件瀑布持有的待答项；host = 宿主 userQuestions 投影。 */
+    const val PENDING_SOURCE_PLUGIN: String = "plugin"
+    const val PENDING_SOURCE_HOST: String = "host"
+
+    // ---- §5.13 Todo（v1.3.0） ----
+
+    /** Todo 三态（契约 §5.13）。 */
+    const val TODO_STATUS_PENDING: String = "pending"
+    const val TODO_STATUS_IN_PROGRESS: String = "in_progress"
+    const val TODO_STATUS_COMPLETED: String = "completed"
+
+    // ---- §5.14 Goal（v1.3.0） ----
+
+    /** Goal 阶段（契约 §5.14）。 */
+    const val GOAL_PHASE_ACTIVE: String = "active"
+    const val GOAL_PHASE_PAUSED: String = "paused"
+    const val GOAL_PHASE_BLOCKED: String = "blocked"
+    const val GOAL_PHASE_COMPLETE: String = "complete"
+
+    /** Goal 续跑激活态（进程内状态，不持久；契约 §5.14）。 */
+    const val GOAL_ACTIVATION_ARMED: String = "armed"
+    const val GOAL_ACTIVATION_DISARMED: String = "disarmed"
+
+    /**
+     * Goal 人类操作（契约 §5.14）。
+     *
+     * 手机**只允许**这六个；`block` 属于模型 / 策略，手机不得触发。
+     */
+    const val GOAL_ACTION_CREATE: String = "create"
+    const val GOAL_ACTION_EDIT: String = "edit"
+    const val GOAL_ACTION_PAUSE: String = "pause"
+    const val GOAL_ACTION_RESUME: String = "resume"
+    const val GOAL_ACTION_COMPLETE: String = "complete"
+    const val GOAL_ACTION_CLEAR: String = "clear"
+
+    /** Goal 版本过期（Host CAS 失败；契约 §5.14）：客户端必须重拉 session.goal 后重试。 */
+    const val ERR_GOAL_STALE_REVISION: String = "GOAL_STALE_REVISION"
 
     /** 校验 channel 格式（契约 §4）。KAT 字面量不参与运行时校验。 */
     fun isValidChannel(ch: String): Boolean = CHANNEL_REGEX.matches(ch)

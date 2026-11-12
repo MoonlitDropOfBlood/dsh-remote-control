@@ -13,6 +13,8 @@
  *  - 发送模式**只读**（跟随 DSH 设置，契约 §5.1 v1.1.2）：手机端不发 mode
  *  - subagent 的模型 / 权限**只读**；one-shot 子代理整条输入区替换为说明行
  *  - 附件走 core 的分块上传（不在这里塞 base64）
+ *  - v1.3.0：输入区上方依次是 **Goal 单行条 → Todo 折叠卡 → 排队消息**
+ *    （契约 §5.13 / §5.14；无数据隐藏；Todo 只读；子代理的 Goal 只读）
  */
 package dsh.rc.pocket.ui
 
@@ -50,6 +52,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.RadioButton
@@ -70,6 +73,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.text.style.TextOverflow
@@ -77,10 +81,15 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import dsh.rc.core.Capabilities
 import dsh.rc.core.LinkState
+import dsh.rc.core.GoalAction
+import dsh.rc.core.GoalWire
 import dsh.rc.core.ImageRef
 import dsh.rc.core.ModelOption
 import dsh.rc.core.ModelSelection
 import dsh.rc.core.PermissionOption
+import dsh.rc.core.Protocol
+import dsh.rc.core.TodoItem
+import dsh.rc.core.TodoState
 import dsh.rc.pocket.ui.attach.AttachmentChips
 import dsh.rc.pocket.ui.attach.rememberAttachmentPicker
 import dsh.rc.pocket.ui.theme.Hairline
@@ -119,6 +128,12 @@ fun SessionDetailScreen(
     val approvals by vm.approvals.collectAsState()
     val questions by vm.questions.collectAsState()
     val queueItems by vm.queueItems.collectAsState()
+    // v1.3.0：Todo / Goal（契约 §5.13 / §5.14）
+    val todos by vm.todos.collectAsState()
+    val goal by vm.goal.collectAsState()
+    val goalActivation by vm.goalActivation.collectAsState()
+    val goalSupported by vm.goalSupported.collectAsState()
+    val goalActions by vm.goalActions.collectAsState()
     val drafts by vm.drafts.collectAsState()
     val uploadProgress by vm.uploadProgress.collectAsState()
     val uploading by vm.uploading.collectAsState()
@@ -132,6 +147,9 @@ fun SessionDetailScreen(
     var showModelPicker by remember { mutableStateOf(false) }
     var showPermissionPicker by remember { mutableStateOf(false) }
     var viewerImage by remember { mutableStateOf<ImageRef?>(null) }
+    // v1.3.0：Goal 编辑弹窗 + 完成 / 清除二次确认
+    var goalEditorMode by remember { mutableStateOf<GoalAction?>(null) }
+    var goalConfirm by remember { mutableStateOf<GoalAction?>(null) }
     val snackbar = remember { SnackbarHostState() }
 
     val isSubagent = parentSessionId.isNotEmpty()
@@ -413,6 +431,23 @@ fun SessionDetailScreen(
                 }
             }
 
+            // ---- Goal 单行条（契约 §5.14；无数据隐藏；子代理只读） ----
+            GoalBar(
+                goal = goal,
+                activation = goalActivation,
+                supported = goalSupported,
+                readOnly = readOnly,
+                allowedActions = goalActions,
+                onCreate = { goalEditorMode = GoalAction.CREATE },
+                onEdit = { goalEditorMode = GoalAction.EDIT },
+                onPause = { vm.goalAction(sessionId, GoalAction.PAUSE) },
+                onResume = { vm.goalAction(sessionId, GoalAction.RESUME) },
+                onClear = { goalConfirm = GoalAction.CLEAR },
+            )
+
+            // ---- Todo 折叠卡（契约 §5.13；只读；宿主不支持时隐藏） ----
+            TodoCard(state = todos)
+
             // ---- 排队消息（宿主推来的，只展示不猜测；契约 §5.2） ----
             if (queueItems.isNotEmpty()) {
                 Column(modifier = Modifier.padding(horizontal = Sp.sp3)) {
@@ -686,6 +721,49 @@ fun SessionDetailScreen(
             vm = vm,
             image = image,
             onDismiss = { viewerImage = null },
+        )
+    }
+
+    // ---- Goal 新建 / 编辑（契约 §5.14：objective + maxGoalRounds） ----
+    goalEditorMode?.let { mode ->
+        GoalEditorDialog(
+            mode = mode,
+            current = goal,
+            onDismiss = { goalEditorMode = null },
+            onConfirm = { objective, maxRounds ->
+                goalEditorMode = null
+                vm.goalAction(sessionId, mode, objective, maxRounds)
+            },
+        )
+    }
+
+    // ---- Goal 完成 / 清除：二次确认（契约 §5.14） ----
+    goalConfirm?.let { mode ->
+        AlertDialog(
+            onDismissRequest = { goalConfirm = null },
+            title = { Text(if (mode == GoalAction.COMPLETE) "完成目标？" else "清除目标？") },
+            text = {
+                Text(
+                    text = if (mode == GoalAction.COMPLETE) {
+                        "标记当前目标为已完成？桌面端会同步看到这次变更。"
+                    } else {
+                        "清除当前目标？这个动作不可撤销。"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = PocketTheme.colors.labelSecondary,
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        goalConfirm = null
+                        vm.goalAction(sessionId, mode)
+                    },
+                ) { Text("确认") }
+            },
+            dismissButton = {
+                TextButton(onClick = { goalConfirm = null }) { Text("取消") }
+            },
         )
     }
 }
@@ -962,8 +1040,7 @@ private fun ImageViewerDialog(
     vm: PocketViewModel,
     image: ImageRef,
     onDismiss: () -> Unit,
-) {
-    val colors = PocketTheme.colors
+) {    val colors = PocketTheme.colors
     var dataUri by remember(image.imageId) { mutableStateOf(image.thumb) }
     LaunchedEffect(image.imageId) {
         val fetched = vm.fetchImage(image.imageId)

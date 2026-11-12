@@ -239,6 +239,68 @@ object AttachmentPlan {
 
 ---
 
+### 2.5 v1.3.0 增补：待答交互 / Todo / Goal（契约 §5.12 / §5.13 / §5.14）
+
+```kotlin
+// ---- Protocol.kt ----
+const val CONTRACT_VERSION = "v1.3.0"
+const val MSG_PENDING_INTERACTIONS = "pending.interactions"
+const val MSG_SESSION_TODOS = "session.todos"
+const val MSG_SESSION_GOAL = "session.goal"
+const val MSG_SESSION_GOAL_ACTION = "session.goalAction"
+const val TOPIC_SESSION_TODOS_CHANGED = "session.todosChanged"
+const val TOPIC_SESSION_GOAL_CHANGED = "session.goalChanged"
+const val TOPIC_SESSION_GOAL_ACTIVATION_CHANGED = "session.goalActivationChanged"
+const val FEATURE_SESSION_STATE_V1 = "session-state-v1"   // hello.features 声明
+val CLIENT_FEATURES: List<String>                          // = ["session-state-v1"]
+
+// ---- Models.kt ----
+data class TodoItem(val content: String, val status: String)   // pending | in_progress | completed
+data class TodoState(val supported: Boolean, val todos: List<TodoItem>?)
+data class GoalWire(
+    val id: String, val revision: Long, val objective: String, val phase: String,
+    val blockedReason: GoalBlockedReason?, val maxGoalRounds: Int, val roundsStarted: Int,
+    val createdAt: Long, val updatedAt: Long, val activation: String?   // armed | disarmed | null
+)
+data class GoalActivation(val id: String, val revision: Long, val activation: String)
+enum class GoalAction(val wire: String) { CREATE, EDIT, PAUSE, RESUME, COMPLETE, CLEAR }
+data class PendingQuestion(...)   // askId/sessionId/callId/questions/state/answerable/source/expiresAt/timeoutMs/multiSelect
+data class PendingApproval(...)   // askId/sessionId/toolName/reason/argsPreview/answerable/source/expiresAt
+
+// ---- SessionStore 新增成员 ----
+val todos: StateFlow<TodoState?>          // null = 宿主不支持 / 未拉；supported + todos=null = 暂无任务
+val goal: StateFlow<GoalWire?>            // null = 当前没有目标
+val goalActivation: StateFlow<String?>    // armed | disarmed | null（读不到 → 不得显示「自动续跑中」）
+val goalSupported: StateFlow<Boolean>     // 宿主是否支持 Goal
+val goalActions: StateFlow<List<String>>  // 宿主允许的人类操作子集（空 = 不限制）
+
+suspend fun loadPendingInteractions(sessionId: String? = null)  // 只读、绝不阻塞；失败回空数组
+suspend fun loadSessionTodos(sessionId: String)                  // 手机只读
+suspend fun loadSessionGoal(sessionId: String)
+suspend fun goalAction(
+    sessionId: String, action: GoalAction,
+    objective: String? = null, maxGoalRounds: Int? = null
+): Boolean
+fun canOperateGoal(sessionId: String): Boolean                    // 子代理只读
+```
+
+**行为口径（v1.3.0）**
+
+15. **队列快照是全量**：整表替换 + 按 `itemId` 去重；空数组 = 清空（契约 §5.2 v1.3.0）。
+16. **待答按 `askId` 幂等**：同 `askId` 的事件/快照是**状态更新**（open → continued），
+    原地替换而非叠加第二张卡；`question.resolved` **不得**删掉仍 `continued` 且可答的卡片。
+17. **`pending.interactions` 是只读恢复通道**：读取失败回空数组、**不阻塞**瀑布；
+    `applied:false` 之后必须重拉一次快照。
+18. **Todo**：`supported:false`（宿主不支持）→ **隐藏 UI**；`todos:null` → 显示「暂无任务」。
+    事件 `session.todosChanged` 整表覆盖（`todo/write` 覆盖；`turn/start` 清为 `null`）。
+19. **Goal**：除 `create` 外每个操作都带手机当前看到的 `expected{id,revision}`（Host CAS）；
+    `GOAL_STALE_REVISION` → **重拉** `session.goal` 并把错误透出，**不得**自动覆盖；
+    `block` 不属于手机人类操作；子代理会话**只读**。
+20. **`hello.features` 必须声明 `session-state-v1`**（契约 §5.1 v1.3.0）：
+    未声明的旧客户端，插件按旧语义发 `question.resolved` 且不重发 `continued`。
+
+---
+
 ## 3. UI 模块（`:app`）依赖的 core 公共面
 
 - `DshrcLink` / `LinkState` / `LinkConfig` / `EpochState` / `HostInfo` / `LinkListener`

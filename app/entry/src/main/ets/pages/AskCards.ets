@@ -133,6 +133,12 @@ export struct AskCountdownBar {
   @Param title: string = '';
   @Param remaining: number = 0;
   @Param totalMs: number = 1;
+  /**
+   * v1.3.0（§5.12）：remaining<=0 时的替代文案。
+   * 'continued'（手机独占窗口已结束但宿主仍可答）→「可补答」；
+   * 宿主已不可答 → 「已失效」（不得再显示可编辑卡）。
+   */
+  @Param expiredText: string = '';
 
   build() {
     Column() {
@@ -147,7 +153,8 @@ export struct AskCountdownBar {
           .backgroundColor(this.remaining > 20000 ? $r('app.color.brand_tint') :
             $r('app.color.state_error_tint'))
         Blank()
-        Text(this.remaining > 0 ? countdownText(this.remaining) : '已超时')
+        Text(this.remaining > 0 ? countdownText(this.remaining) :
+          (this.expiredText.length > 0 ? this.expiredText : '已超时'))
           .fontSize(FS_CAPTION)
           .fontColor(this.remaining > 0 ? $r('app.color.label_secondary') :
             $r('app.color.state_error'))
@@ -218,12 +225,18 @@ export struct ApprovalCardView {
     });
   }
 
+  /** v1.3.0（§5.12）：宿主已不可答时不再显示可编辑按钮（fail-open 交给桌面端）。 */
+  private expiredText(): string {
+    return this.card.answerable ? '' : '已失效';
+  }
+
   build() {
     Column() {
       AskCountdownBar({
         title: '工具审批',
         remaining: this.remaining,
-        totalMs: this.card.timeoutMs > 0 ? this.card.timeoutMs : 1
+        totalMs: this.card.timeoutMs > 0 ? this.card.timeoutMs : 1,
+        expiredText: this.expiredText()
       })
 
       if (this.sessionTitle.length > 0) {
@@ -275,7 +288,7 @@ export struct ApprovalCardView {
           .fontColor($r('app.color.label_on_brand'))
           .backgroundColor($r('app.color.brand_fill'))
           .borderRadius(RADIUS_CTRL)
-          .enabled(this.remaining > 0 && !this.card.answered)
+          .enabled(this.card.answerable && this.remaining > 0 && !this.card.answered)
           .onClick((): void => {
             this.answer('approved');
           })
@@ -289,7 +302,7 @@ export struct ApprovalCardView {
           .backgroundColor($r('app.color.bg_layer_1'))
           .border({ width: HAIRLINE, color: $r('app.color.state_error') })
           .borderRadius(RADIUS_CTRL)
-          .enabled(this.remaining > 0 && !this.card.answered)
+          .enabled(this.card.answerable && this.remaining > 0 && !this.card.answered)
           .onClick((): void => {
             this.answer('rejected');
           })
@@ -405,6 +418,32 @@ export struct QuestionCardView {
     return false;
   }
 
+  /**
+   * v1.3.0（§5.12）：是否仍可作答。
+   * - `answerable=false` → 宿主已不可答（超时且无投影）：**不得**显示可编辑卡；
+   * - `state='continued'` → 手机独占等待窗口已结束，但宿主仍可答 → **仍可补答**。
+   */
+  private canSubmit(): boolean {
+    if (!this.card.answerable) {
+      return false;
+    }
+    if (this.card.state === 'continued') {
+      return true;
+    }
+    return this.remaining > 0;
+  }
+
+  /** 倒计时归零后的替代文案（continued → 「可补答」；失效 → 「已失效」）。 */
+  private expiredText(): string {
+    if (!this.card.answerable) {
+      return '已失效';
+    }
+    if (this.card.state === 'continued') {
+      return '可补答';
+    }
+    return '';
+  }
+
   /** 提交回答（契约 §5.1 question.answer）。 */
   private submit(): void {
     const text: string = this.freeText.trim();
@@ -414,9 +453,11 @@ export struct QuestionCardView {
     }
     const answers: Object = this.buildAnswers();
     this.store.submitQuestion(this.card.askId, answers, text).then((applied: boolean): void => {
+      // v1.3.0（§5.12）：applied=false **不能**断言「桌面已处理」——可能已失效，也可能
+      // 另一端刚回答；store 已重拉快照，这里只提示「正在重新核对」。
       promptAction.showToast({
-        message: applied ? '已提交回答' : '已超时，桌面端已处理',
-        duration: 2000
+        message: applied ? '已提交回答' : '回答未生效，正在重新核对最新状态',
+        duration: 2500
       });
     }).catch((e: Error): void => {
       promptAction.showToast({ message: '提交失败：' + e.message, duration: 2500 });
@@ -428,7 +469,8 @@ export struct QuestionCardView {
       AskCountdownBar({
         title: '向你提问',
         remaining: this.remaining,
-        totalMs: this.card.timeoutMs > 0 ? this.card.timeoutMs : 1
+        totalMs: this.card.timeoutMs > 0 ? this.card.timeoutMs : 1,
+        expiredText: this.expiredText()
       })
 
       if (this.sessionTitle.length > 0) {
@@ -487,7 +529,7 @@ export struct QuestionCardView {
         .fontColor($r('app.color.label_on_brand'))
         .backgroundColor($r('app.color.brand_fill'))
         .borderRadius(RADIUS_CTRL)
-        .enabled(this.remaining > 0 && !this.card.answered)
+        .enabled(this.canSubmit() && !this.card.answered)
         .onClick((): void => {
           this.submit();
         })

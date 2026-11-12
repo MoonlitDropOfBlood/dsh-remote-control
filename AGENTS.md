@@ -27,7 +27,7 @@
 | [app/](app/AGENTS.md) | ArkTS | HarmonyOS 手机 App（DevEco 工程） | `devecocli build` + linter-cli 0 ERROR |
 | [app-android/](app-android/AGENTS.md) | Kotlin | **Android 手机 App**（Compose；core 纯 JVM 可无设备跑单测） | `./gradlew :core:test` + `./gradlew :app:assembleDebug` |
 | [e2e/](e2e/AGENTS.md) | Node.js | 协议参考实现 + mock 两端 + 自动化联调 | `node auto-test.mjs` |
-| [docs/PROTOCOL.md](docs/PROTOCOL.md) | — | **线协议契约 v1.2.0（唯一事实源，三方共同合同）** | 改协议必须先改它 |
+| [docs/PROTOCOL.md](docs/PROTOCOL.md) | — | **线协议契约 v1.3.1（唯一事实源，三方共同合同）** | 改协议必须先改它 |
 
 ## 快速开始
 
@@ -71,7 +71,7 @@ cd relay && npm install && node server.js            # 中继（默认 8787；�
 
 ## 全局约定
 
-1. **协议以 docs/PROTOCOL.md 为准**（**v1.2.0**：v1.0.9 会话消息里的图片（§5.10「缩略图内联 +
+1. **协议以 docs/PROTOCOL.md 为准**（**v1.3.1**：v1.0.9 会话消息里的图片（§5.10「缩略图内联 +
    大图按需拉取」）→ v1.1.0 present 投递的文件也上手机（§5.10.1）→ v1.1.2 交付物图片进历史
    （§5.10.2）+ 排队事件 session.queue（§5.1/§5.2）→ **v1.1.3 抗重放的会话纪元**
    （§3.4.1 hello 证明 v2 + AAD 绑定 sid + 纪元单调性；§3.4.2 中继原生 TLS）
@@ -85,7 +85,16 @@ cd relay && npm install && node server.js            # 中继（默认 8787；�
    → **v1.2.0 输入框附件**（§5.11）：`attachment.upload.begin/chunk/commit/abort` 分块上传
    （256KiB/块，密文帧 ≈460KB < 1MiB）+ `session.prompt.uploads[]` + `capabilities.attachments`
    + `ChatMessage.files[]`；附件经宿主 `fileUploads` receipt 落成 prompt 内容块，中继/加密不变。
-   改任何一端的 wire 行为必须先改契约，三方同步。
+   → **v1.3.0 排队权威对账 + 双端提问同步 + Todo + Goal**：`session.queue` 以 Host
+   `inbox` 投影和 `itemId` 为准；`pending.interactions` 恢复提问/审批快照，timed
+   `continued` 可补答；`session.todos` 只读展示；`session.goal` / `session.goalAction`
+   通过 Host 人类面 CAS 操作目标。新客户端在 `hello.features` 声明
+   `session-state-v1`。
+   → **v1.3.1 唤醒消息 + 轮次推送**（§5.3 / §5.14）：`ChatMessage` 新增可选 `trigger`
+   （goal/agent/team/subagent/webhook/schedule/job/plugin；正文为空、渲染成触发卡，
+   桌面同口径「继续执行目标」）；`session.goalChanged` 增加 `operation:"round"`
+   （Host 不推轮次推进，插件读到 goal 轮次消息后补发）；Todo `todos:null` 渲染口径
+   统一为「没数据不显示」。改任何一端的 wire 行为必须先改契约，三方同步。
 2. **KAT 是硬验收**：契约 §7 测试向量（key/iv/ct/tag/hmac）在 plugin 与 app 各有一份自测，
    连接建立前执行，失败禁连。加密链路每一环（HKDF/AES/HMAC）都必须进 KAT。
 3. **git 提交**：`git -c user.name="dsh-remote-control" -c user.email="dev@localhost" commit`，

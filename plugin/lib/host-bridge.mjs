@@ -233,6 +233,39 @@ export function queueItemText(content) {
 }
 
 /**
+ * Host `inbox` 投影视图 → 插件内部队列项（契约 §5.1/§5.2 v1.3.0）。
+ *
+ * `values.inbox` 形状为 `{ "next-turn": UserMessage[], "next-step": UserMessage[] }`
+ * （Host 的 durable inbox 投影）。这里以消息 `id` 作为唯一身份，`rpcId` 只保留
+ * 供旧宿主/旧事件回退使用；没有文本的消息与直播追踪同口径，不占队列展示。
+ * @param {unknown} inbox Host inbox 投影视图
+ * @returns {Array<{itemId:string,text:string,target:"next-turn"|"next-step",rpcId:string}>}
+ */
+export function queueItemsFromInbox(inbox) {
+  const out = [];
+  const seen = new Set();
+  const push = (target, messages) => {
+    if (!Array.isArray(messages)) return;
+    for (const message of messages) {
+      const itemId = typeof message?.id === "string" ? message.id : "";
+      if (itemId === "" || seen.has(itemId)) continue;
+      const text = queueItemText(message?.content);
+      if (text.trim() === "") continue;
+      seen.add(itemId);
+      out.push({
+        itemId,
+        text,
+        target,
+        rpcId: typeof message?.source?.rpcId === "string" ? message.source.rpcId : "",
+      });
+    }
+  };
+  push("next-turn", inbox?.["next-turn"]);
+  push("next-step", inbox?.["next-step"]);
+  return out.slice(0, QUEUE_MAX_ITEMS);
+}
+
+/**
  * 思考块 → 纯文本（契约 §5.3 / 附录 C）。
  * 只取 type==='reasoning' 的块；普通正文与工具结果**不**进这里。
  * @param {unknown} blocks ContentBlock[]
@@ -273,6 +306,18 @@ export function reasoningText(blocks) {
  *   - 任何不认识的形态返回 []（跳过），绝不抛出。
  * @returns {object[]} ChatMessage[]
  */
+/** v1.3.1：宿主唤醒消息的来源 → 客户端的触发卡类型（对齐桌面端 turnTriggerDetails）。 */
+const WAKE_TRIGGER_KINDS = Object.freeze({
+  goal: "goal",
+  "agent-message": "agent",
+  "team-message": "team",
+  "subagent-settled": "subagent",
+  webhook: "webhook",
+  schedule: "schedule",
+  "tool-jobs": "job",
+  "cordis-host-runner": "plugin",
+});
+
 export function mapHistoryMessages(sessionId, record) {
   const event = record?.event ?? record;
   if (!event || typeof event !== "object") return [];
@@ -287,10 +332,23 @@ export function mapHistoryMessages(sessionId, record) {
 
   let role;
   let content;
+  let trigger = "";
   if (type === "user/message") {
-    if (data?.source?.kind !== "user") return [];
-    role = "user";
-    content = data.content;
+    const sourceKind = data?.source?.kind;
+    if (sourceKind === "user") {
+      role = "user";
+      content = data.content;
+    } else {
+      // v1.3.1（§5.3）：宿主**唤醒消息**（不是用户手打）——Goal 轮次提示就是这一类
+      // （goal-round-driver 写入 source.kind='goal' 的 user/message）。
+      // 桌面端把它渲染成「触发卡」（继续执行目标），旧实现直接 return [] →
+      // 手机端整段缺失（用户反馈：消息列表里看不到目标消息）。
+      const kind = WAKE_TRIGGER_KINDS[sourceKind];
+      if (kind === undefined) return [];
+      role = "user";
+      trigger = kind;
+      content = data.content;
+    }
   } else {
     role = "assistant";
     content = data?.message?.content;
@@ -311,10 +369,15 @@ export function mapHistoryMessages(sessionId, record) {
   const images = imageBlocksOf(content).map((ref) => imageRefMeta(ref));
   // v1.2.0（§5.11.4）：文件块单独成字段（只有名称/大小，不需要读字节）
   const files = fileRefsOfContent(content);
-  if (text.trim() !== "" || images.length > 0 || files.length > 0) {
+  if (text.trim() !== "" || images.length > 0 || files.length > 0 || trigger !== "") {
     const message = { id: `${sessionId}:${seq}`, role, text, ts, seq };
     if (images.length > 0) message.images = images;
     if (files.length > 0) message.files = files;
+    if (trigger !== "") {
+      // 唤醒消息的原始注入正文由客户端隐藏（与桌面端一致），只显示触发卡。
+      message.text = "";
+      message.trigger = trigger;
+    }
     out.push(message);
   }
   return out;
@@ -773,6 +836,87 @@ export function mapReasoningEfforts(rows) {
 }
 
 /**
+ * v1.3.0：Host todo 行 → wire TodoItem[]（只保留 content/status，未知项丢弃）。
+ * @param {unknown} raw
+ * @returns {Array<{content:string,status:"pending"|"in_progress"|"completed"}>}
+ */
+export function mapTodoItems(raw) {
+  if (!Array.isArray(raw)) return [];
+  const statuses = new Set(["pending", "in_progress", "completed"]);
+  const out = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const content = typeof item.content === "string" ? item.content : "";
+    const status = typeof item.status === "string" ? item.status : "";
+    if (content === "" || !statuses.has(status)) continue;
+    out.push({ content, status });
+  }
+  return out;
+}
+
+/**
+ * v1.3.0：Host GoalProjection/GoalView → 扁平 wire GoalWire。
+ * 只接受 goal.id 与合法 phase；activation 由调用方按可用性提供。
+ * @param {unknown} goal
+ * @param {unknown} roundsStarted
+ * @param {unknown} createdAt
+ * @param {unknown} updatedAt
+ * @param {"armed"|"disarmed"|null} activation
+ * @returns {object|null}
+ */
+export function mapGoalWire(goal, roundsStarted, createdAt, updatedAt, activation) {
+  if (!goal || typeof goal !== "object" || typeof goal.id !== "string" || goal.id === "") return null;
+  const phases = new Set(["active", "paused", "blocked", "complete"]);
+  if (!phases.has(goal.phase)) return null;
+  const out = {
+    id: goal.id,
+    revision: Number(goal.revision) || 0,
+    objective: typeof goal.objective === "string" ? goal.objective : "",
+    phase: goal.phase,
+    maxGoalRounds: Number(goal.maxGoalRounds) || 0,
+    roundsStarted: Number(roundsStarted) || 0,
+    createdAt: Number(createdAt) || 0,
+    updatedAt: Number(updatedAt) || 0,
+  };
+  if (goal.blockedReason && typeof goal.blockedReason === "object") {
+    const code = typeof goal.blockedReason.code === "string" ? goal.blockedReason.code : "";
+    const message = typeof goal.blockedReason.message === "string" ? goal.blockedReason.message : "";
+    if (code !== "" && message !== "") out.blockedReason = { code, message };
+  }
+  if (activation === "armed" || activation === "disarmed") out.activation = activation;
+  return out;
+}
+
+/**
+ * v1.3.0：Host AskUserQuestionItem[] → wire Question[]（不泄露 Host 私有字段）。
+ * @param {unknown} raw
+ * @returns {Array<object>}
+ */
+export function mapWireQuestions(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const q of raw) {
+    const id = typeof q?.id === "string" ? q.id : "";
+    if (id === "") continue;
+    const options = Array.isArray(q?.options)
+      ? q.options
+          .map((o) => ({
+            label: typeof o?.label === "string" ? o.label : "",
+            description: typeof o?.description === "string" ? o.description : "",
+          }))
+          .filter((o) => o.label !== "")
+      : [];
+    out.push({
+      id,
+      question: typeof q?.question === "string" ? q.question : "",
+      multiSelect: q?.multiSelect === true,
+      options,
+    });
+  }
+  return out;
+}
+
+/**
  * 契约 §5.8 ModelSelection：手机提交的 model → 提交给宿主的
  * {provider, model, reasoningEffort?}（id 不可反拆，只认 provider/model）。
  * @param {unknown} raw
@@ -902,7 +1046,15 @@ export class HostBridge {
   #modelSelections = new Map(); // sessionId -> {provider, model, reasoningEffort?}（v1.0.8 内存态）
   // v1.1.7：有效权限的直播兜底；权威查询仍优先走 permissions 持久投影。
   #permissionSelections = new Map(); // sessionId -> string（含派生态 custom）
-  #pending = new Map(); // askId -> { resolve, kind, sessionId, timer, abortHandler, signal }
+  #pending = new Map(); // askId -> { resolve, kind, sessionId, timer, abortHandler, signal, meta }
+  // v1.3.0：Host userQuestions 投影里仍可回答的问题（continued/open），
+  // key = sessionId + "\0" + callId；用于快照、桌面端回答后清理与手机补答路由。
+  #hostQuestions = new Map();
+  // v1.3.0：goal/activation-changed 的进程内状态缓存（投影不含 activation）。
+  #goalActivations = new Map(); // sessionId -> {id,revision,activation}
+  #askQuestionCalls = new Set(); // v1.3.0：进行中的 ask_user_question callId（用于投影对账）
+  #todoSessions = new Set(); // v1.3.0：已确认有 todo 投影的会话（降级时不能把 turn/start 当能力声明）
+  #clientFeatures = new Set(); // v1.3.0：hello.features（旧 App 不声明新语义）
   #titles = new Map(); // sessionId -> title（turn.end 推送文案用）
   #pushToken = ""; // 手机 push.register 上报的 token（内存态）
   // v1.0.9（§5.10）：imageId -> 宿主附件引用（image.fetch 用；插件重启后为空）
@@ -965,6 +1117,29 @@ export class HostBridge {
     ctx.on("approval/request", (req, next) => this.#onApprovalRequest(req, next), { prepend: true });
     ctx.on("user-questions/request", (req, next) => this.#onQuestionRequest(req, next), { prepend: true });
 
+    // v1.3.0：Goal 进程内 activation（不持久，只能从 Host 事件拿）。
+    this.#on("goal/activation-changed", (payload) => {
+      const sessionId = String(payload?.sessionId ?? "");
+      if (sessionId === "") return;
+      const goal = payload?.goal;
+      if (!goal || typeof goal.id !== "string") {
+        this.#goalActivations.delete(sessionId);
+        return;
+      }
+      const activation = goal.activation === "armed" ? "armed" : "disarmed";
+      this.#goalActivations.set(sessionId, {
+        id: goal.id,
+        revision: Number(goal.revision) || 0,
+        activation,
+      });
+      this.#sendEvent("session.goalActivationChanged", {
+        sessionId,
+        id: goal.id,
+        revision: Number(goal.revision) || 0,
+        activation,
+      });
+    });
+
     // --- 事件桥接（§5.2）---
     this.#on("api-session/added", (summary) => {
       const s = mapSummary(summary);
@@ -975,6 +1150,10 @@ export class HostBridge {
       const key = String(sessionId);
       this.#titles.delete(key);
       this.#permissionSelections.delete(key);
+      this.#goalActivations.delete(key);
+      for (const mapKey of this.#hostQuestions.keys()) {
+        if (mapKey.startsWith(key + "\0")) this.#hostQuestions.delete(mapKey);
+      }
       // 会话没了，它的待执行列表与交付物历史条目也没有意义了（避免内存泄漏）
       this.#queues.delete(key);
       this.#deliveredEntries.delete(key);
@@ -1074,6 +1253,9 @@ export class HostBridge {
           this.#flushStream(sessionId);
           this.#sendEvent("tool.call", mapped);
         }
+        if (event?.data?.name === "ask_user_question" && typeof event?.data?.callId === "string") {
+          this.#askQuestionCalls.add(event.data.callId);
+        }
         return;
       }
       if (type === "tool/result") {
@@ -1082,6 +1264,53 @@ export class HostBridge {
           this.#flushStream(sessionId);
           this.#sendEvent("tool.result", mapped);
         }
+        const callId = String(event?.data?.message?.toolCallId ?? "");
+        let hasCachedQuestion = false;
+        for (const key of this.#hostQuestions.keys()) {
+          if (key.startsWith(sessionId + "\0")) {
+            hasCachedQuestion = true;
+            break;
+          }
+        }
+        if ((callId !== "" && this.#askQuestionCalls.has(callId)) || hasCachedQuestion) {
+          if (callId !== "") this.#askQuestionCalls.delete(callId);
+          // Host timed 模式：tool/result 落成 pending 后，投影会从 open 变 continued；
+          // 异步对账，绝不阻塞事件流。
+          void this.#sweepHostQuestions(sessionId);
+        }
+        return;
+      }
+      if (type === "todo/write") {
+        this.#todoSessions.add(sessionId);
+        const todos = event?.data?.todos === null ? null : mapTodoItems(event?.data?.todos);
+        this.#sendEvent("session.todosChanged", { sessionId, todos });
+        return;
+      }
+      if (type === "turn/start") {
+        // Host todo 投影语义：下一回合开始清空上一回合清单。
+        // 只有在已确认该会话有 todo 投影时才发；否则没有 tool-todo 的宿主会因为
+        // 普通 turn/start 被客户端误判为「支持 Todo」（capabilities 缺省必须隐藏）。
+        if (this.#todoSessions.has(sessionId)) {
+          this.#sendEvent("session.todosChanged", { sessionId, todos: null });
+        }
+        return;
+      }
+      if (type === "goal/change") {
+        const data = event?.data;
+        const operation = typeof data?.operation === "string" ? data.operation : "";
+        let goal = null;
+        if (operation !== "clear") {
+          goal = mapGoalWire(data?.goal, data?.roundsStarted, data?.createdAt, data?.updatedAt, null);
+          if (goal !== null) {
+            const activation = this.#goalActivations.get(sessionId);
+            if (activation && activation.id === goal.id && activation.revision === goal.revision) {
+              goal.activation = activation.activation;
+            }
+          }
+        } else {
+          this.#goalActivations.delete(sessionId);
+        }
+        this.#sendEvent("session.goalChanged", { sessionId, goal, operation: operation || "edit" });
         return;
       }
       if (type === "model/selection") {
@@ -1122,6 +1351,16 @@ export class HostBridge {
       if (type === "user/message") {
         // v1.1.1（§5.2）：真人输入被消费（进入某个 turn）→ 从待执行列表里摘掉。
         this.#handleUserMessage(sessionId, event);
+        // v1.3.0：迟到回答/桌面回答会以 user-question-reply 写入，对账投影并清卡。
+        if (event?.data?.source?.kind === "user-question-reply") {
+          void this.#sweepHostQuestions(sessionId);
+        }
+        // v1.3.1：Goal 轮次推进 = goal-round-driver 写入 source.kind="goal" 的
+        // user/message，而 Host **只在 goal/change 发事件**（轮次推进不发）→
+        // 不在这里补一次广播，手机端会一直停在上一个轮次。
+        if (event?.data?.source?.kind === "goal") {
+          void this.#emitGoalRound(sessionId);
+        }
         return;
       }
       // 其余事件（turn/*、step/* …）忽略
@@ -1201,8 +1440,14 @@ export class HostBridge {
     }
     const inserted = Array.isArray(data?.inserted) ? data.inserted : [];
     for (const message of inserted) {
+      // v1.3.1：只跟踪**真人输入**。Goal 轮次提示（source.kind="goal"）等宿主自动注入
+      // 的唤醒消息不进手机「排队消息」——它们由触发卡表达（「继续执行目标」），
+      // 真进队列只会把注入的原始 prompt 漏出来，还容易看起来像「残留」。
+      const sourceKind = message?.source?.kind;
+      if (sourceKind !== undefined && sourceKind !== "user") continue;
       const itemId = typeof message?.id === "string" ? message.id : "";
       if (itemId === "") continue;
+      if (items.some((item) => item.itemId === itemId)) continue; // 同一 Host 消息只能占一项
       const text = queueItemText(message?.content);
       if (text.trim() === "") continue; // 没有文本 → 不是一条可展示的待执行消息
       if (items.length >= QUEUE_MAX_ITEMS) {
@@ -1228,12 +1473,20 @@ export class HostBridge {
    */
   #handleUserMessage(sessionId, event) {
     const data = event?.data;
-    if (data?.source?.kind !== "user") return;
-    const rpcId = typeof data?.source?.rpcId === "string" ? data.source.rpcId : "";
-    if (rpcId === "") return;
+    // v1.3.1：出队按 Host 消息身份（data.id）判定，**不再要求 source.kind==='user'**
+    // ——凡进过队列的消息被消费就必须出队（旧实现只认真人来源，任何被跟踪的
+    // 非 user 来源消息都会永久残留，这正是「排队残留」的一类）。
     const items = this.#queues.get(sessionId);
     if (!items || items.length === 0) return;
-    const index = items.findIndex((item) => item.rpcId !== "" && item.rpcId === rpcId);
+    // v1.3.0：Host 消息 id 是队列项的真实身份；子代理初始注入可以**没有 rpcId**
+    // （source.kind='user' 但无 rpcId）。旧实现只认 rpcId → 消费后永远不出队。
+    const itemId = typeof data?.id === "string" ? data.id : "";
+    const rpcId = typeof data?.source?.rpcId === "string" ? data.source.rpcId : "";
+    let index = itemId === "" ? -1 : items.findIndex((item) => item.itemId === itemId);
+    if (index < 0 && rpcId !== "") {
+      // 旧宿主/旧事件缺 id 时保留 rpcId 回退（只对带 rpcId 的项生效）。
+      index = items.findIndex((item) => item.rpcId !== "" && item.rpcId === rpcId);
+    }
     if (index < 0) return;
     const target = items[index]?.target ?? "";
     items.splice(index, 1);
@@ -1292,14 +1545,323 @@ export class HostBridge {
    * ——用户会看到「排队列表空着，但桌面端明明排着一条」。
    * 故客户端打开会话时拉一次全量快照（与事件同形状）。
    */
-  #rSessionQueue(m) {
+  async #rSessionQueue(m) {
     const p = m.payload ?? {};
     const sessionId = typeof p.sessionId === "string" ? p.sessionId : "";
     if (sessionId === "") {
       this.#reply(m, errorOf(m, "bad-params", "sessionId required"));
       return;
     }
+    // v1.3.0：优先读 Host 的 inbox 持久投影，事件缓存只作旧宿主回退。
+    // 这样即使漏掉 inbox/spliced 或 user/message，回前台仍能对账出真实队列。
+    try {
+      const sc = this.#sc();
+      if (typeof sc.projections === "function") {
+        const projections = await sc.projections({ sessionId }, this.#signal(10_000));
+        const inbox = projections?.values?.inbox;
+        if (inbox !== undefined && inbox !== null && typeof inbox === "object") {
+          const items = queueItemsFromInbox(inbox);
+          this.#queues.set(sessionId, items.map((item) => ({ ...item })));
+          this.#reply(m, resultOf(m, { sessionId, items: this.#queueItemsOf(sessionId) }));
+          return;
+        }
+      }
+    } catch (e) {
+      this.#log("warn", "inbox projection unavailable; falling back to live queue tracking", {
+        sessionId,
+        error: errText(e),
+      });
+    }
     this.#reply(m, resultOf(m, { sessionId, items: this.#queueItemsOf(sessionId) }));
+  }
+
+  // ---- v1.3.0：待答交互 / Todo / Goal ------------------------------------
+
+  /** 读一个会话的投影值；失败返回 null（调用方自行降级）。 */
+  async #projectionValues(sessionId) {
+    try {
+      const sc = this.#sc();
+      if (typeof sc.projections !== "function") return null;
+      const projections = await sc.projections({ sessionId }, this.#signal(10_000));
+      const values = projections?.values;
+      return values && typeof values === "object" ? values : null;
+    } catch (e) {
+      this.#log("warn", "projection read failed", { sessionId, error: errText(e) });
+      return null;
+    }
+  }
+
+  /** 把一个 Host userQuestions active 行映射成 wire PendingQuestion。 */
+  #hostQuestionWire(sessionId, row) {
+    const callId = typeof row?.callId === "string" ? row.callId : "";
+    if (callId === "") return null;
+    const questions = mapWireQuestions(row?.questions);
+    if (questions.length === 0) return null;
+    const continued = row?.state === "continued";
+    return {
+      askId: callId,
+      sessionId,
+      callId,
+      questions,
+      state: continued ? "continued" : "open",
+      answerable: continued,
+      source: "host",
+      multiSelect: questions.some((q) => q.multiSelect),
+    };
+  }
+
+  /**
+   * 对账 Host userQuestions 投影：把 active 行发布为 question.request，并清掉
+   * 已从投影消失的卡片。`tool/result`、user-question-reply 与快照请求都会触发。
+   * 任何异常只记录，绝不影响瀑布。
+   */
+  async #sweepHostQuestions(sessionId) {
+    const values = await this.#projectionValues(sessionId);
+    const active = values?.userQuestions?.active;
+    if (!Array.isArray(active)) return;
+    // 已经提交但尚在 Host inbox 等待接纳的迟到回答：桌面 UI 也会暂不显示该卡，
+    // 避免用户回答后回前台又看到一张“可再次回答”的重复卡。
+    const queuedReplies = new Set();
+    const inbox = values?.inbox;
+    for (const target of ["next-step", "next-turn"]) {
+      const messages = inbox?.[target];
+      if (!Array.isArray(messages)) continue;
+      for (const message of messages) {
+        const source = message?.source;
+        if (source?.kind === "user-question-reply" && typeof source.callId === "string") {
+          queuedReplies.add(source.callId);
+        }
+      }
+    }
+    const prefix = sessionId + "\0";
+    const nextKeys = new Set();
+    for (const row of active) {
+      const wire = this.#hostQuestionWire(sessionId, row);
+      if (wire === null) continue;
+      if (wire.state === "continued" && queuedReplies.has(wire.callId)) continue;
+      const key = prefix + wire.callId;
+      nextKeys.add(key);
+      this.#hostQuestions.set(key, wire);
+      // 同一 askId 重发 = 状态更新（客户端替换卡片，不叠加）。
+      // 旧 App 会把重发当新卡，只有声明 session-state-v1 的客户端才接收状态更新。
+      if (this.#clientFeatures.has("session-state-v1")) {
+        this.#sendEvent("question.request", wire, wire.state === "continued");
+      }
+    }
+    for (const [key, old] of this.#hostQuestions) {
+      if (!key.startsWith(prefix) || nextKeys.has(key)) continue;
+      this.#hostQuestions.delete(key);
+      this.#sendEvent("question.resolved", { askId: old.askId, source: "desktop" });
+    }
+  }
+
+  /** pending.interactions：插件实时待答 + Host 投影（指定会话时）合并且按 askId 去重。 */
+  async #rPendingInteractions(m) {
+    const p = m.payload ?? {};
+    const sessionId = typeof p.sessionId === "string" ? p.sessionId : "";
+    // 能说新请求本身就是能力声明（旧 App 不会发）；幂等补进 feature 集合，
+    // 避免新 App 忘记在 hello 声明时把遗留 continued 卡误当旧客户端。
+    this.#clientFeatures.add("session-state-v1");
+    const questions = [];
+    const approvals = [];
+    for (const [askId, entry] of this.#pending) {
+      if (sessionId !== "" && entry.sessionId !== sessionId) continue;
+      if (entry.kind === "approval") {
+        approvals.push({
+          ...entry.meta,
+          askId,
+          sessionId: entry.sessionId,
+          answerable: true,
+          source: "plugin",
+          ...(entry.expiresAt ? { expiresAt: entry.expiresAt } : {}),
+        });
+      } else {
+        questions.push({
+          ...entry.meta,
+          askId,
+          sessionId: entry.sessionId,
+          state: "open",
+          answerable: true,
+          source: "plugin",
+          ...(entry.expiresAt ? { expiresAt: entry.expiresAt } : {}),
+        });
+      }
+    }
+    if (sessionId !== "") {
+      await this.#sweepHostQuestions(sessionId);
+      for (const wire of this.#hostQuestions.values()) {
+        if (wire.sessionId !== sessionId) continue;
+        if (questions.some((q) => q.askId === wire.askId)) continue;
+        questions.push(wire);
+      }
+    }
+    this.#reply(m, resultOf(m, { questions, approvals }));
+  }
+
+  /** session.todos：Host `todos` 持久投影（只读）。 */
+  async #rSessionTodos(m) {
+    const p = m.payload ?? {};
+    const sessionId = typeof p.sessionId === "string" ? p.sessionId : "";
+    if (sessionId === "") {
+      this.#reply(m, errorOf(m, "bad-params", "sessionId required"));
+      return;
+    }
+    const values = await this.#projectionValues(sessionId);
+    const supported = values !== null && Object.prototype.hasOwnProperty.call(values, "todos");
+    const todos = !supported || values.todos === null ? null : mapTodoItems(values.todos);
+    if (supported) this.#todoSessions.add(sessionId);
+    else this.#todoSessions.delete(sessionId);
+    this.#reply(m, resultOf(m, { sessionId, todos, supported }));
+  }
+
+  /** Goal 人类操作集合（只暴露 Host GoalService 真正存在的方法）。 */
+  #goalActions(goals) {
+    if (!goals) return [];
+    const wanted = ["create", "edit", "pause", "resume", "complete", "clear"];
+    return wanted.filter((name) => typeof goals[name] === "function");
+  }
+
+  /** 读会话当前 goal + activation（不激活冷会话）。 */
+  async #readGoal(sessionId) {
+    const values = await this.#projectionValues(sessionId);
+    const supported = values !== null && Object.prototype.hasOwnProperty.call(values, "goal");
+    const raw = supported ? values.goal : null;
+    let activation = null;
+    let goal = null;
+    if (raw && typeof raw === "object" && raw.goal && typeof raw.goal.id === "string") {
+      const cached = this.#goalActivations.get(sessionId);
+      if (cached && cached.id === raw.goal.id && cached.revision === raw.goal.revision) {
+        activation = cached.activation;
+      }
+      // 有活 Agent 时从 Host 服务读准确的 activation；绝不为了查询激活冷会话。
+      try {
+        const agents = this.#service("agents");
+        const live = agents && typeof agents.get === "function" ? agents.get(sessionId) : null;
+        const goals = this.#service("goals");
+        if (live && goals && typeof goals.get === "function") {
+          const view = goals.get(live);
+          if (view && view.id === raw.goal.id) activation = view.activation === "armed" ? "armed" : "disarmed";
+        }
+      } catch (e) {
+        this.#log("warn", "goal activation read failed", { sessionId, error: errText(e) });
+      }
+      goal = mapGoalWire(raw.goal, raw.roundsStarted, raw.createdAt, raw.updatedAt, activation);
+    }
+    return { supported, goal, activation };
+  }
+
+  /** v1.3.1：轮次推进（Host 不发 goal/change）→ 重读投影并广播 operation="round"。 */
+  async #emitGoalRound(sessionId) {
+    try {
+      const state = await this.#readGoal(sessionId);
+      if (state.goal === null) return;
+      const goal = state.goal;
+      const cached = this.#goalActivations.get(sessionId);
+      if (cached && cached.id === goal.id && cached.revision === goal.revision) {
+        goal.activation = cached.activation;
+      }
+      this.#sendEvent("session.goalChanged", { sessionId, goal, operation: "round" });
+    } catch (e) {
+      this.#log("warn", "goal round broadcast failed", { sessionId, error: errText(e) });
+    }
+  }
+
+  /** session.goal：读持久投影 + 进程内 activation。 */
+  async #rSessionGoal(m) {
+    const p = m.payload ?? {};
+    const sessionId = typeof p.sessionId === "string" ? p.sessionId : "";
+    if (sessionId === "") {
+      this.#reply(m, errorOf(m, "bad-params", "sessionId required"));
+      return;
+    }
+    const state = await this.#readGoal(sessionId);
+    const goals = this.#service("goals");
+    this.#reply(
+      m,
+      resultOf(m, {
+        sessionId,
+        goal: state.goal,
+        activation: state.activation,
+        supported: state.supported || goals !== null,
+        actions: this.#goalActions(goals),
+      }),
+    );
+  }
+
+  /** session.goalAction：手机人类操作，走 Host GoalService + CAS ref。 */
+  async #rSessionGoalAction(m) {
+    const p = m.payload ?? {};
+    const sessionId = typeof p.sessionId === "string" ? p.sessionId : "";
+    const action = typeof p.action === "string" ? p.action : "";
+    const allowed = ["create", "edit", "pause", "resume", "complete", "clear"];
+    if (sessionId === "" || !allowed.includes(action)) {
+      this.#reply(m, errorOf(m, "bad-params", "sessionId and a valid action required"));
+      return;
+    }
+    const goals = this.#service("goals");
+    if (!goals || typeof goals[action] !== "function") {
+      this.#reply(m, errorOf(m, "service-unavailable", "goals service unavailable"));
+      return;
+    }
+    let agent = null;
+    try {
+      const sc = this.#sc();
+      if (typeof sc.resolveAgent !== "function") throw new Error("sessionController.resolveAgent unavailable");
+      const resolved = await sc.resolveAgent(sessionId);
+      if (resolved?.error) throw resolved.error;
+      agent = resolved?.agent ?? resolved?.session?.agent ?? null;
+      if (!agent) throw new Error(`session "${sessionId}" has no live agent`);
+    } catch (e) {
+      const err = hostErrorOf(e, "goal-agent-unavailable");
+      this.#reply(m, errorOf(m, err.code, err.message));
+      return;
+    }
+    let expected = null;
+    if (action !== "create") {
+      const raw = p.expected;
+      if (!raw || typeof raw.id !== "string" || !Number.isInteger(raw.revision) || raw.revision < 1) {
+        this.#reply(m, errorOf(m, "bad-params", "expected {id, revision} required"));
+        return;
+      }
+      expected = { id: raw.id, revision: raw.revision };
+    }
+    const objective = typeof p.objective === "string" ? p.objective.trim() : "";
+    const maxGoalRounds = p.maxGoalRounds;
+    if ((action === "create" || action === "edit") && objective === "" && action === "create") {
+      this.#reply(m, errorOf(m, "bad-params", "objective required for create"));
+      return;
+    }
+    if (action === "edit" && objective === "" && maxGoalRounds === undefined) {
+      this.#reply(m, errorOf(m, "bad-params", "edit requires objective or maxGoalRounds"));
+      return;
+    }
+    if (maxGoalRounds !== undefined && (!Number.isInteger(maxGoalRounds) || maxGoalRounds < 1)) {
+      this.#reply(m, errorOf(m, "bad-params", "maxGoalRounds must be a positive integer"));
+      return;
+    }
+    try {
+      if (action === "create") {
+        await goals.create(agent, {
+          objective,
+          ...(maxGoalRounds === undefined ? {} : { maxGoalRounds }),
+        });
+      } else if (action === "edit") {
+        await goals.edit(agent, expected, {
+          ...(objective === "" ? {} : { objective }),
+          ...(maxGoalRounds === undefined ? {} : { maxGoalRounds }),
+        });
+      } else if (action === "clear") {
+        await goals.clear(agent, expected);
+      } else {
+        await goals[action](agent, expected);
+      }
+      const state = await this.#readGoal(sessionId);
+      this.#reply(m, resultOf(m, { sessionId, goal: state.goal }));
+    } catch (e) {
+      const err = hostErrorOf(e, "goal-action-failed");
+      this.#log("warn", "goal action failed", { sessionId, action, code: err.code });
+      this.#reply(m, errorOf(m, err.code, err.message));
+    }
   }
 
   /** 归档集合（宿主没有 Workspace 注册表 → null，表示「不知道」而不是「空」）。 */
@@ -1390,6 +1952,11 @@ export class HostBridge {
       entry.resolve({ settled: "timeout" });
     }
     this.#pending.clear();
+    this.#hostQuestions.clear();
+    this.#goalActivations.clear();
+    this.#askQuestionCalls.clear();
+    this.#todoSessions.clear();
+    this.#clientFeatures.clear();
     for (const off of this.#disposers) {
       try {
         off();
@@ -1896,7 +2463,15 @@ export class HostBridge {
         case "session.permission":
           return await this.#rSessionPermission(m);
         case "session.queue":
-          return this.#rSessionQueue(m);
+          return await this.#rSessionQueue(m);
+        case "pending.interactions":
+          return await this.#rPendingInteractions(m);
+        case "session.todos":
+          return await this.#rSessionTodos(m);
+        case "session.goal":
+          return await this.#rSessionGoal(m);
+        case "session.goalAction":
+          return await this.#rSessionGoalAction(m);
         case "session.archive":
           return await this.#rSessionArchive(m);
         case "session.unarchive":
@@ -1921,7 +2496,7 @@ export class HostBridge {
         case "approval.answer":
           return this.#rApprovalAnswer(m);
         case "question.answer":
-          return this.#rQuestionAnswer(m);
+          return await this.#rQuestionAnswer(m);
         case "push.register":
           return this.#rPushRegister(m);
         default:
@@ -1991,6 +2566,11 @@ export class HostBridge {
   #rHello(m) {
     const p = m.payload ?? {};
     if (typeof p.pushToken === "string" && p.pushToken !== "") this.#pushToken = p.pushToken;
+    this.#clientFeatures = new Set(
+      Array.isArray(p.features)
+        ? p.features.filter((f) => typeof f === "string" && f !== "").slice(0, 16)
+        : [],
+    );
     this.#reply(
       m,
       resultOf(m, {
@@ -2535,6 +3115,21 @@ export class HostBridge {
     // v1.2.0（§5.11.1）：宿主具备附件服务（attachments + fileUploads）才声明附件能力；
     // 否则**省略该字段**，客户端隐藏附件入口（旧插件也没有该字段）。
     if (this.#attachmentHostReady()) capabilities.attachments = attachmentCapabilities();
+    // v1.3.0：新协议能力（字段缺省 = 旧 Host 不支持）。
+    const goals = this.#service("goals");
+    capabilities.todos = { supported: true }; // 具体会话是否有 todo 投影由 session.todos.supported 判定
+    capabilities.goal = { read: true, actions: this.#goalActions(goals) };
+    let hostContinued = false;
+    try {
+      hostContinued = typeof this.#sc().projections === "function";
+    } catch {
+      hostContinued = false;
+    }
+    capabilities.pendingInteractions = {
+      questions: true,
+      approvals: true,
+      hostContinued,
+    };
     this.#reply(m, resultOf(m, capabilities));
   }
 
@@ -3251,21 +3846,74 @@ export class HostBridge {
     this.#reply(m, resultOf(m, { applied: true }));
   }
 
-  #rQuestionAnswer(m) {
+  async #rQuestionAnswer(m) {
     const p = m.payload ?? {};
     const askId = typeof p.askId === "string" ? p.askId : "";
-    const entry = askId === "" ? undefined : this.#pending.get(askId);
-    if (entry === undefined || entry.kind !== "question") {
-      this.#reply(m, resultOf(m, { applied: false }));
-      return;
-    }
     const answers = p.answers;
     if (answers === null || typeof answers !== "object" || Array.isArray(answers)) {
       this.#reply(m, errorOf(m, "bad-answers", "answers must be an object of questionId -> label(s)"));
       return;
     }
-    this.#settle(entry, "phone", { answers, freeText: typeof p.freeText === "string" ? p.freeText : "" });
-    this.#reply(m, resultOf(m, { applied: true }));
+    const freeText = typeof p.freeText === "string" ? p.freeText : "";
+    const entry = askId === "" ? undefined : this.#pending.get(askId);
+    if (entry !== undefined && entry.kind === "question") {
+      this.#settle(entry, "phone", { answers, freeText });
+      this.#reply(m, resultOf(m, { applied: true }));
+      return;
+    }
+
+    // v1.3.0：超过插件独占窗口后，Host timed 模式仍将问题保持在 continued；
+    // 此时必须走 Host 官方 answer（steer 一条 user-question-reply），禁止伪造消息。
+    let hostQuestion = null;
+    for (const wire of this.#hostQuestions.values()) {
+      if (wire.askId === askId || wire.callId === askId) {
+        hostQuestion = wire;
+        break;
+      }
+    }
+    if (hostQuestion === null || hostQuestion.state !== "continued") {
+      this.#reply(m, resultOf(m, { applied: false }));
+      return;
+    }
+    const questions = hostQuestion.questions;
+    const userQuestions = this.#service("userQuestions");
+    if (!userQuestions || typeof userQuestions.answer !== "function") {
+      this.#reply(m, errorOf(m, "service-unavailable", "userQuestions.answer unavailable"));
+      return;
+    }
+    let agent = null;
+    try {
+      const sc = this.#sc();
+      const resolved = await sc.resolveAgent(hostQuestion.sessionId);
+      if (resolved?.error) throw resolved.error;
+      agent = resolved?.agent ?? resolved?.session?.agent ?? null;
+      if (!agent) throw new Error(`session "${hostQuestion.sessionId}" has no live agent`);
+    } catch (e) {
+      const err = hostErrorOf(e, "question-agent-unavailable");
+      this.#reply(m, errorOf(m, err.code, err.message));
+      return;
+    }
+    try {
+      const answer = toAskUserQuestionAnswer(questions, answers, freeText);
+      const accepted =
+        questions.every((q) => answer.answers.some((a) => a.id === q.id)) &&
+        userQuestions.answer(agent, hostQuestion.callId, answer) === true;
+      if (!accepted) {
+        this.#reply(m, resultOf(m, { applied: false }));
+        return;
+      }
+      this.#hostQuestions.delete(hostQuestion.sessionId + "\0" + hostQuestion.callId);
+      this.#sendEvent("question.resolved", { askId: hostQuestion.askId, source: "phone" });
+      this.#reply(m, resultOf(m, { applied: true }));
+    } catch (e) {
+      const err = hostErrorOf(e, "question-answer-failed");
+      this.#log("warn", "continued question answer failed", {
+        sessionId: hostQuestion.sessionId,
+        code: err.code,
+      });
+      // Host 错误码原样给客户端，便于展示 REPLY_QUEUED / BAD_ANSWER。
+      this.#reply(m, errorOf(m, err.code, err.message));
+    }
   }
 
   #rPushRegister(m) {
@@ -3310,16 +3958,16 @@ export class HostBridge {
     const askId = randomUUID();
     const sessionId = String(req?.agent?.session?.id ?? "");
     const timeoutMs = Number(this.#cfg.approvalTimeoutMs) || 120_000;
+    const expiresAt = Date.now() + timeoutMs;
+    const meta = {
+      toolName: String(req?.toolName ?? "unknown"),
+      reason: typeof req?.reason === "string" ? req.reason : "",
+      argsPreview: this.#argsPreviewOf(req?.agent, req?.callId),
+      timeoutMs,
+    };
     const sent = this.#sendEvent(
       "approval.request",
-      {
-        askId,
-        sessionId,
-        toolName: String(req?.toolName ?? "unknown"),
-        reason: typeof req?.reason === "string" ? req.reason : "",
-        argsPreview: this.#argsPreviewOf(req?.agent, req?.callId),
-        timeoutMs,
-      },
+      { askId, sessionId, ...meta, expiresAt },
       true, // urgent：离线时优先补发（契约 §4）
     );
     if (!sent) {
@@ -3337,6 +3985,8 @@ export class HostBridge {
       sessionId,
       signal: req?.signal,
       timeoutMs,
+      expiresAt,
+      meta,
     });
     if (outcome.settled === "phone") {
       const decision = outcome.decision === "approved" ? "approved" : "rejected";
@@ -3364,27 +4014,32 @@ export class HostBridge {
   /** user-questions/request 拦截器（同 §5.5 语义，答案是 AskUserQuestionAnswer）。 */
   async #onQuestionRequest(req, next) {
     if (!this.#shouldIntercept("question")) return next();
-    const askId = randomUUID();
+    // v1.3.0：timed 模式带 Host callId；用它作为稳定 askId，双端才能围绕
+    // 同一个问题对象回答/关闭。legacy 没有 wait，仍用随机 id。
+    const callId = typeof req?.wait?.callId === "string" ? req.wait.callId : "";
+    const askId = callId !== "" ? callId : randomUUID();
     const sessionId = String(req?.agent?.session?.id ?? "");
     const timeoutMs = Number(this.#cfg.approvalTimeoutMs) || 120_000;
-    const questions = (Array.isArray(req?.questions) ? req.questions : []).map((q) => ({
-      id: String(q?.id ?? ""),
-      question: String(q?.question ?? ""),
-      multiSelect: q?.multiSelect === true,
-      options: (Array.isArray(q?.options) ? q.options : []).map((o) => ({
-        label: String(o?.label ?? ""),
-        description: typeof o?.description === "string" ? o.description : "",
-      })),
-    }));
-    if (questions.length === 0 || questions.some((q) => q.id === "")) return next(); // 形状不对，放行
+    const expiresAt = Date.now() + timeoutMs;
+    const questions = mapWireQuestions(req?.questions);
+    if (questions.length === 0) return next(); // 形状不对，放行
+    const meta = {
+      callId,
+      questions,
+      timeoutMs,
+      multiSelect: questions.some((q) => q.multiSelect),
+    };
     const sent = this.#sendEvent(
       "question.request",
       {
         askId,
         sessionId,
-        questions,
-        timeoutMs,
-        multiSelect: questions.some((q) => q.multiSelect),
+        callId,
+        state: "open",
+        answerable: true,
+        source: "plugin",
+        ...meta,
+        expiresAt,
       },
       true,
     );
@@ -3403,17 +4058,28 @@ export class HostBridge {
       sessionId,
       signal: req?.signal,
       timeoutMs,
+      expiresAt,
+      meta,
     });
     if (outcome.settled === "phone") {
       this.#sendEvent("question.resolved", { askId, source: "phone" });
+      this.#hostQuestions.delete(sessionId + "\0" + (callId || askId));
       return toAskUserQuestionAnswer(questions, outcome.answers, outcome.freeText);
     }
-    this.#sendEvent("question.resolved", { askId, source: "timeout" });
+    // legacy：没有 Host 投影，超时后问题真的交给桌面，手机卡片必须结束。
+    // timed：同一请求已有 callId；超时只结束手机独占窗口，随后由投影以
+    // state:'continued' 重新发布，不能提前发 resolved 把卡片删掉。
+    if (callId === "" || !this.#clientFeatures.has("session-state-v1")) {
+      // legacy，或旧 App 不认识 continued：保持旧语义，超时即清卡。
+      this.#sendEvent("question.resolved", { askId, source: "timeout" });
+    }
     try {
       return await next();
     } catch (e) {
       this.#log("warn", "next() after question timeout failed", { error: errText(e) });
       throw e;
+    } finally {
+      if (callId !== "") void this.#sweepHostQuestions(sessionId);
     }
   }
 
@@ -3422,7 +4088,7 @@ export class HostBridge {
    * settle 后从 #pending 移除——迟到的手机回答回 applied:false（§5.5）。
    * @returns {Promise<{settled:"phone", ...}|{settled:"timeout"}>}
    */
-  #waitForAnswer({ askId, kind, sessionId, signal, timeoutMs }) {
+  #waitForAnswer({ askId, kind, sessionId, signal, timeoutMs, expiresAt, meta }) {
     return new Promise((resolve) => {
       const entry = {
         kind,
@@ -3431,6 +4097,8 @@ export class HostBridge {
         timer: null,
         signal,
         abortHandler: null,
+        expiresAt: Number(expiresAt) || 0,
+        meta: meta && typeof meta === "object" ? meta : {},
       };
       const finish = (result) => {
         if (this.#pending.get(askId) !== entry) return;

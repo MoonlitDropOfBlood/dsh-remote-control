@@ -17,7 +17,7 @@ import { KeyboardAvoidMode, promptAction } from '@kit.ArkUI';
 import { common } from '@kit.AbilityKit';
 import { EventPost } from 'eventpost';
 import { HRouter } from 'hrouter';
-import { EVT_PENDING_NAV } from '../model/events';
+import { EVT_PENDING_NAV, EVT_SESSION_STATE_CHANGED } from '../model/events';
 import { ConnectionStore, RemoteProfile, connectionStore } from '../model/connections';
 import { dshrcLink, LinkState } from '../model/link';
 import { openApprovalQueue, openConnections, openNewSession, openSessionDetail } from '../model/routes';
@@ -138,6 +138,13 @@ struct Index {
   @Local store: SessionStore = sessionStore;
   @Local conn: ConnectionStore = connectionStore;
   @Local refreshing: boolean = false;
+  /**
+   * v1.3.1：待处理（审批 / 提问）数量快照。
+   * store.pendingCount() 是 helper 方法读 store 内部数组，**不会建立渲染依赖**
+   * （真机症状：横幅数字不跟着变）→ 改由 store 广播 EVT_SESSION_STATE_CHANGED，
+   * 首页把数字搬进自己的 @Local。
+   */
+  @Local pendingCountSnap: number = 0;
   /** 是否处于「已归档」视图（v1.0.7：Host 权威归档，契约 §5.9）。 */
   @Local showArchived: boolean = false;
   /** 列表投影缓存键（listVersion + 视图；变了才重建投影）。 */
@@ -166,6 +173,11 @@ struct Index {
     EventPost.getDefault().onFromComponent(EVT_PENDING_NAV, this, (): void => {
       this.consumePending();
     }, true);
+    // v1.3.1：待处理数量随会话状态变化刷新（横幅数字实时更新）。
+    EventPost.getDefault().onFromComponent(EVT_SESSION_STATE_CHANGED, this, (): void => {
+      this.pendingCountSnap = this.store.pendingCount();
+    });
+    this.pendingCountSnap = this.store.pendingCount();
     // 返回本页时刷新（hrouter 生命周期；根页未挂 NavDestination 时注册静默跳过，
     // 实际兜底是下面 onVisibleAreaChange 的「重新可见」判定）。
     HRouter.registerLifecycle(this, {
@@ -410,7 +422,7 @@ struct Index {
   @Builder
   pendingBanner() {
     Row() {
-      Text('⏳ 有 ' + this.store.pendingCount().toString() + ' 个审批 / 提问待处理')
+      Text('⏳ 有 ' + this.pendingCountSnap.toString() + ' 个审批 / 提问待处理')
         .fontSize(FS_SMALL)
         .fontColor($r('app.color.state_warn'))
         .layoutWeight(1)
@@ -508,7 +520,7 @@ struct Index {
         if (this.store.lastError.length > 0) {
           this.errorBanner()
         }
-        if (this.store.pendingCount() > 0) {
+        if (this.pendingCountSnap > 0) {
           this.pendingBanner()
         }
         // V2 双向绑定（!!）：refreshing 不走 !! 的话组件拿不到「正在刷新」状态，

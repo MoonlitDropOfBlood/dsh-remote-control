@@ -274,7 +274,16 @@ export class Correlator {
       if (p !== undefined) {
         this.#pending.delete(m.payload.id);
         if (m.payload.ok) p.resolve(m.payload.value);
-        else p.reject(new Error(m.payload.error?.message ?? "remote error"));
+        else {
+          // 把错误码也带进 message：e2e 断言需要区分宿主错误码
+          // （如 v1.3.0 的 GOAL_STALE_REVISION），只带 message 会丢码。
+          const code =
+            typeof m.payload.error?.code === "string" && m.payload.error.code !== ""
+              ? m.payload.error.code
+              : "remote-error";
+          const text = m.payload.error?.message ?? "remote error";
+          p.reject(new Error(code + ": " + text));
+        }
         return;
       }
     }

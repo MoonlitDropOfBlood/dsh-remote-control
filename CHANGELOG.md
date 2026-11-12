@@ -3,6 +3,53 @@
 本仓库的版本说明。发版时（推 `v*` 标签）release workflow 会抽取对应版本段落作为
 GitHub Release 的正文——**bump 版本时必须同步补一段 `## [版本]`**，否则发布失败。
 
+## [1.3.2] - 2026-11-12
+
+会话状态三件套（排队 / 待答交互 / Todo / Goal）的真机验收收尾：**契约升到 v1.3.1**
+（只新增可选字段，旧客户端/旧插件保持旧行为）。插件与两端 App 同步；中继无行为变更。
+
+### 契约 v1.3.1
+
+- `ChatMessage` 新增可选 `trigger`（`goal|agent|team|subagent|webhook|schedule|job|plugin`）：
+  宿主**唤醒消息**（不是用户手打，例如 Goal 轮次提示）正文为空，客户端渲染成触发卡
+  （桌面同口径「继续执行目标」），**不显示注入的原始 prompt**；未知来源仍跳过。
+- `session.goalChanged` 新增 `operation:"round"`：Host 只在 `goal/change` 发事件，
+  轮次推进由 `goal-round-driver` 写 `user/message` 完成 → 插件读投影后补发，手机轮次不再停在旧值。
+- Todo `todos:null`（宿主支持但本回合无清单）渲染口径统一为**不显示**（与 `supported:false` 一致），
+  不再画「暂无任务」空行。
+
+### 插件（Host 侧）
+
+- `mapHistoryMessages` 不再丢弃 `source.kind !== "user"` 的宿主唤醒消息，改为映射 `trigger`
+  （Goal 轮次提示不再整段缺失）。
+- 新增 `#emitGoalRound()`：`source.kind === "goal"` 的 `user/message` 触发重读并广播
+  `session.goalChanged{operation:"round"}`。
+- **排队残留修根**：`#handleUserMessage` 旧实现开头 `source.kind !== "user" → return`
+  → 非真人来源的队列项**永远出不了队**；现改为按 Host 消息 `id` 出队（来源无关）。
+  同时 `#handleInboxSpliced` 只跟踪真人输入 → Goal 轮次提示等自动注入的消息**不进手机队列**
+  （子代理初始注入仍是 `kind:"user"`，照常进队并按 id 出队；子代理完成唤醒显示触发卡）。
+- 门禁：`verify-session-state` **43 项**（新增 trigger 映射/正文隐藏/未知来源跳过/
+  轮次补广播/goal 提示不进队/子代理两类注入）；`verify-images` 出队断言同步更新。
+
+### App（HarmonyOS）
+
+- Goal 行对齐桌面 `GoalBar`：`[目标] 状态 轮次 文案… [⏸/▶] [✎] [🗑]`——状态词短（不带「的目标」）、
+  操作改**图标按钮**、**去掉「完成」**（桌面亦无；协议仍保留 complete）、编辑面板**不再编辑轮次**
+  （轮次由 Agent 控制）。
+- 唤醒消息触发卡；Todo 无数据整行隐藏。
+- 修 ArkUI V2 状态快照刷新的 4 处遗留（Goal 行/触发卡/待答卡/队列改用页面 @Local 快照）。
+
+### App（Android）
+
+- 与 HarmonyOS 同口径：Goal 图标按钮行、删除「完成」、编辑不提交轮次、触发卡、Todo 无数据隐藏。
+- `:core:test` **121 例**（新增 trigger 默认值与 Todo 无数据不可见）。
+
+### 其它
+
+- `plugin/scripts/verify-host-api.mjs`（新增）：读本机真 DSH 运行时源码核对插件依赖的宿主形状
+  （inbox/todos/goal/userQuestions 投影 + `ctx.goals` 签名 + CAS ref + answer schema），
+  CI 钉版本 `0.2.2-rc.1` 运行；无宿主时 SKIP。
+
 ## [1.3.1] - 2026-11-10
 
 修复手机端「回合完成后从后台切回前台，时间线末尾多出一个工作步骤组」的幽灵残留（两端同步），

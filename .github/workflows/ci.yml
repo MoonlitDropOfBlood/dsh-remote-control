@@ -63,6 +63,24 @@ jobs:
         run: node scripts/verify-steps.mjs
       - name: verify-images
         run: node scripts/verify-images.mjs
+      - name: verify-session-state
+        run: node scripts/verify-session-state.mjs
+      # verify-host-api：插件对**真实 DSH 宿主 API** 的假设（v1.3.0 的
+      # inbox/todos/goal/userQuestions 投影与服务形状）。mock host 测不出这类
+      # 「宿主形状变了」的问题——必须对着真宿主包源码核对。
+      # 版本必须钉住：npm 的 latest 标签还停在旧版（0.0.1-rc.x），
+      # 装 latest 会因为宿主早于投影功能而误报 FAIL。
+      - name: verify-host-api
+        run: |
+          mkdir -p /tmp/hostapi && cd /tmp/hostapi
+          npm init -y >/dev/null 2>&1
+          npm i --silent --no-audit --no-fund --legacy-peer-deps \
+            "@deepseek-ai/dsh-goal@0.2.2-rc.1" \
+            "@deepseek-ai/dsh-tool-todo@0.2.2-rc.1" \
+            "@deepseek-ai/dsh-user-questions@0.2.2-rc.1" \
+            "@deepseek-ai/dsh-agent-loop@0.2.2-rc.1"
+          cd "$GITHUB_WORKSPACE/plugin"
+          DSH_RUNTIME=/tmp/hostapi/node_modules node scripts/verify-host-api.mjs
       - name: verify-relay-supervisor
         run: node scripts/verify-relay-supervisor.mjs
       - name: verify-pairing

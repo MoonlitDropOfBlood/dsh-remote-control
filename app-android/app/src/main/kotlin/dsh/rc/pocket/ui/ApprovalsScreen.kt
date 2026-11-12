@@ -163,7 +163,8 @@ fun ApprovalsScreen(
 /**
  * 审批卡：允许（品牌填充）/ 拒绝（描边红）。
  *
- * 倒计时按「卡片首次出现」起算（core 的 ApprovalRequest 只带 timeoutMs，不带收到时刻）。
+ * 倒计时按「卡片首次出现」起算（core 的 ApprovalRequest 只带 timeoutMs，不带收到时刻）；
+ * v1.3.0 优先用 `expiresAt`（绝对时间）——恢复出来的卡片没有「收到时刻」，只有绝对期限。
  */
 @Composable
 fun ApprovalCard(
@@ -173,8 +174,8 @@ fun ApprovalCard(
     modifier: Modifier = Modifier,
 ) {
     val colors = PocketTheme.colors
-    val deadline = remember(approval.askId) {
-        System.currentTimeMillis() + approval.timeoutMs.coerceAtLeast(0L)
+    val deadline = remember(approval.askId, approval.expiresAt, approval.timeoutMs) {
+        approval.expiresAt ?: (System.currentTimeMillis() + approval.timeoutMs.coerceAtLeast(0L))
     }
     val remaining = remember(approval.askId) { mutableStateOf(deadline - System.currentTimeMillis()) }
     LaunchedEffect(approval.askId) {
@@ -186,6 +187,8 @@ fun ApprovalCard(
     }
     val total = approval.timeoutMs.coerceAtLeast(1L)
     val expired = remaining.value <= 0L
+    // v1.3.0（契约 §5.12）：失效的审批不得再显示可编辑按钮（超时后仍按 fail-open 交给桌面）。
+    val editable = approval.answerable
 
     Column(
         modifier = modifier
@@ -194,7 +197,12 @@ fun ApprovalCard(
             .border(Hairline, colors.borderL2, RoundedCornerShape(Radius.card))
             .padding(Sp.sp4),
     ) {
-        CountdownBar(title = "工具审批", remaining = remaining.value, totalMs = total)
+        CountdownBar(
+            title = "工具审批",
+            remaining = remaining.value,
+            totalMs = total,
+            statusText = if (!editable) "已失效" else null,
+        )
         if (sessionTitle.isNotEmpty()) {
             Text(
                 text = sessionTitle,
@@ -244,13 +252,13 @@ fun ApprovalCard(
         ) {
             Button(
                 onClick = { vm.answerApproval(approval.askId, "approved") },
-                enabled = !expired,
+                enabled = editable && !expired,
                 shape = RoundedCornerShape(Radius.ctrl),
                 modifier = Modifier.weight(1f),
             ) { Text("允许") }
             OutlinedButton(
                 onClick = { vm.answerApproval(approval.askId, "rejected") },
-                enabled = !expired,
+                enabled = editable && !expired,
                 shape = RoundedCornerShape(Radius.ctrl),
                 modifier = Modifier.weight(1f),
             ) { Text("拒绝") }
@@ -260,6 +268,13 @@ fun ApprovalCard(
 
 /**
  * 提问卡：单选 / 多选 / 自由文本，按契约 §5.4 组装 answers。
+ *
+ * v1.3.0（契约 §5.12）：
+ *  - `state == "continued"` → 手机独占等待窗口已结束，但宿主**仍可补答** → 卡片保留、
+ *    仍可提交（不得按超时删卡）；
+ *  - `answerable == false` → 不得显示可编辑卡（只读展示）；
+ *  - `expiresAt` 优先于 `timeoutMs`（恢复出来的卡片只有绝对期限）；
+ *  - `callId` 与电脑端共用同一个（两端回答后互相同步关闭）。
  */
 @Composable
 fun QuestionCard(
@@ -269,8 +284,8 @@ fun QuestionCard(
     modifier: Modifier = Modifier,
 ) {
     val colors = PocketTheme.colors
-    val deadline = remember(question.askId) {
-        System.currentTimeMillis() + question.timeoutMs.coerceAtLeast(0L)
+    val deadline = remember(question.askId, question.expiresAt, question.timeoutMs) {
+        question.expiresAt ?: (System.currentTimeMillis() + question.timeoutMs.coerceAtLeast(0L))
     }
     val remaining = remember(question.askId) { mutableStateOf(deadline - System.currentTimeMillis()) }
     var freeText by remember(question.askId) { mutableStateOf("") }
@@ -285,6 +300,8 @@ fun QuestionCard(
         }
     }
     val expired = remaining.value <= 0L
+    // v1.3.0：可答性由 answerable 决定；continued 状态**不再**因为超时而禁答。
+    val editable = question.answerable
 
     Column(
         modifier = modifier
@@ -293,7 +310,16 @@ fun QuestionCard(
             .border(Hairline, colors.borderL2, RoundedCornerShape(Radius.card))
             .padding(Sp.sp4),
     ) {
-        CountdownBar(title = "向你提问", remaining = remaining.value, totalMs = question.timeoutMs.coerceAtLeast(1L))
+        CountdownBar(
+            title = if (question.isContinued) "向你提问 · 可补答" else "向你提问",
+            remaining = remaining.value,
+            totalMs = question.timeoutMs.coerceAtLeast(1L),
+            statusText = when {
+                !editable -> "已失效"
+                question.isContinued -> "等待已结束 · 仍可补答"
+                else -> null
+            },
+        )
         if (sessionTitle.isNotEmpty()) {
             Text(
                 text = sessionTitle,
@@ -304,11 +330,24 @@ fun QuestionCard(
                 modifier = Modifier.padding(top = Sp.sp2),
             )
         }
+        if (question.callId.isNotEmpty()) {
+            // 与电脑端共用同一个 Host callId（两端回答后互相同步关闭）。
+            Text(
+                text = "callId ${question.callId}",
+                style = MaterialTheme.typography.labelSmall,
+                fontFamily = FontFamily.Monospace,
+                color = colors.labelTertiary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(top = Sp.sp1),
+            )
+        }
         for (q in question.questions) {
             QuestionBlock(
                 question = q,
                 multi = q.multiSelect || question.multiSelect,
                 selected = picks[q.id].orEmpty(),
+                enabled = editable,
                 onToggle = { label ->
                     val current = picks[q.id].orEmpty()
                     val multi = q.multiSelect || question.multiSelect
@@ -330,6 +369,7 @@ fun QuestionCard(
         TextField(
             value = freeText,
             onValueChange = { freeText = it },
+            enabled = editable,
             placeholder = {
                 Text(
                     text = "补充说明、澄清或直接作答…",
@@ -358,12 +398,12 @@ fun QuestionCard(
                     freeText.trim(),
                 )
             },
-            enabled = !expired,
+            enabled = editable && (!expired || question.isContinued),
             shape = RoundedCornerShape(Radius.ctrl),
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(top = Sp.sp3),
-        ) { Text("提交回答") }
+        ) { Text(if (question.isContinued) "补答" else "提交回答") }
     }
 }
 
@@ -373,6 +413,7 @@ private fun QuestionBlock(
     question: Question,
     multi: Boolean,
     selected: List<String>,
+    enabled: Boolean = true,
     onToggle: (String) -> Unit,
 ) {
     val colors = PocketTheme.colors
@@ -399,18 +440,20 @@ private fun QuestionBlock(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clickable { onToggle(option.label) }
+                    .clickable(enabled = enabled) { onToggle(option.label) }
                     .padding(vertical = Sp.sp1),
             ) {
                 if (multi) {
                     Checkbox(
                         checked = selected.contains(option.label),
                         onCheckedChange = { onToggle(option.label) },
+                        enabled = enabled,
                     )
                 } else {
                     RadioButton(
                         selected = selected.contains(option.label),
                         onClick = { onToggle(option.label) },
+                        enabled = enabled,
                     )
                 }
                 Column(modifier = Modifier.padding(start = Sp.sp2)) {
@@ -432,9 +475,18 @@ private fun QuestionBlock(
     }
 }
 
-/** 倒计时条（剩余时间 + 进度）。 */
+/**
+ * 倒计时条（剩余时间 + 进度）。
+ *
+ * v1.3.0：`statusText` 非空时用它替代倒计时文案（continued / 已失效）。
+ */
 @Composable
-private fun CountdownBar(title: String, remaining: Long, totalMs: Long) {
+private fun CountdownBar(
+    title: String,
+    remaining: Long,
+    totalMs: Long,
+    statusText: String? = null,
+) {
     val colors = PocketTheme.colors
     val urgent = remaining in 1..20_000L
     Column {
@@ -452,14 +504,15 @@ private fun CountdownBar(title: String, remaining: Long, totalMs: Long) {
                     .padding(horizontal = Sp.sp2, vertical = 3.dp),
             )
             Text(
-                text = if (remaining > 0) countdownText(remaining) else "已超时",
+                text = statusText ?: if (remaining > 0) countdownText(remaining) else "已超时",
                 style = MaterialTheme.typography.labelSmall,
-                color = if (remaining > 0) colors.labelSecondary else colors.stateError,
+                color = if (statusText != null) colors.labelSecondary
+                else if (remaining > 0) colors.labelSecondary else colors.stateError,
                 modifier = Modifier.padding(start = Sp.sp2),
             )
         }
         androidx.compose.material3.LinearProgressIndicator(
-            progress = { if (remaining > 0) remaining.toFloat() / totalMs.toFloat() else 0f },
+            progress = { if (remaining > 0 && statusText == null) remaining.toFloat() / totalMs.toFloat() else 0f },
             color = if (urgent) colors.stateError else colors.brandFill,
             trackColor = colors.bgLayer2,
             modifier = Modifier

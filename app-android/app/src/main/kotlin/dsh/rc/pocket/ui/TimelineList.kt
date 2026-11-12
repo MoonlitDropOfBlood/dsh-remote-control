@@ -17,6 +17,7 @@ package dsh.rc.pocket.ui
 import android.graphics.BitmapFactory
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.layout.Arrangement
@@ -35,6 +36,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Lightbulb
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
@@ -68,6 +70,7 @@ import dsh.rc.core.TimelineItem
 import dsh.rc.core.TimelineMessage
 import dsh.rc.core.TimelineReasoning
 import dsh.rc.core.TimelineStep
+import dsh.rc.pocket.ui.theme.Hairline
 import dsh.rc.pocket.ui.theme.PocketTheme
 import dsh.rc.pocket.ui.theme.Radius
 import dsh.rc.pocket.ui.theme.Sp
@@ -173,6 +176,19 @@ fun TimelineList(
  *
  * 纯附件消息（正文为空）**不画空气泡**（契约 §5.11.4）。
  */
+/** v1.3.1：唤醒消息的触发卡文案（对齐桌面端 message.trigger.* 词条）。 */
+private fun triggerLabel(trigger: String): String = when (trigger) {
+    "goal" -> "继续执行目标"
+    "agent" -> "收到任务消息"
+    "team" -> "收到团队消息"
+    "subagent" -> "子任务状态更新"
+    "webhook" -> "收到外部事件"
+    "schedule" -> "自动化任务"
+    "job" -> "后台任务状态更新"
+    "plugin" -> "插件状态更新"
+    else -> "收到执行请求"
+}
+
 @Composable
 private fun MessageBubble(
     item: TimelineMessage,
@@ -180,6 +196,36 @@ private fun MessageBubble(
     modifier: Modifier = Modifier,
 ) {
     val colors = PocketTheme.colors
+    // v1.3.1（契约 §5.3）：唤醒消息（Goal 轮次提示等）→ 触发卡，不画普通气泡、
+    // 也不显示注入的原始正文（与 HarmonyOS 版、桌面端同口径）。
+    if (item.trigger.isNotEmpty()) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = modifier
+                .fillMaxWidth()
+                .padding(vertical = Sp.sp1),
+        ) {
+            Icon(
+                imageVector = Icons.Default.Info,
+                contentDescription = null,
+                tint = colors.labelTertiary,
+                modifier = Modifier.size(14.dp),
+            )
+            Text(
+                text = triggerLabel(item.trigger),
+                style = MaterialTheme.typography.labelSmall,
+                color = colors.labelSecondary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier
+                    .padding(start = Sp.sp2)
+                    .background(colors.bgLayer2, RoundedCornerShape(Radius.pill))
+                    .border(Hairline, colors.borderL1, RoundedCornerShape(Radius.pill))
+                    .padding(horizontal = Sp.sp2, vertical = 2.dp),
+            )
+        }
+        return
+    }
     val isUser = item.role == "user"
     Column(
         modifier = modifier

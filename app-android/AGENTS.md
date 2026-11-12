@@ -189,3 +189,25 @@ JCA 加密是同步的 → 发送侧用 `sendLock` 临界区完成「seq 分配 
     掉 `TimelineReasoning` 且 `seq<0` 的项；运行中 / 向前翻页不动。
 - 回归：`core/src/test/kotlin/dsh/rc/core/LiveStepReconcileTest.kt` 新增
   `LiveReasoningReconcileTest` 4 例（空闲摘除 / 流式与已定稿都摘 / 运行中保留 / prepend 保留）。
+
+## 2026-11-12：v1.3.1 对齐 HarmonyOS 版（真机验收驱动的四处修正）
+
+HarmonyOS 版改完后同步到这里，**wire 与 UI 口径两端必须一致**：
+
+1. **Goal 行对齐桌面 GoalBar**（`ui/GoalTodoPanel.kt` `GoalBar`）：
+   `[目标] 状态 轮次 文案… [⏸/▶] [✎] [🗑]`——状态词短（不带「的目标」）、
+   操作只用 `IconButton` 图标（Pause/PlayArrow/Edit/Delete，来自 material-icons-extended），
+   **删除「完成」按钮**（桌面也没有；协议仍保留 `complete`）。
+   状态由 `goalStatusShort(goal, activation)` 判定：`active+armed/未知`→进行中、
+   `active+disarmed`→已暂停、`paused`→已暂停、`blocked`→受阻。
+2. **目标编辑弹窗不编辑轮次**：`GoalEditorDialog` 只有目标内容，`onConfirm(objective, null)`
+   ——轮次由 Agent 控制，手机不提交 `maxGoalRounds`。
+3. **唤醒消息触发卡**（契约 §5.3 v1.3.1）：`ChatMessage.trigger` / `TimelineMessage.trigger`
+   （`Store.mergeHistory` 的 fresh 与 `prior.copy` 都要带 `trigger`）；
+   `TimelineList` 在 `item.trigger.isNotEmpty()` 时画触发卡胶囊（`triggerLabel()` 用桌面
+   `message.trigger.*` 同词条），**不画气泡、不显示注入的原始正文**。
+4. **任务清单没数据整行隐藏**：`TodoCard` 只在 `todoVisibility(state) == LIST` 渲染
+   （`HIDDEN`/`EMPTY` 都不画空行；纯函数语义不变）。
+
+回归：`./gradlew :core:test`（`CoreApiContractTest` 新增 trigger 默认值与
+「Todo 无数据时 UI 不可见」两例，共 121 例 0 失败）+ `:app:assembleDebug`。

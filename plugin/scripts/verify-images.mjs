@@ -1064,7 +1064,8 @@ setSharpResolver(null);
     q4[3]?.sessionId === "sess-q2" && q4[3]?.items?.length === 2
     && q4[3].items.map((i) => i.itemId).join(",") === "m-2,m-3", JSON.stringify(q4[3]));
 
-  // 8) 非真人来源的 user/message（agent 注入）→ 不出队
+  // 8) v1.3.1：出队按 Host 消息身份（data.id）判定，**不再要求 source.kind==='user'**
+  //    ——凡进过队列的消息被消费就必须出队（旧的「只认真人来源」正是排队残留的一类）。
   splice("sess-q", "next-turn", [
     { id: "m-4", source: { kind: "user", rpcId: "rpc-4" }, content: [{ type: "text", text: "第四条" }] },
   ]);
@@ -1076,7 +1077,7 @@ setSharpResolver(null);
     data: { id: "m-4", source: { kind: "agent" }, content: [{ type: "text", text: "注入" }] },
   });
   const q5 = eventsOf(relay.sent, "session.queue");
-  check("session.queue：非真人来源的 user/message 不出队", q5.length === 5, `events=${q5.length}`);
+  check("session.queue：同 id 的 user/message 无论来源都出队（不残留）", q5.length === 6, `events=${q5.length}`);
 }
 
 // ---------------------------------------------------------------------------

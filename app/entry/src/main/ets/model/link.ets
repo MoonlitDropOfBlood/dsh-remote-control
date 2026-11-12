@@ -47,6 +47,14 @@ import {
   DshrcRelayFrame,
   DshrcRelayPeers,
   DshrcPeerProof,
+  DshrcTodoItem,
+  DshrcTodosSnapshot,
+  DshrcGoalWire,
+  DshrcGoalSnapshot,
+  DshrcGoalAction,
+  DshrcGoalRef,
+  DshrcPendingInteractions,
+  CLIENT_FEATURES,
   FRAME_ERROR,
   FRAME_FRAME,
   FRAME_HELLO,
@@ -82,6 +90,10 @@ import {
   MSG_SESSION_RENAME,
   MSG_APPROVAL_ANSWER,
   MSG_QUESTION_ANSWER,
+  MSG_PENDING_INTERACTIONS,
+  MSG_SESSION_TODOS,
+  MSG_SESSION_GOAL,
+  MSG_SESSION_GOAL_ACTION,
   MSG_PUSH_REGISTER,
   MSG_PING,
   PROTO_HELLO_V2,
@@ -93,7 +105,8 @@ import {
   SID_LEGACY,
   SID_LEN,
   SID_PATTERN,
-  makeMsg
+  makeMsg,
+  parsePendingInteractions
 } from './protocol';
 import { assertKat, deriveKey, helloSig, helloSig2, open, seal } from './crypto';
 import { DshrcOrderedQueue } from './ordered-queue';
@@ -1040,6 +1053,9 @@ export class DshrcLink {
         proto: PROTO_VERSION,
         clientName: cfg.clientName,
         appVersion: cfg.appVersion,
+        // v1.3.0（契约 §5.1）：声明 session-state-v1 —— 插件据此对本客户端启用
+        // pending.interactions 恢复通道、Todo 只读、Goal CAS 与 continued 补答语义。
+        features: CLIENT_FEATURES.slice(),
         sig: sig
       };
       this.correlator.request((m: DshrcMsg) => {
@@ -1439,6 +1455,97 @@ export class DshrcLink {
     }
     return this.request(MSG_QUESTION_ANSWER, p).then((v: DshrcValue): boolean => {
       return v.applied === true;
+    });
+  }
+
+  /**
+   * pending.interactions（§5.12 v1.3.0）：拉取待答交互快照（**只读恢复通道**）。
+   *
+   *  - 不带 sessionId → 只回插件仍持有的全局待答项（不做全量冷读）；
+   *  - 带 sessionId   → 插件仍持有的待答项 **合并** 该会话 Host `userQuestions`
+   *    投影里 `open` / `continued` 的问题。
+   *
+   * **只读，绝不能阻塞瀑布**：读取失败由调用方按空数组处理（fail-open）。
+   */
+  pendingInteractions(sessionId?: string): Promise<DshrcPendingInteractions> {
+    const p: DshrcPayload = {};
+    if (sessionId !== undefined && sessionId.length > 0) {
+      p.sessionId = sessionId;
+    }
+    return this.request(MSG_PENDING_INTERACTIONS, p, 15000).then((v: DshrcValue): DshrcPendingInteractions => {
+      return parsePendingInteractions(v);
+    });
+  }
+
+  /**
+   * session.todos（§5.13 v1.3.0）：读 Host `todos` 持久投影（手机**只读**）。
+   *  - `todos:null` = 本回合尚无清单 / 已清空（显示「暂无任务」）；
+   *  - `supported:false` = 宿主未提供该能力（客户端**隐藏**清单区，不得报错）。
+   */
+  todos(sessionId: string): Promise<DshrcTodosSnapshot> {
+    if (sessionId.length === 0) {
+      return Promise.reject(new Error('sessionId empty'));
+    }
+    const p: DshrcPayload = { sessionId: sessionId };
+    return this.request(MSG_SESSION_TODOS, p, 15000).then((v: DshrcValue): DshrcTodosSnapshot => {
+      const snap: DshrcTodosSnapshot = {
+        sessionId: v.sessionId !== undefined ? v.sessionId : sessionId,
+        todos: v.todos !== undefined ? v.todos : null,
+        supported: v.supported === true
+      };
+      return snap;
+    });
+  }
+
+  /**
+   * session.goal（§5.14 v1.3.0）：读 Host `goal` 持久投影。
+   *  - `goal:null` = 当前无目标；
+   *  - `activation:null` = 未知（客户端**不得**显示「自动续跑中」）；
+   *  - `actions` = 宿主可执行的人类操作子集。
+   */
+  goal(sessionId: string): Promise<DshrcGoalSnapshot> {
+    if (sessionId.length === 0) {
+      return Promise.reject(new Error('sessionId empty'));
+    }
+    const p: DshrcPayload = { sessionId: sessionId };
+    return this.request(MSG_SESSION_GOAL, p, 15000).then((v: DshrcValue): DshrcGoalSnapshot => {
+      const snap: DshrcGoalSnapshot = {
+        sessionId: v.sessionId !== undefined ? v.sessionId : sessionId,
+        goal: v.goal !== undefined ? v.goal : null,
+        activation: v.activation !== undefined ? v.activation : null,
+        supported: v.supported === true,
+        actions: v.actions !== undefined ? v.actions : []
+      };
+      return snap;
+    });
+  }
+
+  /**
+   * session.goalAction（§5.14 v1.3.0）：执行目标的人类操作。
+   *
+   *  - `create` **不带** expected（新建目标，`objective` 必填）；
+   *  - 其余动作**必须**带手机当前看到的 `expected:{id,revision}`，由 Host 做 CAS；
+   *    revision 陈旧 → Host 回 `GOAL_STALE_REVISION`，客户端必须重拉 `session.goal`
+   *    后重试，**不得覆盖**桌面刚做的变更；
+   *  - `block` 不是手机的人类操作（类型里根本没有这个动作，编译期就发不出去）。
+   */
+  goalAction(sessionId: string, action: DshrcGoalAction, expected?: DshrcGoalRef,
+    objective?: string, maxGoalRounds?: number): Promise<DshrcGoalWire | null> {
+    if (sessionId.length === 0) {
+      return Promise.reject(new Error('sessionId empty'));
+    }
+    const p: DshrcPayload = { sessionId: sessionId, action: action };
+    if (expected !== undefined) {
+      p.expected = expected;
+    }
+    if (objective !== undefined && objective.length > 0) {
+      p.objective = objective;
+    }
+    if (maxGoalRounds !== undefined && maxGoalRounds > 0) {
+      p.maxGoalRounds = maxGoalRounds;
+    }
+    return this.request(MSG_SESSION_GOAL_ACTION, p, 20000).then((v: DshrcValue): DshrcGoalWire | null => {
+      return v.goal !== undefined ? v.goal : null;
     });
   }
 

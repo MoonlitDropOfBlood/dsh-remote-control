@@ -55,6 +55,17 @@
 > 旧插件无该字段 → 客户端隐藏附件入口；④ `ChatMessage` 新增可选 `files:FileRef[]`
 > （用户消息里的文件），**正文不再为 file 块写 `[文件]` 占位符**（与 v1.0.9 图片同口径）。
 > **中继/加密/帧格式不变**（附件走普通业务帧）；附件只对**根会话**开放（subagent 不支持）。
+> **v1.3.0 于 2026-11-12 增补：排队权威对账 + 双端提问同步 + Todo + Goal**——
+> ① `session.queue` 改读 Host `inbox` 持久投影，排队消息以 Host `itemId` 为准，`rpcId`
+> 只作旧宿主回退；修复子代理注入消息（无 `rpcId`）消费后仍残留。
+> ② `question.request` / `question.resolved` 不再是一次性内存事件：新增
+> `pending.interactions` 快照与稳定 `callId`/`expiresAt`；启用 Host `userQuestions`
+> timed 模式时，`open` 可答、超时变 `continued` 仍可补答，任意一端回答后另一端同步关闭。
+> 插件只把 Host 投影作为权威，不伪造用户消息；`approvalTimeoutMs` 不得删除仍可回答的问题。
+> ③ 新增 `session.todos` / `session.todosChanged`，手机只读展示 Host `todos` 投影。
+> ④ 新增 `session.goal` / `session.goalAction` 与 `session.goalChanged` /
+> `session.goalActivationChanged`，手机展示并可执行新建/编辑/暂停/恢复/完成/清除；
+> 所有变更携带 `{id,revision}` 做 Host CAS，禁止手机覆盖桌面刚做的变更。
 > 三个实现（DSH 插件 / 中继服务器 / HarmonyOS App）
 > 都必须以本文档为准；任何协议改动必须先改本文档并通知 Lead。
 
@@ -224,14 +235,14 @@ dshrc://pair?r=<encodeURIComponent(relayUrl)>&c=<channel>&s=<secret>[&t=<encodeU
 
 | type | payload | 响应 value | 说明 |
 |---|---|---|---|
-| `hello` | `{proto:1, clientName, appVersion, pushToken?, sig}` | `{hostName, dshVersion, pluginVersion}` | 连接/重连后首条；`sig` 见 §3.4 |
+| `hello` | `{proto:1, clientName, appVersion, pushToken?, features?, sig}` | `{hostName, dshVersion, pluginVersion}` | 连接/重连后首条；`sig` 见 §3.4。**v1.3.0** 可带可选 `features:string[]`；当前定义 `"session-state-v1"`（支持 pending.interactions、Todo、Goal 与 continued 状态重发）。旧插件忽略该字段；旧 App 不带该字段，插件按旧事件语义处理 |
 | `session.list` | `{}` | `{sessions:[SessionSummary]}` | SessionSummary 见 §5.3；**v1.0.7** 每项可带 `archived`，由插件根据 Workspace 注册表拼装，不需要 `includeArchived` 参数 |
 | `session.history` | `{sessionId, beforeSeq?:number, maxMessages?:number}` | `{messages:[ChatMessage], steps:[StepRecord], hasMore, oldestSeq}` | **v1.0.4** 向后翻页的历史消息；`beforeSeq` 缺省取最新一页。ChatMessage：`{id, role:"user"\|"assistant"\|"reasoning", text, ts, seq}`（`reasoning` 为 **v1.0.7** 新增；见 §5.3）。subagent 会话自动走 durable subagent 地址。**v1.0.6**：新增 `steps`（工具步骤，§5.7）——旧插件不返该字段时客户端只显示消息 |
 | `session.subagents` | `{sessionId}` | `{subagents:[SubagentInfo]}` | **v1.0.5** 父会话的直接子代理目录（父会话 `subagentCatalog` 投影 + 运行态）。SubagentInfo 见 §5.6 |
 | `session.subagentPrompt` | `{parentSessionId, childSessionId, text}` | `{accepted:bool}` | **v1.0.5** 向 **continuable** 子代理发消息（delivery:'queue'）；one-shot 子代理返回 `unsupported` 错误。回复走同一事件流（sessionId=child） |
 | `session.subagentCancel` | `{parentSessionId, childSessionId}` | `{accepted:bool}` | **v1.0.5** 取消 continuable 子代理当前 turn（interruptByParent；accepted=信号已受理，非已停止） |
 | `session.create` | `{title?, cwd?, agentPreset?, permission?, model?}` | `{sessionId, agentPreset?, model?, modelError?}` | cwd 缺省或为空串时，插件解析为 Host 用户主目录下的 `~/.dsh/remote` 并在创建前递归确保目录存在；不再使用 DSH 后端 `process.cwd()`。该路径随后仍按 §5.1 的工作区反查规则归组，未注册则允许未分组；目录创建失败回错，不静默回退。显式 cwd 行为不变。**v1.0.6**：`agentPreset` / `permission` = 模式与权限（§5.8）。**v1.0.7**：`model:{provider,model,reasoningEffort?}` = 模型选择；Host 在创建后、首条 prompt 前 `selectModel`。会话已创建但模型设置失败时仍回成功并带 `modelError`，客户端不得重复创建 |
-| `session.capabilities` | `{}` | `{presets:[ModeOption], permissions:[PermissionOption], defaultPreset?, defaultPermission?, models:[ModelOption], defaultModelId?, archiveSupported:bool, busyEnter:'queue'\|'steer', attachments?:{...}}` | **v1.0.6** 模式与权限目录。**v1.0.7** 增加模型目录与真实归档能力标记（§5.8/§5.9）。**v1.0.8** `ModelOption.efforts` 暴露该模型可选思考强度（§5.8）；宿主未提供对应能力时 models 为空 / archiveSupported=false，客户端隐藏对应选择区，不得报错。**v1.1.2** 增补 `busyEnter`：宿主「繁忙时的发送行为」——**只读**（客户端不得提供切换），宿主读不到时按 'queue'。**v1.2.0** 增补 `attachments`（§5.11）：宿主不支持附件时**缺省该字段**（客户端隐藏附件入口） |
+| `session.capabilities` | `{}` | `{presets:[ModeOption], permissions:[PermissionOption], defaultPreset?, defaultPermission?, models:[ModelOption], defaultModelId?, archiveSupported:bool, busyEnter:'queue'\|'steer', attachments?:{...}, todos?:{supported:bool}, goal?:{read:bool, actions:GoalAction[]}, pendingInteractions?:{questions:bool, approvals:bool, hostContinued:bool}}` | **v1.3.0** 增补 `todos` / `goal` / `pendingInteractions`（字段缺省 = 旧宿主不支持；客户端隐藏对应入口，新请求报 `bad-type` 时静默降级，不得弹错误）。**v1.0.6** 模式与权限目录。**v1.0.7** 增加模型目录与真实归档能力标记（§5.8/§5.9）。**v1.0.8** `ModelOption.efforts` 暴露该模型可选思考强度（§5.8）；宿主未提供对应能力时 models 为空 / archiveSupported=false，客户端隐藏对应选择区，不得报错。**v1.1.2** 增补 `busyEnter`：宿主「繁忙时的发送行为」——**只读**（客户端不得提供切换），宿主读不到时按 'queue'。**v1.2.0** 增补 `attachments`（§5.11）：宿主不支持附件时**缺省该字段**（客户端隐藏附件入口） |
 | `session.archive` | `{sessionId, stopActivity?:bool}` | `{sessionId, archived:true}` | **v1.0.7** 写入 Workspace 真实归档集合；`stopActivity=true` 时按 Host 语义停止运行活动，缺省为 false |
 | `session.unarchive` | `{sessionId}` | `{sessionId, archived:false}` | **v1.0.7** 从 Workspace 归档集合恢复；幂等 |
 | `session.selectModel` | `{sessionId, model:ModelSelection}` | `{model:ModelSelection}` | **v1.0.8** 对**已存在会话**切换模型/思考强度；插件调 `sessionController.selectModel({sessionId,…})`。Host 拒绝时回 `error`（原文带出），成功回归一化后的 selection，并视为一次 `model/selection`（同样触发 `session.modelChanged`） |
@@ -243,12 +254,16 @@ dshrc://pair?r=<encodeURIComponent(relayUrl)>&c=<channel>&s=<secret>[&t=<encodeU
 | `attachment.upload.chunk` | `{uploadId, index:number, data:string}` | `{received:number}` | **v1.2.0** 上传一个分块：`index` 从 0 连续递增，`data` = **标准 base64**（canonical）的明文块（≤`chunkBytes`，最后一块可短）；`received` = 截至目前累计字节数。乱序/重复/超长回 `attachment-chunk-mismatch` |
 | `attachment.upload.commit` | `{uploadId}` | `{uploadId, attachment:UploadedAttachment}` | **v1.2.0** 提交：插件把累积字节写入宿主附件服务（图片归一化、文件逐字节存储）。成功后该 uploadId 只能用于一次 `session.prompt`。宿主校验失败原样回 `session/attachment-invalid`（reason 带宿主码） |
 | `attachment.upload.abort` | `{uploadId}` | `{aborted:bool}` | **v1.2.0** 放弃上传并释放缓冲；幂等（未知/已提交/已过期 → `aborted:false`，不报错）。已 commit 的附件不可撤回（宿主附件不可删除） |
-| `session.queue` | `{sessionId}` | `{sessionId, items:[{itemId, text, target:'next-turn'\|'next-step'}]}` | **v1.1.2** 拉取该会话**当前**待执行消息的全量快照。与 §5.2 的 `session.queue` 事件同形状：事件只在**变化时**推，客户端断线重连后必须拉一次才能补上断线期间变过的队列 |
+| `session.queue` | `{sessionId}` | `{sessionId, items:[{itemId, text, target:'next-turn'\|'next-step'}]}` | **v1.1.2** 拉取该会话**当前**待执行消息的全量快照。与 §5.2 的 `session.queue` 事件同形状：事件只在**变化时**推，客户端断线重连后必须拉一次才能补上断线期间变过的队列。**v1.3.0 权威口径**：插件必须优先读 Host `sessionController.projections` 的 `values.inbox`，从其中 `next-turn`/`next-step` 的消息重建；投影不可用才回退插件内存。出队以 Host 消息 `id`（wire 里的 `itemId`）为主键，`source.rpcId` 只作旧宿主回退——子代理初始注入可以没有 `rpcId`，不能因此永久残留 |
 | `session.cancel` | `{sessionId}` | `{cancelled:bool}` | 取消当前运行的 turn |
 | `session.rename` | `{sessionId, title}` | `{title}` | |
 | `image.fetch` | `{imageId, maxEdge?:number}` | `{imageId, mediaType, width, height, data:"data:<mediaType>;base64,…"}` | **v1.0.9** 拉取图片大图（§5.10）：`maxEdge` 缺省 1600、上限 4096；插件等比缩放后回 data URI，单张 ≤ 1MiB（中继硬上限），失败回 `error`（不影响消息流） |
+| `pending.interactions` | `{sessionId?}` | `{questions:[PendingQuestion], approvals:[PendingApproval]}` | **v1.3.0** 拉取待答快照，供回前台/重连恢复。指定 `sessionId` 时同时合并插件仍持有的待答项与该会话 Host `userQuestions` 投影的 `open/continued` 问题；未指定时只回插件仍持有的全局待答项（不做全量冷读）。**只读，绝不能阻塞瀑布**；读取失败回空数组，不影响 fail-open |
+| `session.todos` | `{sessionId}` | `{sessionId, todos:[TodoItem]\|null, supported:bool}` | **v1.3.0** 读 Host `todos` 持久投影。`null` = 本回合尚无清单/已清空；`supported:false` = 宿主未提供该能力。手机只读 |
+| `session.goal` | `{sessionId}` | `{sessionId, goal:GoalWire\|null, activation:'armed'\|'disarmed'\|null, supported:bool, actions:GoalAction[]}` | **v1.3.0** 读 Host `goal` 持久投影；`activation` 来自活 Agent 的服务读取或 activation 事件缓存，未知为 `null`。`null` = 当前无目标。`actions` 是宿主可执行的人类操作子集 |
+| `session.goalAction` | `{sessionId, action:GoalAction, expected?:{id,revision}, objective?:string, maxGoalRounds?:number}` | `{sessionId, goal:GoalWire\|null}` | **v1.3.0** 执行人类操作。`create` 不需要 `expected`，`objective` 必填；`edit` 至少提供 `objective`/`maxGoalRounds`；`pause`/`resume`/`complete`/`clear` 必须带手机当前看到的 `expected`，由 Host 做 CAS。陈旧 revision 回 `GOAL_STALE_REVISION`，客户端必须重拉 `session.goal` 后重试，不得覆盖新状态。禁止手机触发 `block` |
 | `approval.answer` | `{askId, decision:"approved"\|"rejected", note?}` | `{applied:bool}` | decision 只允许 approved/rejected |
-| `question.answer` | `{askId, answers:{ [questionId]: value }, freeText?}` | `{applied:bool}` | answers 结构见 §5.4 |
+| `question.answer` | `{askId, answers:{ [questionId]: value }, freeText?}` | `{applied:bool}` | answers 结构见 §5.4。**v1.3.0**：`askId` 命中插件待答项走原瀑布；否则若该问题在 Host 投影中为 `continued`，插件可调用 Host 官方 `userQuestions.answer()` 补答。不得伪造用户消息。`applied:false` 表示已失效或已由另一端处理，客户端随后重拉快照 |
 | `push.register` | `{pushToken, platform:"harmonyos"}` | `{registered:bool}` | 手机拿到 Push Token 后上报 |
 | `ping` | `{}` | `{pong:ts}` | 应用层探活（与传输层心跳独立） |
 
@@ -263,7 +278,10 @@ dshrc://pair?r=<encodeURIComponent(relayUrl)>&c=<channel>&s=<secret>[&t=<encodeU
 | `session.modelChanged` | `{sessionId, model:ModelSelection}` | **v1.0.8** 会话模型/思考强度变化：源为 Host 会话事件 `model/selection`（桌面端切换、手机端 `session.selectModel` 都会触发）；客户端更新会话当前模型显示 |
 | `session.permissionChanged` | `{sessionId, permission:string}` | **v1.1.7** 有效当前权限变化：源为 Host 会话事件 `permission/preset`、`sandbox/mode`、`approval/policy` 三类 knob；每条按 Host 顺序携带 `permissionPresets.current(session)` 有效值（含派生态 `custom`），与桌面端 `permissions.currentValue` 同口径。客户端更新当前权限显示；`custom` 仅可展示，不得变成选择目标 |
 | `session.activity` | `{sessionId, updatedAt}` | 事件 `api-session/activity` |
-| `session.queue` | `{sessionId, items:[{itemId, text, target:'next-turn'\|'next-step'}]}` | **v1.1.1** 该会话**待执行**的用户消息（排队中 / 已插入当前 turn 但尚未消费）。源为 Host 会话事件 `agent/inbox/spliced`（入队）与 `user/message`（被消费时出队）。客户端据此显示「排队中」列表——**只做展示，不做猜测**；items 为空数组 = 没有待执行消息 |
+| `session.queue` | `{sessionId, items:[{itemId, text, target:'next-turn'\|'next-step'}]}` | **v1.1.1** 该会话**待执行**的用户消息（排队中 / 已插入当前 turn 但尚未消费）。源为 Host 会话事件 `agent/inbox/spliced`（入队）与 `user/message`（被消费时出队）。客户端据此显示「排队中」列表——**只做展示，不做猜测**；items 为空数组 = 没有待执行消息。**v1.3.0**：以 Host 消息 `id` 出队；事件只用于实时更新，`session.queue` 拉取负责权威对账 |
+| `session.todosChanged` | `{sessionId, todos:[TodoItem]\|null}` | **v1.3.0** Host 会话事件 `todo/write`（整表覆盖）或 `turn/start`（清单清为 `null`）。客户端整表替换，不自行合并 |
+| `session.goalChanged` | `{sessionId, goal:GoalWire\|null, operation:'create'\|'edit'\|'pause'\|'resume'\|'complete'\|'block'\|'clear'\|'round'}` | **v1.3.0** Host 会话事件 `goal/change`。**v1.3.1**：轮次推进（`roundsStarted` 增加）也发一条 `operation:'round'`——Host 不为此发 `goal/change`（轮次由 goal-round-driver 写入 `user/message`），插件重读投影后补发。`clear` 为 `null`；其余给完整 `GoalWire`（不含 activation） |
+| `session.goalActivationChanged` | `{sessionId, id, revision, activation:'armed'\|'disarmed'}` | **v1.3.0** Host 进程内事件 `goal/activation-changed`；无当前目标时不发 |
 | `assistant.delta` | `{sessionId, text}` | 事件 `agent/assistant-stream`（文本增量；**按 sessionId 合并节流 ≤8 条/秒**）。**v1.1.6**：与思考增量共用保序队列（见本表末注） |
 | `assistant.reasoningDelta` | `{sessionId, text}` | **v1.0.7** `agent/assistant-stream` 的 `reasoning-delta` 思考增量；与文本分流，客户端合并进「思考过程」块 |
 | `assistant.image` | `{sessionId, image:ImageRef}` | **v1.0.9** 会话消息里的图片（§5.10）：源为 Host 会话事件的 `content` 块 `type:"image"`（附件引用）；**v1.1.0** 增补第二来源：present 投递的图片文件（§5.10.1，imageId 以 `d` 开头，`source:"deliverable"`） |
@@ -271,10 +289,10 @@ dshrc://pair?r=<encodeURIComponent(relayUrl)>&c=<channel>&s=<secret>[&t=<encodeU
 | `tool.result` | `{sessionId, callId, status:"ok"\|"error", resultText, errorText?, ts}` | **v1.0.6** Host 会话事件 `tool/result`（工具调用结束；`resultText` 为结果文本，失败时 `errorText` 为原因） |
 | ~~`system.message`~~ | ~~`{sessionId, kind:"system"\|"developer", text, ts}`~~ | **v1.1.4 移除**（v1.0.6 引入）。宿主 `system/message` / `developer/message` 是**系统提示词组装记录 / 工具注册表变更**，不是对话内容——DSH 桌面端聊天视图从不展示，手机端也不应展示（曾显示成大段「系统消息」，与 PC 轨迹不一致）。插件**不再桥接**该事件；客户端遇到旧插件发来的该 topic 直接忽略 |
 | `turn.end` | `{sessionId, status:"idle"\|"error", error?}` | 事件 `agent/status`(idle) / `agent/error`。**v1.1.6**：保证在该 session 全部待发增量冲刷完之后发出 |
-| `approval.request` | `{askId, sessionId, toolName, reason, argsPreview, timeoutMs}` | 瀑布 `approval/request` |
+| `approval.request` | `{askId, sessionId, toolName, reason, argsPreview, timeoutMs, expiresAt?}` | 瀑布 `approval/request`。**v1.3.0** 增补绝对 `expiresAt`，供回前台恢复时按剩余时间显示；审批仍无 Host pending 投影，超时后只恢复插件仍持有的项 |
 | `approval.resolved` | `{askId, decision, source:"phone"\|"timeout"\|"desktop"}` | 瀑布收束时回推（手机 UI 消除卡片用） |
-| `question.request` | `{askId, sessionId, questions:[Question], timeoutMs, multiSelect?}` | 瀑布 `user-questions/request` |
-| `question.resolved` | `{askId, source:"phone"\|"timeout"\|"desktop"}` | 同上 |
+| `question.request` | `{askId, sessionId, callId?, questions:[Question], timeoutMs?, expiresAt?, state:"open"\|"continued", answerable:bool, multiSelect?}` | 瀑布 `user-questions/request` 或 Host `userQuestions` 投影。**v1.3.0**：同一 `askId` 重发表示状态更新（客户端替换而非叠加）；`state:"continued"` 表示等待窗口已结束但仍可补答。`expiresAt` 是绝对 Unix 毫秒，恢复卡按剩余时间显示 |
+| `question.resolved` | `{askId, source:"phone"\|"timeout"\|"desktop"}` | 问题真正结束（已回答/已取消/已失效）。**v1.3.0**：`timeout` 不再删除仍为 `continued` 的卡片；插件随后必须以 `question.request{state:"continued"}` 重发 |
 | `push.state` | `{enabled, reason?}` | 推送通道状态变化 |
 | `error` | `{message}` | 兜底 |
 
@@ -327,10 +345,15 @@ Host `sessionController.list` 本身仍不回归档标记，插件必须用
 
 - 监听 `approval/request`（waterfall）：仅当 **手机端已连接**（或离线但配置了推送）且开关打开时拦截；
   否则必须 `next()` 原样放行。
-- 拦截后：生成 `askId`，向手机推 `approval.request` 并发送 Push 推送，等待 `approval.answer`；
+- 拦截后：生成稳定 `askId`，向手机推 `approval.request` 并发送 Push 推送，等待 `approval.answer`；
   **超时（默认 120s，可配）或失败必须 `next()` 放行给桌面端答案器**，绝不 fail-closed 卡死任务。
   手机若在超时后才回答，回 `applied:false`。
-- `user-questions/request` 同理，等待 `question.answer`；超时 `next()`。
+- `user-questions/request` 同理，但 **v1.3.0** 起：Host 启用 `userQuestions` timed 模式时，
+  超时只结束手机独占窗口，不删除仍 `continued` 的卡片；插件继续从 Host 投影提供快照，
+  手机可经 `ctx.userQuestions.answer` 补答。插件不得把 `timeout` 当作问题过期，也不得
+  自己伪造 `user/message`。
+- 所有待答项在回前台/重连后必须能由快照恢复；恢复失败只影响展示，不影响瀑布计时与
+  fail-open 放行。
 - 参考实现范式：`D:/ai-projects/dsh/dsh-agent-approval/index.js` 中
   `ctx.on("approval/request", (req,next)=>…, {prepend:true})` 的写法（`req.agent` / `req.toolName` /
   `req.reason` / `req.callId` / `req.signal`，返回值为 ApprovalOutcome 字符串）。
@@ -471,6 +494,17 @@ Host `sessionController.list` 本身仍不回归档标记，插件必须用
 ```
 
 - `ChatMessage` **v1.0.9** 新增可选字段 `images:ImageRef[]`——旧插件不返该字段时客户端当空数组处理。
+
+**v1.3.1：唤醒消息（`trigger`）**——宿主**唤醒一回合**的消息不是用户手打的
+（`data.source.kind !== "user"`）：目标轮次提示是 `kind:"goal"`，另有
+`agent-message` / `team-message` / `subagent-settled` / `webhook` / `schedule` /
+`tool-jobs` / `cordis-host-runner`。桌面端把它们渲染成**触发卡**（图标 + 一句话，例如
+「继续执行目标」），**不显示注入的原始正文**。手机端同口径：
+
+- `ChatMessage` 新增可选 `trigger: "goal"|"agent"|"team"|"subagent"|"webhook"|"schedule"|"job"|"plugin"`；
+  带该字段的消息 `text` 为空串（原始注入正文被客户端隐藏），`role:"user"`、有 `seq`（照常参与排序）。
+- 旧插件不返该字段 / 旧客户端不认该字段 → 保持旧行为（这类消息不显示）。
+- 未知来源（不在上表）仍然**跳过**，不臆造消息。
 - `assistant.image` 事件：图片随消息到达时推送 `{sessionId, image:ImageRef}`；
   客户端把它挂到**该会话当前正在流式的 assistant 消息**上（无流式消息时按到达序单独成一条图片消息）。
 - 缩略图**必须**在事件/历史里内联（客户端才能立刻显示），但**必须**压缩到
@@ -639,6 +673,97 @@ host → client: {aborted}
 
 宿主入口的附件校验错误（`session/attachment-invalid`）**原样透传**（连带 `reason`），
 客户端按宿主文案提示，不吞成通用错误。
+
+### 5.12 待答交互与双端提问同步（v1.3.0）
+
+```json
+PendingQuestion = {
+  "askId": "stable-identity",
+  "sessionId": "session-…",
+  "callId": "call-…",                 // 有 Host callId 时必填
+  "questions": [Question],
+  "state": "open" | "continued",
+  "answerable": true,
+  "source": "plugin" | "host",
+  "expiresAt": 1760000000000,         // 可省略：indefinite/continued
+  "timeoutMs": 120000,                // 兼容旧客户端，可省略
+  "multiSelect": false                // 可省略
+}
+
+PendingApproval = {
+  "askId": "stable-identity",
+  "sessionId": "session-…",
+  "toolName": "bash",
+  "reason": "…",
+  "argsPreview": "…",
+  "answerable": true,
+  "source": "plugin",
+  "expiresAt": 1760000000000          // 可省略
+}
+```
+
+**不变量：**
+
+1. `pending.interactions` 是只读恢复通道。读取失败必须返回空数组，绝不能等待、阻塞或改动瀑布。
+   客户端与插件**必须服从 DSH 当前配置**（legacy 或 timed）；不得为功能上线擅自修改 DSH
+   预设、profile 或 `tool-ask-user` 的 mode/timeout。
+2. 插件的 `approvalTimeoutMs` 只表示“手机独占等待窗口”，**不是问题寿命**。启用 Host
+   `userQuestions` timed 模式后，窗口结束只把问题从 `open` 推进到 `continued`；Host
+   仍可回答时手机卡片不得删除。
+3. 手机与电脑使用同一个 Host `callId`；任意一端回答后，插件应发 `question.resolved`，
+   另一端据此关闭。桌面端回答走 Host 原生水位，手机端 `continued` 回答必须调用
+   `ctx.userQuestions.answer(agent, callId, answer)`，禁止注入伪造的 `user/message`。
+4. 手机在后台/断线错过 `question.request` 时，回前台或重连必须拉一次
+   `pending.interactions`；事件只负责变化，不承担恢复。
+5. 已超时且 Host 不再可回答（legacy 模式无投影）的问题不得伪装成可答；快照可以省略它，
+   客户端不得显示可编辑卡。
+6. 旧客户端兼容：未在 `hello.features` 声明 `session-state-v1` 的客户端，插件仍按旧语义在
+   timed 超时时发 `question.resolved`，且不得向它重发 `question.request{state:"continued"}`
+   （旧 UI 会重复建卡）。新能力只对声明该特性的客户端启用。
+7. 审批与提问共用同一快照通道。Host 没有审批投影，审批只恢复插件仍持有的未决项；
+   超时后仍按 fail-open 交给桌面，不得伪造可答。
+
+### 5.13 Todo（v1.3.0）
+
+```json
+TodoItem = { "content": "…", "status": "pending" | "in_progress" | "completed" }
+```
+
+- 数据源只有 Host `todos` 持久投影 / `todo/write` 会话事件；手机**只读**，不得写清单。
+- 整表快照语义：`todo/write` 覆盖，`turn/start` 清为 `null`。
+- `session.todos` 的 `supported:false` 与 `todos:null` 必须在**协议层**区分
+  （`supported` 字段本身就是能力声明）；**渲染口径 v1.3.1 统一为「没数据就不显示」**：
+  `todos:null` / 空数组与 `supported:false` 一样**整块不渲染**（不再画「暂无任务」空行）。
+
+### 5.14 Goal（v1.3.0）
+
+```json
+GoalWire = {
+  "id": "goal-…",
+  "revision": 3,
+  "objective": "…",
+  "phase": "active" | "paused" | "blocked" | "complete",
+  "blockedReason": { "code": "…", "message": "…" },  // 仅 blocked
+  "maxGoalRounds": 12,
+  "roundsStarted": 4,
+  "createdAt": 1760000000000,
+  "updatedAt": 1760000000000,
+  "activation": "armed" | "disarmed"                 // 已知时
+}
+```
+
+`GoalAction = "create" | "edit" | "pause" | "resume" | "complete" | "clear"`。
+
+- 手机只能调用 Host 人类面 `ctx.goals`；禁止调用模型工具 `update_goal` / `create_goal`，
+  也禁止伪造 `user/message`。
+- 除 `create` 外，每个变更都携带客户端看到的 `{id,revision}`；Host 返回
+  `GOAL_STALE_REVISION` 时客户端必须重拉，不能自动覆盖。
+- `block` 不属于手机人类操作；模型/策略负责 blocked。
+- 完成与清除必须在手机端二次确认。
+- `activation` 是进程内状态，不持久；读不到就省略/`null`，不得显示“自动续跑中”。
+- **轮次**（`roundsStarted`/`maxGoalRounds`）由 Agent 的自动续跑驱动，**手机端不编辑轮次**
+  （`session.goalAction` 的 `maxGoalRounds` 只在 `edit` 时可选提交，客户端一般不提交）；
+  轮次推进通过 `session.goalChanged{operation:"round"}` 推送（v1.3.1）。
 
 ## 6. Push Kit（华为推送）旁路
 

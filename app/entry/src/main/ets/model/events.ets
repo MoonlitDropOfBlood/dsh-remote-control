@@ -31,6 +31,18 @@ export const EVT_QUESTION_ARRIVED: string = 'dshrc/question/arrived';
 export const EVT_QUESTION_RESOLVED: string = 'dshrc/question/resolved';
 /** 推送点击待导航目标（载荷：sessionId, askId；粘性——Index 晚挂载时补收）。 */
 export const EVT_PENDING_NAV: string = 'dshrc/nav/pending';
+/**
+ * 会话状态快照变化（载荷：sessionId；sessionId 为空串 = 全体会话）。
+ *
+ * 覆盖：待答交互（提问 / 审批卡片增删）、排队消息表、Todo 清单、目标（Goal）。
+ *
+ * 为什么需要它：这些数据在 store 里是 **Map + 版本号**（Map 不是可观察对象），
+ * 页面若只在 build 里「读一次版本号」并不会建立真正的渲染依赖——真机上表现为
+ * 「排队消息残留不消失」「回前台后提问卡不弹出」「目标操作后不刷新」。
+ * ⇒ 统一由 store 在数据变化时广播本事件，页面收到后把快照搬进**自己的 @Local**，
+ * 页面状态变化一定会触发重渲染（V2 最基本机制），不再依赖跨对象的观察依赖。
+ */
+export const EVT_SESSION_STATE_CHANGED: string = 'dshrc/session/state';
 
 /** 广播链路状态变化（link.ets setState 内调用；粘性补收最近一次）。 */
 export function postLinkState(state: string): void {
@@ -73,4 +85,9 @@ export function postQuestionResolved(askId: string): void {
  */
 export function postPendingNav(sessionId: string, askId: string): void {
   EventPost.getDefault().postStick(EVT_PENDING_NAV, sessionId, askId);
+}
+
+/** 广播会话状态快照变化（待答交互 / 排队 / Todo / Goal）。 */
+export function postSessionStateChanged(sessionId: string): void {
+  EventPost.getDefault().postNormal(EVT_SESSION_STATE_CHANGED, sessionId);
 }

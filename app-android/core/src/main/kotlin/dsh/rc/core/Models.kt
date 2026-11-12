@@ -4,6 +4,8 @@
  *
  * 与 HarmonyOS 版 app/entry/src/main/ets/model/protocol.ets 的 Dshrc* 接口一一对应，
  * 字段语义逐字对齐契约（含各版本注记里的「旧插件缺省 → 安全缺省」规则）。
+ *
+ * v1.3.0 增补：§5.12 待答交互 / §5.13 Todo / §5.14 Goal。
  */
 package dsh.rc.core
 
@@ -128,7 +130,13 @@ data class ChatMessage(
     /** 消息内图片（旧插件不返 → 空列表）。 */
     val images: List<ImageRef> = emptyList(),
     /** 消息内文件（旧插件不返 → 空列表）。 */
-    val files: List<FileRef> = emptyList()
+    val files: List<FileRef> = emptyList(),
+    /**
+     * v1.3.1（契约 §5.3）：**唤醒消息**的触发来源（宿主自动唤醒回合，不是用户手打）。
+     * goal / agent / team / subagent / webhook / schedule / job / plugin。
+     * 非空时 text 为空串（注入正文被隐藏），UI 渲染成触发卡（如「继续执行目标」）。
+     */
+    val trigger: String = ""
 ) {
     companion object {
         fun fromJson(o: JsonObject): ChatMessage = ChatMessage(
@@ -140,7 +148,8 @@ data class ChatMessage(
             images = o.arrOrNull("images")?.mapNotNull { (it as? JsonObject)?.let(ImageRef::fromJson) }
                 ?: emptyList(),
             files = o.arrOrNull("files")?.mapNotNull { (it as? JsonObject)?.let(FileRef::fromJson) }
-                ?: emptyList()
+                ?: emptyList(),
+            trigger = o.str("trigger")
         )
     }
 }
@@ -286,6 +295,42 @@ data class AttachmentCaps(
     }
 }
 
+/** Todo 能力标记（契约 §5.1 v1.3.0 capabilities.todos）。缺省 = 旧宿主不支持。 */
+data class TodoCaps(val supported: Boolean) {
+    companion object {
+        fun fromJson(o: JsonObject) = TodoCaps(supported = o.bool("supported"))
+    }
+}
+
+/** Goal 能力目录（契约 §5.1 v1.3.0 capabilities.goal）：read + 可执行的人类操作子集。 */
+data class GoalCaps(
+    val read: Boolean,
+    val actions: List<String>
+) {
+    companion object {
+        fun fromJson(o: JsonObject) = GoalCaps(
+            read = o.bool("read"),
+            actions = o.strList("actions")
+        )
+    }
+}
+
+/** 待答交互能力标记（契约 §5.1 v1.3.0 capabilities.pendingInteractions）。 */
+data class PendingInteractionsCaps(
+    val questions: Boolean,
+    val approvals: Boolean,
+    /** 宿主是否支持「窗口结束后继续补答」。 */
+    val hostContinued: Boolean
+) {
+    companion object {
+        fun fromJson(o: JsonObject) = PendingInteractionsCaps(
+            questions = o.bool("questions"),
+            approvals = o.bool("approvals"),
+            hostContinued = o.bool("hostContinued")
+        )
+    }
+}
+
 /** session.capabilities 响应（契约 §5.8）。 */
 data class Capabilities(
     val presets: List<ModeOption>,
@@ -298,7 +343,13 @@ data class Capabilities(
     /** 宿主「繁忙时的发送行为」——**只读**（契约 §5.1 v1.1.2）。 */
     val busyEnter: String,
     /** 附件能力目录；**null = 宿主不支持**（隐藏附件入口，不得报错）。 */
-    val attachments: AttachmentCaps? = null
+    val attachments: AttachmentCaps? = null,
+    /** Todo 能力；**null = 宿主不支持**（隐藏清单入口，不得报错）。 */
+    val todos: TodoCaps? = null,
+    /** Goal 能力；**null = 宿主不支持**（隐藏目标入口，不得报错）。 */
+    val goal: GoalCaps? = null,
+    /** 待答交互能力；**null = 宿主不支持**（旧插件只有一次性事件）。 */
+    val pendingInteractions: PendingInteractionsCaps? = null
 ) {
     companion object {
         fun fromJson(o: JsonObject): Capabilities = Capabilities(
@@ -313,7 +364,10 @@ data class Capabilities(
             defaultModelId = o.str("defaultModelId"),
             archiveSupported = o.bool("archiveSupported"),
             busyEnter = if (o.str("busyEnter") == Protocol.MODE_STEER) Protocol.MODE_STEER else Protocol.MODE_QUEUE,
-            attachments = o.objOrNull("attachments")?.let(AttachmentCaps::fromJson)
+            attachments = o.objOrNull("attachments")?.let(AttachmentCaps::fromJson),
+            todos = o.objOrNull("todos")?.let(TodoCaps::fromJson),
+            goal = o.objOrNull("goal")?.let(GoalCaps::fromJson),
+            pendingInteractions = o.objOrNull("pendingInteractions")?.let(PendingInteractionsCaps::fromJson)
         )
     }
 }
@@ -391,7 +445,13 @@ data class ApprovalRequest(
     val toolName: String,
     val reason: String,
     val argsPreview: String,
-    val timeoutMs: Long
+    val timeoutMs: Long,
+    /** v1.3.0（契约 §5.12）：false = 已失效，**不得**显示可编辑卡。 */
+    val answerable: Boolean = true,
+    /** v1.3.0（契约 §5.12）：绝对过期时间（Unix 毫秒）；null = 无限期 / 未给。 */
+    val expiresAt: Long? = null,
+    /** v1.3.0（契约 §5.12）：来源（plugin | host）。 */
+    val source: String = Protocol.PENDING_SOURCE_PLUGIN
 ) {
     companion object {
         fun fromJson(o: JsonObject) = ApprovalRequest(
@@ -400,28 +460,311 @@ data class ApprovalRequest(
             toolName = o.str("toolName"),
             reason = o.str("reason"),
             argsPreview = o.str("argsPreview"),
-            timeoutMs = o.long("timeoutMs")
+            timeoutMs = o.long("timeoutMs"),
+            answerable = o.bool("answerable", true),
+            expiresAt = o.longOrNull("expiresAt"),
+            source = o.str("source", Protocol.PENDING_SOURCE_PLUGIN)
         )
     }
 }
 
-/** question.request（契约 §5.2）。 */
+/**
+ * question.request（契约 §5.2）。
+ *
+ * v1.3.0（契约 §5.12）增补四个字段：
+ *  - `state` = open（手机独占窗口内）| continued（窗口结束但**仍可补答**）；
+ *  - `callId` = Host callId（手机与电脑共用同一个，两端回答后互相同步关闭）；
+ *  - `expiresAt` = 绝对过期时间（Unix 毫秒；恢复卡按剩余时间显示）；
+ *  - `answerable` = false 时不得显示可编辑卡。
+ */
 data class QuestionRequest(
     val askId: String,
     val sessionId: String,
     val questions: List<Question>,
     val timeoutMs: Long,
-    val multiSelect: Boolean
+    val multiSelect: Boolean,
+    /** v1.3.0：状态（open | continued）。 */
+    val state: String = Protocol.PENDING_STATE_OPEN,
+    /** v1.3.0：Host callId（可空 = 旧插件没给）。 */
+    val callId: String = "",
+    /** v1.3.0：绝对过期时间（Unix 毫秒；null = 无限期 / continued）。 */
+    val expiresAt: Long? = null,
+    /** v1.3.0：是否仍可应答。 */
+    val answerable: Boolean = true,
+    /** v1.3.0：来源（plugin | host）。 */
+    val source: String = Protocol.PENDING_SOURCE_PLUGIN
 ) {
+    /** v1.3.0：等待窗口已结束但仍可补答（契约 §5.12 不变量 2）。 */
+    val isContinued: Boolean get() = state == Protocol.PENDING_STATE_CONTINUED
+
     companion object {
         fun fromJson(o: JsonObject) = QuestionRequest(
             askId = o.str("askId"),
             sessionId = o.str("sessionId"),
-            questions = o.arrOrNull("questions")?.mapNotNull { (it as? JsonObject)?.let(Question::fromJson) }
+            questions = o.arrOrNull("questions")
+                ?.mapNotNull { (it as? JsonObject)?.let(Question::fromJson) }
                 ?: emptyList(),
+            timeoutMs = o.long("timeoutMs"),
+            multiSelect = o.bool("multiSelect"),
+            state = o.str("state", Protocol.PENDING_STATE_OPEN),
+            callId = o.str("callId"),
+            expiresAt = o.longOrNull("expiresAt"),
+            answerable = o.bool("answerable", true),
+            source = o.str("source", Protocol.PENDING_SOURCE_PLUGIN)
+        )
+    }
+}
+
+// ---- §5.12 待答交互快照（v1.3.0） ----
+
+/**
+ * 待答问题快照项（契约 §5.12 PendingQuestion）。
+ *
+ * 快照是**只读恢复通道**：读取失败必须回空数组，绝不能等待、阻塞或改动瀑布。
+ */
+data class PendingQuestion(
+    val askId: String,
+    val sessionId: String,
+    /** Host callId（手机与电脑共用同一个）；没有时为空串。 */
+    val callId: String,
+    val questions: List<Question>,
+    /** "open" | "continued"。 */
+    val state: String,
+    /** false = 不得显示可编辑卡（契约 §5.12 不变量 5）。 */
+    val answerable: Boolean,
+    /** "plugin" | "host"。 */
+    val source: String,
+    /** 绝对过期时间（Unix 毫秒）；null = 无限期 / continued。 */
+    val expiresAt: Long?,
+    /** 兼容旧客户端；可缺省。 */
+    val timeoutMs: Long,
+    val multiSelect: Boolean
+) {
+    /** 转成卡片模型（UI 侧统一用 QuestionRequest 渲染）。 */
+    fun toQuestionRequest(): QuestionRequest = QuestionRequest(
+        askId = askId,
+        sessionId = sessionId,
+        questions = questions,
+        timeoutMs = timeoutMs,
+        multiSelect = multiSelect,
+        state = state,
+        callId = callId,
+        expiresAt = expiresAt,
+        answerable = answerable,
+        source = source
+    )
+
+    companion object {
+        fun fromJson(o: JsonObject) = PendingQuestion(
+            askId = o.str("askId"),
+            sessionId = o.str("sessionId"),
+            callId = o.str("callId"),
+            questions = o.arrOrNull("questions")
+                ?.mapNotNull { (it as? JsonObject)?.let(Question::fromJson) }
+                ?: emptyList(),
+            state = o.str("state", Protocol.PENDING_STATE_OPEN),
+            answerable = o.bool("answerable", true),
+            source = o.str("source", Protocol.PENDING_SOURCE_PLUGIN),
+            expiresAt = o.longOrNull("expiresAt"),
             timeoutMs = o.long("timeoutMs"),
             multiSelect = o.bool("multiSelect")
         )
+    }
+}
+
+/** 待答审批快照项（契约 §5.12 PendingApproval）。 */
+data class PendingApproval(
+    val askId: String,
+    val sessionId: String,
+    val toolName: String,
+    val reason: String,
+    val argsPreview: String,
+    /** false = 不得显示可编辑卡（超时后仍按 fail-open 交给桌面）。 */
+    val answerable: Boolean,
+    /** "plugin" | "host"。 */
+    val source: String,
+    /** 绝对过期时间（Unix 毫秒）；null = 无限期。 */
+    val expiresAt: Long?
+) {
+    /** 转成卡片模型（UI 侧统一用 ApprovalRequest 渲染）。 */
+    fun toApprovalRequest(timeoutMs: Long = 0L): ApprovalRequest = ApprovalRequest(
+        askId = askId,
+        sessionId = sessionId,
+        toolName = toolName,
+        reason = reason,
+        argsPreview = argsPreview,
+        timeoutMs = timeoutMs,
+        answerable = answerable,
+        expiresAt = expiresAt,
+        source = source
+    )
+
+    companion object {
+        fun fromJson(o: JsonObject) = PendingApproval(
+            askId = o.str("askId"),
+            sessionId = o.str("sessionId"),
+            toolName = o.str("toolName"),
+            reason = o.str("reason"),
+            argsPreview = o.str("argsPreview"),
+            answerable = o.bool("answerable", true),
+            source = o.str("source", Protocol.PENDING_SOURCE_PLUGIN),
+            expiresAt = o.longOrNull("expiresAt")
+        )
+    }
+}
+
+// ---- §5.13 Todo（v1.3.0） ----
+
+/**
+ * Todo 清单项（契约 §5.13）：`status` = pending | in_progress | completed。
+ *
+ * 数据源只有 Host `todos` 持久投影 / `todo/write` 会话事件；手机**只读**。
+ */
+data class TodoItem(
+    val content: String,
+    val status: String
+) {
+    val isPending: Boolean get() = status == Protocol.TODO_STATUS_PENDING
+    val isInProgress: Boolean get() = status == Protocol.TODO_STATUS_IN_PROGRESS
+    val isCompleted: Boolean get() = status == Protocol.TODO_STATUS_COMPLETED
+
+    companion object {
+        fun fromJson(o: JsonObject) = TodoItem(
+            content = o.str("content"),
+            status = o.str("status", Protocol.TODO_STATUS_PENDING)
+        )
+    }
+}
+
+/**
+ * Todo 快照（契约 §5.13）。
+ *
+ * **`supported` 与 `todos == null` 必须区分**：
+ *  - `supported == false` → 宿主未提供该能力 → **隐藏 UI**；
+ *  - `supported == true && todos == null` → 本回合尚无清单 / 已清空 → 显示「暂无任务」。
+ */
+data class TodoState(
+    val supported: Boolean,
+    val todos: List<TodoItem>?
+) {
+    /** 是否有清单项（null 与空列表都算没有）。 */
+    val hasTodos: Boolean get() = !todos.isNullOrEmpty()
+
+    /** 已完成条数。 */
+    val completedCount: Int get() = todos?.count { it.isCompleted } ?: 0
+
+    /** 进行中条数。 */
+    val inProgressCount: Int get() = todos?.count { it.isInProgress } ?: 0
+
+    /** 待办条数。 */
+    val pendingCount: Int get() = todos?.count { it.isPending } ?: 0
+
+    companion object {
+        fun fromJson(o: JsonObject) = TodoState(
+            supported = o.bool("supported", true),
+            todos = o.arrOrNull("todos")?.mapNotNull { (it as? JsonObject)?.let(TodoItem::fromJson) }
+        )
+    }
+}
+
+// ---- §5.14 Goal（v1.3.0） ----
+
+/** Goal 被阻塞时的原因（契约 §5.14；仅 blocked 阶段有）。 */
+data class GoalBlockedReason(
+    val code: String,
+    val message: String
+) {
+    companion object {
+        fun fromJson(o: JsonObject) = GoalBlockedReason(o.str("code"), o.str("message"))
+    }
+}
+
+/**
+ * Goal 目标（契约 §5.14 GoalWire）。
+ *
+ * `id` + `revision` 是 Host CAS 的凭据：除 create 外的每个变更都要带上手机当前看到的
+ * `{id, revision}`，陈旧 revision 回 `GOAL_STALE_REVISION`（客户端必须重拉，不得覆盖）。
+ *
+ * `activation` 是**进程内**状态、不持久；读不到就是 null（不得显示「自动续跑中」）。
+ */
+data class GoalWire(
+    val id: String,
+    val revision: Long,
+    val objective: String,
+    /** "active" | "paused" | "blocked" | "complete"。 */
+    val phase: String,
+    val blockedReason: GoalBlockedReason?,
+    val maxGoalRounds: Int,
+    val roundsStarted: Int,
+    val createdAt: Long,
+    val updatedAt: Long,
+    /** "armed" | "disarmed" | null（未知）。 */
+    val activation: String? = null
+) {
+    val isActive: Boolean get() = phase == Protocol.GOAL_PHASE_ACTIVE
+    val isPaused: Boolean get() = phase == Protocol.GOAL_PHASE_PAUSED
+    val isBlocked: Boolean get() = phase == Protocol.GOAL_PHASE_BLOCKED
+    val isComplete: Boolean get() = phase == Protocol.GOAL_PHASE_COMPLETE
+
+    /** 已武装（自动续跑中）；**读不到时必须为 false**（不得谎称「自动续跑中」）。 */
+    val isArmed: Boolean get() = activation == Protocol.GOAL_ACTIVATION_ARMED
+
+    companion object {
+        fun fromJson(o: JsonObject) = GoalWire(
+            id = o.str("id"),
+            revision = o.long("revision"),
+            objective = o.str("objective"),
+            phase = o.str("phase", Protocol.GOAL_PHASE_ACTIVE),
+            blockedReason = o.objOrNull("blockedReason")?.let(GoalBlockedReason::fromJson),
+            maxGoalRounds = o.int("maxGoalRounds"),
+            roundsStarted = o.int("roundsStarted"),
+            createdAt = o.long("createdAt"),
+            updatedAt = o.long("updatedAt"),
+            activation = o.strOrNull("activation")?.takeIf { it.isNotEmpty() }
+        )
+    }
+}
+
+/**
+ * Goal 续跑激活态（契约 §5.2 `session.goalActivationChanged` 的载荷）。
+ *
+ * 事件只在**进程内**触发，不持久；无当前目标时宿主不会发。
+ */
+data class GoalActivation(
+    val id: String,
+    val revision: Long,
+    /** "armed" | "disarmed"。 */
+    val activation: String
+) {
+    companion object {
+        fun fromJson(o: JsonObject) = GoalActivation(
+            id = o.str("id"),
+            revision = o.long("revision"),
+            activation = o.str("activation")
+        )
+    }
+}
+
+/**
+ * Goal 人类操作（契约 §5.14 GoalAction）。
+ *
+ * 手机只能调用 Host 人类面 `ctx.goals`；**禁止** `block`（属于模型 / 策略）。
+ * 除 [CREATE] 外每个操作都要带 `{id, revision}` 做 Host CAS。
+ */
+enum class GoalAction(val wire: String) {
+    CREATE(Protocol.GOAL_ACTION_CREATE),
+    EDIT(Protocol.GOAL_ACTION_EDIT),
+    PAUSE(Protocol.GOAL_ACTION_PAUSE),
+    RESUME(Protocol.GOAL_ACTION_RESUME),
+    COMPLETE(Protocol.GOAL_ACTION_COMPLETE),
+    CLEAR(Protocol.GOAL_ACTION_CLEAR);
+
+    /** 是否必须带 expected{id, revision}（create 不带）。 */
+    val requiresExpected: Boolean get() = this != CREATE
+
+    companion object {
+        /** wire 文本 → 操作；未知文本返回 null（旧宿主给的动作不认）。 */
+        fun fromWire(wire: String): GoalAction? = entries.firstOrNull { it.wire == wire }
     }
 }
 

@@ -135,7 +135,10 @@ export async function exportLogs(): Promise<DshrcLogFile[]> {
   }
   try {
     Logan.flush();
-    const info: Map<string, number> = await Logan.getAllFilesInfo();
+    // 三方库 linter 把 getAllFilesInfo() 推断成非 Promise（实际返回 Promise<Map>）；
+    // 先显式赋给 Promise 变量，既满足真实类型，也避免 await-thenable 误报。
+    const infoPromise: Promise<Map<string, number>> = Logan.getAllFilesInfo();
+    const info: Map<string, number> = await infoPromise;
     const out: DshrcLogFile[] = [];
     info.forEach((size: number, name: string): void => {
       out.push({ name: name, path: logDir + '/' + name, size: size });

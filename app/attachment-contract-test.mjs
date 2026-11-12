@@ -217,7 +217,8 @@ const newPage = read('./entry/src/main/ets/pages/NewSessionPage.ets');
 const timeline = read('./entry/src/main/ets/pages/TimelineView.ets');
 
 // protocol：版本 + 四个请求 + 类型
-assert.match(protocol, /CONTRACT_VERSION: string = 'v1\.2\.0'/);
+// v1.3.0 起契约版本升到 v1.3.0（§5.12/§5.13/§5.14）；附件协议本身（§5.11）未变。
+assert.match(protocol, /CONTRACT_VERSION: string = 'v1\.3\.1'/);
 assert.match(protocol, /MSG_UPLOAD_BEGIN: string = 'attachment\.upload\.begin'/);
 assert.match(protocol, /MSG_UPLOAD_CHUNK: string = 'attachment\.upload\.chunk'/);
 assert.match(protocol, /MSG_UPLOAD_COMMIT: string = 'attachment\.upload\.commit'/);

@@ -443,6 +443,582 @@ async function v120AttachmentLoopbackCase() {
 }
 
 /**
+ * v1.3.0（契约 §5.12 / §5.13 / §5.14）：待答交互 / Todo / Goal。
+ * 进程内回环 + mock host（不碰真实 channel / 真实中继）。
+ *
+ * 覆盖：
+ *   - session.queue 权威快照（按 itemId 出队、空快照=清空）；
+ *   - pending.interactions 恢复合并（live plugin pending + host continued）；
+ *   - question.request 新字段 / question.answer 的 live 与 continued 路由；
+ *   - timeout 不清 continued 卡片（随后以 continued 重发）；
+ *   - todo 的 null（无清单）vs unsupported（宿主无该能力）；
+ *   - goal CAS（陈旧 revision → GOAL_STALE_REVISION）与各人类操作；
+ *   - goalChanged / goalActivationChanged / todosChanged 事件；
+ *   - 子代理会话与根会话的差异。
+ */
+async function v130LoopbackCase() {
+  console.log("");
+  console.log("--- v1.3.0 pending/todo/goal case (loopback + mock host) ---");
+  const wire = { channel: "E2ELOOPBACKCHANEL", secret: "e2e-v130-loopback-secret-0123456789" };
+  const seen = []; // 手机端收到的事件
+  let mock = null;
+  const { host, client } = createLoopbackPair({
+    channel: wire.channel,
+    secret: wire.secret,
+    onHostMessage: (m) => {
+      void mock.handle(m).catch((e) => console.error("[mock] handler error:", e));
+    },
+    onClientMessage: (m) => {
+      if (m.type === "event") seen.push(m.payload);
+    },
+  });
+  mock = createMockHost({ link: host, log: () => {} });
+
+  // ---- 0. hello 声明能力（v1.3.0：hello.features = ["session-state-v1"]）------------
+  const hello = await client.request(
+    "hello",
+    { proto: 1, clientName: "auto-test", appVersion: "1.0.0", features: ["session-state-v1"] },
+    5000,
+  );
+  check("hello 正常回包", typeof hello?.hostName === "string", JSON.stringify(hello));
+  check(
+    "mock 记录了客户端声明的 features（§5.12 不变量 6）",
+    mock.clientFeatures.has("session-state-v1"),
+    JSON.stringify([...mock.clientFeatures]),
+  );
+
+  // ---- 1. capabilities 新字段（§5.1）------------------------------------------------
+  const caps = await client.request("session.capabilities", {}, 5000);
+  check("capabilities.todos 能力目录", caps?.todos?.supported === true, JSON.stringify(caps?.todos));
+  check(
+    "capabilities.goal 能力目录（read + 6 个动作，且不含 block）",
+    caps?.goal?.read === true &&
+      Array.isArray(caps.goal.actions) &&
+      caps.goal.actions.length === 6 &&
+      !caps.goal.actions.includes("block"),
+    JSON.stringify(caps?.goal),
+  );
+  check(
+    "capabilities.pendingInteractions 能力目录",
+    caps?.pendingInteractions?.questions === true &&
+      caps?.pendingInteractions?.approvals === true &&
+      caps?.pendingInteractions?.hostContinued === true,
+    JSON.stringify(caps?.pendingInteractions),
+  );
+
+  const created = await client.request("session.create", { title: "e2e-v130" }, 5000);
+  check("create 会话成功", typeof created?.sessionId === "string", JSON.stringify(created));
+  const sid = created.sessionId;
+  const s = mock.sessions.get(sid);
+
+  // ---- 2. session.queue 权威快照（§5.1 v1.3.0 权威口径）------------------------------
+  mock.enqueue(s, { itemId: "msg-a", text: "排队 A", target: "next-turn" });
+  mock.enqueue(s, { itemId: "msg-b", text: "排队 B", target: "next-step" });
+  let queue = await client.request("session.queue", { sessionId: sid }, 5000);
+  check(
+    "session.queue 回权威快照（以 itemId 为主键）",
+    queue?.items?.length === 2 && queue.items[0].itemId === "msg-a" && queue.items[1].itemId === "msg-b",
+    JSON.stringify(queue),
+  );
+  check(
+    "session.queue 项字段 itemId/text/target 齐全",
+    (queue?.items ?? []).every(
+      (i) =>
+        typeof i.itemId === "string" &&
+        typeof i.text === "string" &&
+        ["next-turn", "next-step"].includes(i.target),
+    ),
+    JSON.stringify(queue?.items),
+  );
+  mock.consume(s, "msg-a");
+  queue = await client.request("session.queue", { sessionId: sid }, 5000);
+  check(
+    "session.queue 按 itemId 精确出队（只删那一条）",
+    queue?.items?.length === 1 && queue.items[0].itemId === "msg-b",
+    JSON.stringify(queue),
+  );
+  mock.clearQueue(s);
+  queue = await client.request("session.queue", { sessionId: sid }, 5000);
+  check(
+    "空 session.queue 清除（items=[]，客户端必须清空排队列表）",
+    Array.isArray(queue?.items) && queue.items.length === 0,
+    JSON.stringify(queue),
+  );
+  const queueEvents = seen.filter((e) => e.topic === "session.queue");
+  check(
+    "session.queue 事件最后一帧也是权威空快照",
+    queueEvents.length >= 3 &&
+      Array.isArray(queueEvents[queueEvents.length - 1]?.data?.items) &&
+      queueEvents[queueEvents.length - 1].data.items.length === 0,
+    JSON.stringify(queueEvents.map((e) => (e.data?.items ?? []).length)),
+  );
+
+  // ---- 3. 待答恢复合并（§5.12）------------------------------------------------------
+  const liveAskId = mock.openPluginQuestion(s, {
+    callId: "call-v130-live",
+    hostBacked: true,
+    questions: [
+      { id: "q1", question: "继续吗？", multiSelect: false, options: [{ label: "继续", description: "" }] },
+    ],
+  });
+  const continuedAskId = mock.openHostQuestion(s, {
+    callId: "call-v130-cont",
+    state: "continued",
+    questions: [
+      { id: "q2", question: "补答", multiSelect: false, options: [{ label: "好", description: "" }] },
+    ],
+  });
+  const pending = await client.request("pending.interactions", { sessionId: sid }, 5000);
+  check(
+    "pending 快照合并 live plugin pending + host continued",
+    pending?.questions?.length === 2,
+    JSON.stringify(pending),
+  );
+  const liveRow = pending.questions.find((q) => q.askId === liveAskId);
+  const contRow = pending.questions.find((q) => q.askId === continuedAskId);
+  check(
+    "pending live 行 source=plugin/state=open/answerable=true",
+    liveRow?.source === "plugin" && liveRow?.state === "open" && liveRow?.answerable === true,
+    JSON.stringify(liveRow),
+  );
+  check(
+    "pending continued 行 source=host/state=continued/answerable=true",
+    contRow?.source === "host" && contRow?.state === "continued" && contRow?.answerable === true,
+    JSON.stringify(contRow),
+  );
+  check(
+    "pending 行带 callId 与 questions",
+    liveRow?.callId === "call-v130-live" &&
+      Array.isArray(liveRow?.questions) &&
+      liveRow.questions.length === 1 &&
+      liveRow.questions[0]?.id === "q1",
+    JSON.stringify(liveRow),
+  );
+  check(
+    "pending 含 approvals 数组（审批与提问共用同一快照通道）",
+    Array.isArray(pending?.approvals),
+    JSON.stringify(pending),
+  );
+  const globalPending = await client.request("pending.interactions", {}, 5000);
+  check(
+    "pending 不带 sessionId 只回插件持有的全局待答（不做全量冷读）",
+    globalPending?.questions?.length === 1 && globalPending.questions[0].askId === liveAskId,
+    JSON.stringify(globalPending),
+  );
+
+  // ---- 4. question.request 新字段（§5.2）---------------------------------------------
+  const reqEvent = seen
+    .filter((e) => e.topic === "question.request" && e.data?.askId === liveAskId)
+    .pop()?.data;
+  check(
+    "question.request 带 askId/callId/state/answerable/expiresAt",
+    reqEvent?.askId === liveAskId &&
+      reqEvent?.callId === "call-v130-live" &&
+      reqEvent?.state === "open" &&
+      reqEvent?.answerable === true &&
+      Number.isSafeInteger(reqEvent?.expiresAt),
+    JSON.stringify(reqEvent),
+  );
+  const contEvent = seen
+    .filter((e) => e.topic === "question.request" && e.data?.askId === continuedAskId)
+    .pop()?.data;
+  check(
+    "question.request（host continued）state=continued/answerable=true",
+    contEvent?.state === "continued" && contEvent?.answerable === true,
+    JSON.stringify(contEvent),
+  );
+
+  // ---- 5. question.answer 路由：live / continued（§5.1 / §5.12）--------------------
+  const contAns = await client.request(
+    "question.answer",
+    { askId: continuedAskId, answers: { q2: "好" } },
+    5000,
+  );
+  check("continued 补答 applied=true", contAns?.applied === true, JSON.stringify(contAns));
+  const afterCont = await client.request("pending.interactions", { sessionId: sid }, 5000);
+  check(
+    "补答后 continued 从快照消失",
+    (afterCont?.questions ?? []).every((q) => q.askId !== continuedAskId),
+    JSON.stringify(afterCont),
+  );
+  const contAns2 = await client.request(
+    "question.answer",
+    { askId: continuedAskId, answers: { q2: "好" } },
+    5000,
+  );
+  check(
+    "重复补答 applied=false（已失效或已由另一端处理）",
+    contAns2?.applied === false,
+    JSON.stringify(contAns2),
+  );
+  const liveAns = await client.request(
+    "question.answer",
+    { askId: liveAskId, answers: { q1: "继续" } },
+    5000,
+  );
+  check("live 补答 applied=true（走插件原瀑布）", liveAns?.applied === true, JSON.stringify(liveAns));
+  check(
+    "mock 记录的路由：live / continued 各自命中",
+    mock.lastAnswer?.route === "live" && mock.lastAnswer?.askId === liveAskId,
+    JSON.stringify(mock.lastAnswer),
+  );
+  let unknownAns = null;
+  try {
+    await client.request("question.answer", { askId: "no-such-ask", answers: { q1: "x" } }, 5000);
+  } catch (e) {
+    unknownAns = e;
+  }
+  check("未知 askId 回 applied=false（不报错，客户端随后重拉快照）", unknownAns === null, String(unknownAns));
+  let shapeErr = null;
+  try {
+    await client.request("question.answer", { askId: liveAskId, answers: "not-an-object" }, 5000);
+  } catch (e) {
+    shapeErr = e;
+  }
+  check(
+    "answers 非对象回 bad-answers",
+    shapeErr !== null && String(shapeErr).includes("bad-answers"),
+    String(shapeErr),
+  );
+
+  // ---- 6. timeout 不清 continued 卡片（§5.12 不变量 ② / ⑥）--------------------------
+  const timeoutAskId = mock.openPluginQuestion(s, {
+    callId: "call-v130-timeout",
+    hostBacked: true,
+    questions: [
+      { id: "q3", question: "超时？", multiSelect: false, options: [{ label: "是", description: "" }] },
+    ],
+  });
+  mock.timeoutQuestion(timeoutAskId);
+  const afterTimeout = await client.request("pending.interactions", { sessionId: sid }, 5000);
+  const kept = (afterTimeout?.questions ?? []).find((q) => q.askId === timeoutAskId);
+  check(
+    "timeout 后 continued 卡片仍在快照（不得删除）",
+    kept !== undefined && kept.state === "continued" && kept.answerable === true,
+    JSON.stringify(kept),
+  );
+  const republished = seen
+    .filter((e) => e.topic === "question.request" && e.data?.askId === timeoutAskId)
+    .pop()?.data;
+  check(
+    "timeout 后以 question.request{state:continued} 重发",
+    republished?.state === "continued" && republished?.answerable === true,
+    JSON.stringify(republished),
+  );
+  const timeoutResolved = seen.find(
+    (e) => e.topic === "question.resolved" && e.data?.askId === timeoutAskId,
+  );
+  check(
+    "声明 session-state-v1 的客户端：timeout 不发 resolved（卡片不得被删）",
+    timeoutResolved === undefined,
+    JSON.stringify(timeoutResolved?.data),
+  );
+
+  // ---- 6b. 旧客户端（未声明 session-state-v1）：保持旧语义 ---------------------------
+  // §5.12 不变量 6：旧客户端在 timed 超时时收 question.resolved，且**不得**收到
+  // question.request{state:"continued"} 重发（旧 UI 会重复建卡）。
+  const legacySeen = [];
+  let mockLegacy = null;
+  const { host: hostL, client: clientL } = createLoopbackPair({
+    channel: "E2ELOOPBACKCHANEL3",
+    secret: "e2e-v130-loopback-secret-0123456789",
+    onHostMessage: (m) => {
+      void mockLegacy.handle(m).catch((e) => console.error("[mockLegacy] handler error:", e));
+    },
+    onClientMessage: (m) => {
+      if (m.type === "event") legacySeen.push(m.payload);
+    },
+  });
+  mockLegacy = createMockHost({ link: hostL, log: () => {} });
+  await clientL.request("hello", { proto: 1, clientName: "legacy-phone", appVersion: "0.9.0" }, 5000);
+  const legacyCreated = await clientL.request("session.create", { title: "legacy" }, 5000);
+  const legacySession = mockLegacy.sessions.get(legacyCreated.sessionId);
+  const legacyAskId = mockLegacy.openPluginQuestion(legacySession, {
+    callId: "call-v130-legacy",
+    hostBacked: true,
+    questions: [
+      { id: "q9", question: "旧客户端问题", multiSelect: false, options: [{ label: "好", description: "" }] },
+    ],
+  });
+  mockLegacy.timeoutQuestion(legacyAskId);
+  // 回环投递走微任务队列 → 先让出一次事件循环再断言事件
+  await new Promise((r) => setTimeout(r, 50));
+  const legacyResolved = legacySeen.find(
+    (e) => e.topic === "question.resolved" && e.data?.askId === legacyAskId,
+  );
+  check(
+    "旧客户端：timed 超时收 question.resolved{source:timeout}（旧语义清卡）",
+    legacyResolved?.data?.source === "timeout",
+    JSON.stringify(legacyResolved?.data),
+  );
+  const legacyContinued = legacySeen.find(
+    (e) => e.topic === "question.request" && e.data?.askId === legacyAskId && e.data?.state === "continued",
+  );
+  check(
+    "旧客户端：不得收到 question.request{state:continued} 重发（避免重复建卡）",
+    legacyContinued === undefined,
+    JSON.stringify(legacyContinued?.data),
+  );
+  clientL.close();
+  hostL.close();
+
+  // ---- 6c. 审批与提问共用同一快照通道（§5.12 不变量 7）-----------------------------
+  const approvalAskId = mock.openPluginApproval(s, { toolName: "bash", reason: "跑一条命令" });
+  const withApproval = await client.request("pending.interactions", { sessionId: sid }, 5000);
+  const approvalRow = (withApproval?.approvals ?? []).find((a) => a.askId === approvalAskId);
+  check(
+    "待答审批出现在 pending 快照的 approvals[]（与提问同一通道）",
+    approvalRow !== undefined &&
+      approvalRow.source === "plugin" &&
+      approvalRow.answerable === true &&
+      Number.isSafeInteger(approvalRow.expiresAt),
+    JSON.stringify(withApproval?.approvals),
+  );
+  const approvalEvt = seen
+    .filter((e) => e.topic === "approval.request" && e.data?.askId === approvalAskId)
+    .pop()?.data;
+  check(
+    "approval.request 带 expiresAt（§5.2 v1.3.0）",
+    Number.isSafeInteger(approvalEvt?.expiresAt),
+    JSON.stringify(approvalEvt),
+  );
+  mock.pluginPending.delete(approvalAskId);
+
+  // ---- 7. Todo：null（无清单）vs unsupported（宿主无该能力）（§5.13）----------------
+  let todos = await client.request("session.todos", { sessionId: sid }, 5000);
+  check(
+    "todos supported=true 且 todos=null（本回合尚无清单）",
+    todos?.supported === true && todos?.todos === null,
+    JSON.stringify(todos),
+  );
+  mock.setTodos(s, [
+    { content: "读契约", status: "completed" },
+    { content: "写用例", status: "in_progress" },
+  ]);
+  todos = await client.request("session.todos", { sessionId: sid }, 5000);
+  check(
+    "todos 整表覆盖（2 条）",
+    todos?.todos?.length === 2 &&
+      todos.todos[0].content === "读契约" &&
+      todos.todos[0].status === "completed" &&
+      todos.todos[1].status === "in_progress",
+    JSON.stringify(todos),
+  );
+  const todosEvt = seen.filter((e) => e.topic === "session.todosChanged").pop()?.data;
+  check(
+    "session.todosChanged 事件整表到达",
+    todosEvt?.sessionId === sid && todosEvt?.todos?.length === 2,
+    JSON.stringify(todosEvt),
+  );
+  mock.setTodos(s, null);
+  todos = await client.request("session.todos", { sessionId: sid }, 5000);
+  check(
+    "turn/start 清清单 → todos=null（supported 仍为 true）",
+    todos?.supported === true && todos?.todos === null,
+    JSON.stringify(todos),
+  );
+
+  // 宿主不支持 todos：另起一个 mock（todosSupported:false）
+  let mock2 = null;
+  const { host: host2, client: client2 } = createLoopbackPair({
+    channel: "E2ELOOPBACKCHANEL2",
+    secret: "e2e-v130-loopback-secret-0123456789",
+    onHostMessage: (m) => {
+      void mock2.handle(m).catch((e) => console.error("[mock2] handler error:", e));
+    },
+    onClientMessage: () => {},
+  });
+  mock2 = createMockHost({ link: host2, log: () => {}, todosSupported: false });
+  const caps2 = await client2.request("session.capabilities", {}, 5000);
+  check(
+    "宿主不支持 todos → capabilities.todos.supported=false",
+    caps2?.todos?.supported === false,
+    JSON.stringify(caps2?.todos),
+  );
+  const created2 = await client2.request("session.create", { title: "e2e-v130-no-todo" }, 5000);
+  const todos2 = await client2.request("session.todos", { sessionId: created2.sessionId }, 5000);
+  check(
+    "unsupported 与 null 可区分（隐藏 UI vs 显示「暂无任务」）",
+    todos2?.supported === false && todos2?.todos === null,
+    JSON.stringify(todos2),
+  );
+  client2.close();
+  host2.close();
+
+  // ---- 8. Goal：CAS + 人类操作（§5.14）----------------------------------------------
+  const goalCreate = await client.request(
+    "session.goalAction",
+    { sessionId: sid, action: "create", objective: "完成 v1.3.0 的 e2e 覆盖" },
+    5000,
+  );
+  check(
+    "goal create 成功（phase=active/revision=1）",
+    goalCreate?.goal?.phase === "active" &&
+      goalCreate?.goal?.revision === 1 &&
+      typeof goalCreate.goal.id === "string",
+    JSON.stringify(goalCreate),
+  );
+  const goalRead = await client.request("session.goal", { sessionId: sid }, 5000);
+  check(
+    "session.goal 回 goal/activation/supported/actions",
+    goalRead?.goal?.id === goalCreate.goal.id &&
+      goalRead?.activation === "armed" &&
+      goalRead?.supported === true &&
+      goalRead?.actions?.length === 6,
+    JSON.stringify(goalRead),
+  );
+  check("session.goal 的 goal 带 activation（已知时）", goalRead?.goal?.activation === "armed", JSON.stringify(goalRead?.goal));
+
+  // 另一端改了目标 → revision 前进 → 客户端缓存的 expected 变陈旧
+  mock.bumpGoalRevision(s);
+  let staleErr = null;
+  try {
+    await client.request(
+      "session.goalAction",
+      { sessionId: sid, action: "pause", expected: { id: goalRead.goal.id, revision: goalRead.goal.revision } },
+      5000,
+    );
+  } catch (e) {
+    staleErr = e;
+  }
+  check(
+    "goal CAS：陈旧 revision 回 GOAL_STALE_REVISION",
+    staleErr !== null && String(staleErr).includes("GOAL_STALE_REVISION"),
+    String(staleErr),
+  );
+  const goalAfterStale = await client.request("session.goal", { sessionId: sid }, 5000);
+  check(
+    "陈旧操作未覆盖新状态（phase 仍是 active）",
+    goalAfterStale?.goal?.phase === "active",
+    JSON.stringify(goalAfterStale?.goal),
+  );
+  const paused = await client.request(
+    "session.goalAction",
+    { sessionId: sid, action: "pause", expected: { id: goalAfterStale.goal.id, revision: goalAfterStale.goal.revision } },
+    5000,
+  );
+  check(
+    "重拉后 pause 成功（phase=paused，revision 前进）",
+    paused?.goal?.phase === "paused" && paused.goal.revision > goalAfterStale.goal.revision,
+    JSON.stringify(paused),
+  );
+  const resumed = await client.request(
+    "session.goalAction",
+    { sessionId: sid, action: "resume", expected: { id: paused.goal.id, revision: paused.goal.revision } },
+    5000,
+  );
+  check("resume 成功（phase=active）", resumed?.goal?.phase === "active", JSON.stringify(resumed));
+  const edited = await client.request(
+    "session.goalAction",
+    {
+      sessionId: sid,
+      action: "edit",
+      expected: { id: resumed.goal.id, revision: resumed.goal.revision },
+      objective: "改过的目标",
+      maxGoalRounds: 20,
+    },
+    5000,
+  );
+  check(
+    "edit 成功（objective/maxGoalRounds 更新）",
+    edited?.goal?.objective === "改过的目标" && edited.goal.maxGoalRounds === 20,
+    JSON.stringify(edited),
+  );
+  const completed = await client.request(
+    "session.goalAction",
+    { sessionId: sid, action: "complete", expected: { id: edited.goal.id, revision: edited.goal.revision } },
+    5000,
+  );
+  check("complete 成功（phase=complete）", completed?.goal?.phase === "complete", JSON.stringify(completed));
+  const cleared = await client.request(
+    "session.goalAction",
+    { sessionId: sid, action: "clear", expected: { id: completed.goal.id, revision: completed.goal.revision } },
+    5000,
+  );
+  check("clear 成功（goal=null）", cleared?.goal === null, JSON.stringify(cleared));
+
+  const goalEvents = seen.filter((e) => e.topic === "session.goalChanged");
+  check(
+    "session.goalChanged 事件覆盖 create/edit/pause/resume/complete/clear",
+    ["create", "edit", "pause", "resume", "complete", "clear"].every((op) =>
+      goalEvents.some((e) => e.data?.operation === op),
+    ),
+    JSON.stringify(goalEvents.map((e) => e.data?.operation)),
+  );
+  const clearEvent = goalEvents.filter((e) => e.data?.operation === "clear").pop()?.data;
+  check("clear 事件的 goal 为 null", clearEvent?.goal === null, JSON.stringify(clearEvent));
+  check(
+    "goalChanged 载荷不含 activation（§5.2：不含 activation）",
+    goalEvents.every((e) => e.data?.goal === null || e.data.goal.activation === undefined),
+    JSON.stringify(goalEvents.map((e) => e.data?.goal?.activation)),
+  );
+  const actEvents = seen.filter((e) => e.topic === "session.goalActivationChanged");
+  check(
+    "session.goalActivationChanged 事件（armed/disarmed）到达",
+    actEvents.length >= 2 &&
+      actEvents.some((e) => e.data?.activation === "armed") &&
+      actEvents.some((e) => e.data?.activation === "disarmed"),
+    JSON.stringify(actEvents.map((e) => e.data?.activation)),
+  );
+  check(
+    "goalActivationChanged 带 id/revision",
+    actEvents.every((e) => typeof e.data?.id === "string" && Number.isSafeInteger(e.data?.revision)),
+    JSON.stringify(actEvents[0]?.data),
+  );
+  let blockErr = null;
+  try {
+    await client.request(
+      "session.goalAction",
+      { sessionId: sid, action: "block", expected: { id: "goal-x", revision: 1 } },
+      5000,
+    );
+  } catch (e) {
+    blockErr = e;
+  }
+  check("手机不得触发 block（§5.14）", blockErr !== null, String(blockErr));
+
+  // ---- 9. 子代理会话 vs 根会话（§5.3 / §5.13 / §5.14）-------------------------------
+  const list = await client.request("session.list", {}, 5000);
+  const listIds = (list?.sessions ?? []).map((x) => x.sessionId);
+  check(
+    "session.list 只列根会话（子代理不出现在列表，§5.3）",
+    !listIds.includes("s-demo-1:sub-1") && listIds.includes("s-demo-1"),
+    JSON.stringify(listIds),
+  );
+  const subs = await client.request("session.subagents", { sessionId: "s-demo-1" }, 5000);
+  check("session.subagents 目录仍含子代理（入口在父会话详情页）", subs?.subagents?.length === 2, JSON.stringify(subs));
+  const subTodos = await client.request("session.todos", { sessionId: "s-demo-1:sub-1" }, 5000);
+  check(
+    "子代理会话的 todo 独立于根会话（null ≠ 根会话的清单）",
+    subTodos?.supported === true && subTodos?.todos === null,
+    JSON.stringify(subTodos),
+  );
+  const subGoal = await client.request("session.goal", { sessionId: "s-demo-1:sub-1" }, 5000);
+  check(
+    "子代理会话无自己的 goal（null，但能力 supported=true）",
+    subGoal?.goal === null && subGoal?.supported === true,
+    JSON.stringify(subGoal),
+  );
+  const rootBefore = await client.request("session.goal", { sessionId: "s-demo-1" }, 5000);
+  const subGoalCreate = await client.request(
+    "session.goalAction",
+    { sessionId: "s-demo-1:sub-1", action: "create", objective: "子代理目标" },
+    5000,
+  );
+  check("子代理会话可独立建目标", subGoalCreate?.goal?.objective === "子代理目标", JSON.stringify(subGoalCreate));
+  const rootAfter = await client.request("session.goal", { sessionId: "s-demo-1" }, 5000);
+  check(
+    "子代理建目标不影响根会话",
+    (rootAfter?.goal?.id ?? null) === (rootBefore?.goal?.id ?? null),
+    JSON.stringify({ before: rootBefore?.goal, after: rootAfter?.goal }),
+  );
+
+  client.close();
+  host.close();
+  console.log("v1.3.0 pending/todo/goal loopback case: PASS");
+}
+
+/**
  * B. 真实宿主探针：宿主插件若已升级到 v1.0.6，capabilities/history 应带上新字段；
  *    仍是旧 bundle 时跳过（提示需要 remove_bundle + install_bundle）。
  */
@@ -694,6 +1270,7 @@ try {
     // 只跑回环用例：手机在线也安全（不连真实中继、不占真实 channel）
     await v106LoopbackCase();
     await v120AttachmentLoopbackCase();
+    await v130LoopbackCase();
     await v113ProofCase();
     await v113RelayCase();
     console.log("E2E RESULT: PASS (loopback only)");
@@ -738,6 +1315,7 @@ try {
   // 5. v1.0.6+ 新链路：自测回环（恒跑）+ 真实宿主探针（尽力而为）
   await v106LoopbackCase();
   await v120AttachmentLoopbackCase();
+  await v130LoopbackCase();
   await v113ProofCase();
   await v113RelayCase();
   await v106LiveProbe();

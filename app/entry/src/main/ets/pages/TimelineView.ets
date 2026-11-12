@@ -47,8 +47,7 @@ import {
   SP_2,
   SP_3,
   SP_4,
-  clockTime
-} from '../model/theme';
+  clockTime, RADIUS_PILL } from '../model/theme';
 import { StepCard } from './StepCard';
 
 /** 缩略图最大高度（vp）——契约 §5.10：等比、最大宽度撑满气泡、最大高度 ≤ 320vp。 */
@@ -472,9 +471,57 @@ export struct MessageBubble {
     }
   }
 
+  /** v1.3.1（§5.3）：唤醒消息的触发卡文案（与桌面端 message.trigger.* 同词条）。 */
+  private triggerLabel(): string {
+    const t: string = this.item.trigger;
+    if (t === 'goal') {
+      return '继续执行目标';
+    }
+    if (t === 'agent') {
+      return '收到任务消息';
+    }
+    if (t === 'team') {
+      return '收到团队消息';
+    }
+    if (t === 'subagent') {
+      return '子任务状态更新';
+    }
+    if (t === 'webhook') {
+      return '收到外部事件';
+    }
+    if (t === 'schedule') {
+      return '自动化任务';
+    }
+    if (t === 'job') {
+      return '后台任务状态更新';
+    }
+    if (t === 'plugin') {
+      return '插件状态更新';
+    }
+    return '收到执行请求';
+  }
+
   build() {
     Column() {
-      if (this.item.role === 'user') {
+      // v1.3.1（§5.3）：唤醒消息（Goal 轮次提示等）→ 触发卡，不画普通气泡、
+      // 也不显示注入的原始正文（与桌面端一致）。
+      if (this.item.trigger.length > 0) {
+        Row() {
+          SymbolGlyph($r('sys.symbol.lightbulb'))
+            .fontSize(14)
+            .fontColor([$r('app.color.label_tertiary')])
+          Text(this.triggerLabel())
+            .fontSize(FS_CAPTION)
+            .fontColor($r('app.color.label_secondary'))
+            .margin({ left: SP_2 })
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+        }
+        .padding({ left: SP_2, right: SP_2, top: SP_1, bottom: SP_1 })
+        .borderRadius(RADIUS_PILL)
+        .backgroundColor($r('app.color.bg_layer_2'))
+        .border({ width: HAIRLINE, color: $r('app.color.border_l1') })
+      } else if (this.item.role === 'user') {
         // 用户：右对齐品牌蓝气泡。Text 自身即气泡（padding/bg 挂 Text），
         // constraintSize 的百分比解析自外层 Row（定宽）——绝不把 width('100%')
         // 塞进自适应 Column（循环百分比 → 不换行 → 文字甩出气泡，真机实测 bug）。

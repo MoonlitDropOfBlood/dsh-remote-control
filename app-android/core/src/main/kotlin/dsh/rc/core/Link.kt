@@ -35,7 +35,9 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import okhttp3.OkHttpClient
@@ -106,6 +108,16 @@ class DshrcLink(
     companion object {
         private const val DEFAULT_REQ_TIMEOUT_MS = 15_000L
         private const val HOST_HELLO_TIMEOUT_MS = 15_000L
+
+        /** v1.3.0：待答交互快照（只读、绝不阻塞瀑布 → 超时给得比其他请求短）。 */
+        private const val PENDING_INTERACTIONS_TIMEOUT_MS = 10_000L
+
+        /** v1.3.0：Todo / Goal 快照超时。 */
+        private const val TODOS_TIMEOUT_MS = 15_000L
+        private const val GOAL_TIMEOUT_MS = 15_000L
+
+        /** v1.3.0：Goal 人类操作超时（宿主 CAS + 落盘）。 */
+        private const val GOAL_ACTION_TIMEOUT_MS = 20_000L
 
         /** 加固模式下连续 sid 不匹配达到该次数 → 重连自愈（契约 §3.4.1 钉扎语义）。 */
         private const val SID_MISMATCH_RECONNECT_THRESHOLD = 3
@@ -735,6 +747,10 @@ class DshrcLink(
     /**
      * 业务层 hello（契约 §5.1）：payload.sig 用 v1 证明串（旧插件互操作）；
      * v2 证明只用于**传输层** hello 帧。
+     *
+     * v1.3.0：带 `features: ["session-state-v1"]` → 插件对本客户端启用
+     * `pending.interactions` 快照 / Todo / Goal 与 `question.request{state:"continued"}`
+     * 的状态更新语义（契约 §5.12 不变量 6）。
      */
     private fun sendBusinessHello(generation: Long) {
         val key = this.key ?: return
@@ -744,6 +760,7 @@ class DshrcLink(
             put("proto", Protocol.PROTO_VERSION)
             put("clientName", cfg.clientName)
             put("appVersion", cfg.appVersion)
+            put("features", JsonArray(Protocol.CLIENT_FEATURES.map { JsonPrimitive(it) }))
             put("sig", sig)
         }
         scope.launch {
@@ -771,6 +788,35 @@ class DshrcLink(
         payload: JsonObject,
         timeoutMs: Long = DEFAULT_REQ_TIMEOUT_MS
     ): JsonObject = requestInternal(type, payload, timeoutMs, connectionGeneration)
+
+    // ---- v1.3.0 契约请求（§5.12 待答交互 / §5.13 Todo / §5.14 Goal） ----
+
+    /**
+     * 拉取待答交互快照（契约 §5.1 v1.3.0 `pending.interactions` / §5.12）。
+     *
+     * **只读恢复通道**：读失败由调用方按「回空数组」处理，绝不能阻塞瀑布（fail-open）。
+     * `sessionId` 缺省 = 只回插件仍持有的全局待答项（不做全量冷读）。
+     */
+    suspend fun requestPendingInteractions(sessionId: String? = null): JsonObject {
+        val payload = if (sessionId.isNullOrEmpty()) jsonOf() else jsonOf("sessionId" to sessionId)
+        return request(Protocol.MSG_PENDING_INTERACTIONS, payload, PENDING_INTERACTIONS_TIMEOUT_MS)
+    }
+
+    /** 拉取会话 Todo 快照（契约 §5.1 v1.3.0 `session.todos` / §5.13）。手机只读。 */
+    suspend fun requestSessionTodos(sessionId: String): JsonObject =
+        request(Protocol.MSG_SESSION_TODOS, jsonOf("sessionId" to sessionId), TODOS_TIMEOUT_MS)
+
+    /** 拉取会话 Goal 快照（契约 §5.1 v1.3.0 `session.goal` / §5.14）。 */
+    suspend fun requestSessionGoal(sessionId: String): JsonObject =
+        request(Protocol.MSG_SESSION_GOAL, jsonOf("sessionId" to sessionId), GOAL_TIMEOUT_MS)
+
+    /**
+     * 执行 Goal 人类操作（契约 §5.1 v1.3.0 `session.goalAction` / §5.14）。
+     *
+     * 载荷由 [buildGoalActionPayload] 组装（create 不带 expected，其余必带 `{id,revision}`）。
+     */
+    suspend fun requestSessionGoalAction(payload: JsonObject): JsonObject =
+        request(Protocol.MSG_SESSION_GOAL_ACTION, payload, GOAL_ACTION_TIMEOUT_MS)
 
     private suspend fun requestInternal(
         type: String,

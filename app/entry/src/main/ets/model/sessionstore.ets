@@ -21,7 +21,8 @@ import {
   postApprovalResolved,
   postPendingNav,
   postQuestionArrived,
-  postQuestionResolved
+  postQuestionResolved,
+  postSessionStateChanged
 } from './events';
 import { DshrcLink, DshrcHostInfo, LinkPeers, LinkState, dshrcLink } from './link';
 import {
@@ -37,6 +38,21 @@ import {
   hasTrailingSettledLiveProcess
 } from './timeline-reconcile';
 import { AttachmentCaps, normalizeAttachmentCaps } from './attachment-plan';
+import {
+  GoalRefShape,
+  PendingCardMeta,
+  PendingMergePlan,
+  QueueItemShape,
+  QueueTableResult,
+  TodoCounts,
+  TodoItemShape,
+  goalActionNeedsExpected,
+  goalRefOf,
+  planPendingMerge,
+  replaceQueueTable,
+  replaceTodoTable,
+  todoCounts
+} from './interaction-plan';
 import { DraftAttachment } from './attachments';
 import {
   DshrcMsg,
@@ -56,6 +72,15 @@ import {
   DshrcModelSelection,
   DshrcPermissionOption,
   DshrcStepRecord,
+  DshrcTodoItem,
+  DshrcTodosSnapshot,
+  DshrcGoalWire,
+  DshrcGoalSnapshot,
+  DshrcGoalAction,
+  DshrcGoalRef,
+  DshrcPendingQuestion,
+  DshrcPendingApproval,
+  DshrcPendingInteractions,
   DshrcValue,
   MSG_EVENT,
   MSG_IMAGE_FETCH,
@@ -71,11 +96,14 @@ import {
   TOPIC_SESSION_ACTIVITY,
   TOPIC_SESSION_ADDED,
   TOPIC_SESSION_ARCHIVES,
+  TOPIC_SESSION_GOAL_ACTIVATION_CHANGED,
+  TOPIC_SESSION_GOAL_CHANGED,
   TOPIC_SESSION_MODEL_CHANGED,
   TOPIC_SESSION_PERMISSION_CHANGED,
   TOPIC_SESSION_QUEUE,
   TOPIC_SESSION_REMOVED,
   TOPIC_SESSION_STATUS,
+  TOPIC_SESSION_TODOS_CHANGED,
   TOPIC_TOOL_CALL,
   TOPIC_TOOL_RESULT,
   TOPIC_TURN_END
@@ -239,6 +267,11 @@ export class TimelineItem {
   /** v1.2.0：消息内文件（契约 §5.11.4）——空数组 = 该消息没有文件。 */
   @Trace files: DshrcFileRef[] = [];
   /**
+   * v1.3.1（契约 §5.3）：唤醒消息的触发来源（goal/agent/team/…）。
+   * 非空 → 渲染成触发卡（如「继续执行目标」），不画普通气泡。
+   */
+  @Trace trigger: string = '';
+  /**
    * 折叠态（步骤分组 / 思考块共用）：状态**放在数据里**而不是组件 @Local——
    * 时间线是 List 懒加载 + 节点复用，组件内状态在复用时会串台/丢失；
    * 挂在 item 上随 @Param 绑定，复用/重建后展开状态天然恢复。
@@ -400,7 +433,7 @@ export function groupTimeline(items: TimelineItem[]): TimelineEntry[] {
   return out;
 }
 
-/** 一张待审批卡片（契约 §5.2 approval.request）。 */
+/** 一张待审批卡片（契约 §5.2 approval.request；v1.3.0 增 expiresAt/answerable）。 */
 @ObservedV2
 export class ApprovalCard {
   @Trace askId: string = '';
@@ -411,6 +444,10 @@ export class ApprovalCard {
   @Trace deadline: number = 0; // Date.now() + timeoutMs，倒计时用
   @Trace timeoutMs: number = 0;
   @Trace answered: boolean = false;
+  /** v1.3.0（§5.12）：绝对过期时间（Unix 毫秒；0 = 未知）。 */
+  @Trace expiresAt: number = 0;
+  /** v1.3.0（§5.12）：是否仍可作答（超时且宿主不再可答时为 false）。 */
+  @Trace answerable: boolean = true;
 
   constructor(askId: string, sessionId: string, toolName: string, reason: string,
     argsPreview: string, deadline: number, timeoutMs: number) {
@@ -424,7 +461,15 @@ export class ApprovalCard {
   }
 }
 
-/** 一张待回答卡片（契约 §5.2 question.request / §5.4 Question）。 */
+/**
+ * 一张待回答卡片（契约 §5.2 question.request / §5.4 Question；v1.3.0 增状态机字段）。
+ *
+ * v1.3.0（§5.12）：
+ *  - `state` = 'open'（手机独占等待窗口内）| 'continued'（窗口结束但宿主仍可补答）；
+ *  - `callId` = Host 侧 callId（与桌面端同一个）；
+ *  - `expiresAt` = 绝对 Unix 毫秒（0 = 未知 / 无限期）；
+ *  - `answerable` = 是否仍可作答（超时且宿主不再可答时为 false）。
+ */
 @ObservedV2
 export class QuestionCard {
   @Trace askId: string = '';
@@ -434,6 +479,14 @@ export class QuestionCard {
   @Trace deadline: number = 0;
   @Trace timeoutMs: number = 0;
   @Trace answered: boolean = false;
+  /** v1.3.0：'open' | 'continued'。 */
+  @Trace state: string = 'open';
+  /** v1.3.0：Host 侧 callId（与桌面端同一个）。 */
+  @Trace callId: string = '';
+  /** v1.3.0：绝对过期时间（Unix 毫秒；0 = 未知 / 无限期）。 */
+  @Trace expiresAt: number = 0;
+  /** v1.3.0：是否仍可作答。 */
+  @Trace answerable: boolean = true;
 
   constructor(askId: string, sessionId: string, questions: DshrcQuestion[],
     multiSelect: boolean, deadline: number, timeoutMs: number) {
@@ -558,6 +611,35 @@ export class SessionStore {
   // ---- 审批 / 提问（契约 §5.5）----
   @Trace approvals: ApprovalCard[] = [];
   @Trace questions: QuestionCard[] = [];
+  /**
+   * v1.3.0（§5.12）：宿主是否提供待答交互能力目录（缺省 = 旧宿主不支持）。
+   * 只读记录：不据此拦截快照请求（请求失败会静默降级，fail-open）。
+   */
+  @Trace pendingInteractionsSupported: boolean = false;
+  /**
+   * v1.3.0（§5.12）：待答交互快照的版本号。
+   * 待答卡片内容存在内部 Map（pendingMeta）里——Map 不是可观察对象，
+   * 故用版本号把「内容变了」暴露成 @Trace 变化，驱动 UI 刷新。
+   */
+  @Trace pendingVersion: number = 0;
+  // ---- Todo（契约 §5.13 v1.3.0：手机只读）----
+  /**
+   * Todo 整表版本号：任何会话的清单变化都自增（页面据此重建清单卡）。
+   * 清单**内容**存在内部 Map（todoCache）里，用版本号暴露变化。
+   */
+  @Trace todosVersion: number = 0;
+  /**
+   * v1.3.0（§5.13）：宿主是否提供 todos 能力（false → **隐藏**清单 UI）。
+   * 与「本回合无清单（todos=null → 显示『暂无任务』）」严格区分。
+   */
+  @Trace todosSupported: boolean = false;
+  // ---- Goal（契约 §5.14 v1.3.0）----
+  /** Goal 版本号：目标 / 激活态变化都自增。 */
+  @Trace goalVersion: number = 0;
+  /** v1.3.0（§5.14）：宿主是否可读目标投影（false → 隐藏目标条）。 */
+  @Trace goalSupported: boolean = false;
+  /** v1.3.0（§5.14）：宿主允许的人类操作子集（不含 block）。 */
+  @Trace goalActions: DshrcGoalAction[] = [];
   // ---- 推送（契约 §6）----
   @Trace pushToken: string = '';
   @Trace pushRegistered: boolean = false;
@@ -613,6 +695,27 @@ export class SessionStore {
   private imageCache: Map<string, string> = new Map<string, string>();
   /** v1.1.1：每会话待执行消息（宿主 session.queue 事件，契约 §5.2）。 */
   private queueCache: Map<string, DshrcQueueItem[]> = new Map<string, DshrcQueueItem[]>();
+  /**
+   * v1.3.0（§5.12）：待答卡片的内部元信息（askId → 会话 / 来源 / 出生序号）。
+   * 卡片本体在 approvals/questions（@Trace 数组）里；这里放不进状态树的辅助信息。
+   */
+  private pendingMeta: Map<string, PendingCardMeta> = new Map<string, PendingCardMeta>();
+  /** v1.3.0（§5.12）：本地收到待答卡片的单调序号（快照「发出前/后」判定用）。 */
+  private pendingSeq: number = 0;
+  /** v1.3.0（§5.12）：待答快照请求在途标记（不排队、不阻塞，fail-open）。 */
+  private pendingLoading: boolean = false;
+  /** v1.3.0（§5.13）：每会话 Todo 整表（null = 本回合无清单 / 已清空）。 */
+  private todoCache: Map<string, DshrcTodoItem[] | null> = new Map<string, DshrcTodoItem[] | null>();
+  /** v1.3.0（§5.13）：每会话是否支持 Todo（false → 隐藏清单 UI）。 */
+  private todoSupportedCache: Map<string, boolean> = new Map<string, boolean>();
+  /** v1.3.0（§5.14）：每会话目标投影（null = 当前无目标）。 */
+  private goalCache: Map<string, DshrcGoalWire | null> = new Map<string, DshrcGoalWire | null>();
+  /** v1.3.0（§5.14）：每会话目标激活态（'armed' | 'disarmed'；'' = 未知）。 */
+  private goalActivationCache: Map<string, string> = new Map<string, string>();
+  /** v1.3.0（§5.14）：每会话宿主允许的动作子集。 */
+  private goalActionsCache: Map<string, DshrcGoalAction[]> = new Map<string, DshrcGoalAction[]>();
+  /** v1.3.0（§5.14）：每会话是否可读目标投影（false → 隐藏目标条）。 */
+  private goalSupportedCache: Map<string, boolean> = new Map<string, boolean>();
   private chatSeq: number = 0;
   /** 在途刷新（并发刷新合并到同一个 Promise，v1.0.6：不再直接 resolve 假装已刷新）。 */
   private pendingRefresh: Promise<SessionRefreshResult> | null = null;
@@ -689,6 +792,19 @@ export class SessionStore {
       this.sessionPermission = null;
       this.permissionCache.clear();
       this.queueCache.clear(); // v1.1.1：断开后不留上一台主机的待执行消息
+      // v1.3.0：断开/切远程后不留上一台主机的待答交互 / Todo / Goal 投影
+      this.pendingMeta.clear();
+      this.pendingVersion = this.pendingVersion + 1;
+      this.todoCache.clear();
+      this.todoSupportedCache.clear();
+      this.todosSupported = false;
+      this.todosVersion = this.todosVersion + 1;
+      this.goalCache.clear();
+      this.goalActivationCache.clear();
+      this.goalActionsCache.clear();
+      this.goalSupported = false;
+      this.goalActions = [];
+      this.goalVersion = this.goalVersion + 1;
     }
     if (s === 'error') {
       this.lastError = '连接错误（详见链路日志）';
@@ -714,6 +830,9 @@ export class SessionStore {
     if (this.link.getState() !== 'online') {
       return;
     }
+    // v1.3.0（§5.12）：回前台必须补拉待答交互快照——事件只负责变化，不承担恢复。
+    // 只读通道，**绝不阻塞**（失败静默，fail-open 交给桌面端答案器）。
+    this.loadPendingInteractions(this.activeId);
     this.reconcileActiveSession();
   }
 
@@ -738,6 +857,12 @@ export class SessionStore {
       const sid: string = this.activeId;
       this.loadHistory(sid, false);
       this.loadQueue(sid);
+      // v1.3.0（§5.12）：待答交互快照——断线期间错过的提问/审批靠事件补不上，
+      // 必须拉一次权威快照（只读，不阻塞）。
+      this.loadPendingInteractions(sid);
+      // v1.3.0（§5.13/§5.14）：Todo 与 Goal 同样要补拉（事件只在变化时推）。
+      this.loadTodos(sid);
+      this.loadGoal(sid);
       // v1.1.4 修复：模型也要补拉。此前只补历史/排队/子代理——App 从后台切回时
       // 若 WS 正在重连，aboutToAppear 里那次 session.model 恰好落在断链窗口
       // 静默失败，链路恢复后**永不重试** → 手机端一直显示目录默认模型。
@@ -964,42 +1089,54 @@ export class SessionStore {
   }
 
   /**
-   * session.queue 事件落地：整体覆盖该会话的待执行消息（宿主给的是**全量快照**，
-   * 不做增量猜测），并自增 queueVersion 驱动页面刷新。
+   * session.queue 事件落地：**权威整表替换**（宿主给的是全量快照，不做增量猜测）。
+   *
+   * v1.3.0：以 Host 消息 id（wire `itemId`）为准；**空数组必须覆盖旧缓存**
+   * （队列被清空时不能留着旧项）。规则见 interaction-plan.replaceQueueTable。
    */
   private applyQueueSnapshot(sid: string, raw: DshrcQueueItem[] | undefined): void {
     if (sid.length === 0) {
       return;
     }
-    const items: DshrcQueueItem[] = [];
+    const incoming: QueueItemShape[] = [];
     if (raw !== undefined) {
       for (let i: number = 0; i < raw.length; i++) {
         const src: DshrcQueueItem = raw[i];
-        const item: DshrcQueueItem = {
+        const shape: QueueItemShape = {
           itemId: src.itemId !== undefined ? src.itemId : '',
           text: src.text !== undefined ? src.text : '',
           target: src.target !== undefined ? src.target : 'next-turn'
         };
-        items.push(item);
+        incoming.push(shape);
       }
     }
-    const nextIds: Set<string> = new Set<string>();
-    for (let i: number = 0; i < items.length; i++) {
-      nextIds.add(items[i].itemId);
-    }
-    let removed: boolean = false;
     const previous: DshrcQueueItem[] | undefined = this.queueCache.get(sid);
+    const current: QueueItemShape[] = [];
     if (previous !== undefined) {
-      for (let i: number = 0; i < previous.length; i++) {
-        if (!nextIds.has(previous[i].itemId)) {
-          removed = true;
-          break;
-        }
+      for (let k: number = 0; k < previous.length; k++) {
+        const shape: QueueItemShape = {
+          itemId: previous[k].itemId,
+          text: previous[k].text,
+          target: previous[k].target
+        };
+        current.push(shape);
       }
+    }
+    const result: QueueTableResult = replaceQueueTable(current, incoming);
+    const items: DshrcQueueItem[] = [];
+    for (let j: number = 0; j < result.items.length; j++) {
+      const item: DshrcQueueItem = {
+        itemId: result.items[j].itemId,
+        text: result.items[j].text,
+        target: result.items[j].target
+      };
+      items.push(item);
     }
     this.queueCache.set(sid, items);
     this.queueVersion = this.queueVersion + 1;
-    if (removed && this.link.getState() === 'online') {
+    // v1.3.1：排队表变了 → 广播（页面把快照搬进 @Local，保证真机上排队项能消失）
+    postSessionStateChanged(sid);
+    if (result.removed && this.link.getState() === 'online') {
       // queue 项消失有两种原因：被宿主消费（user/message）或被取消。
       // 前者必须把权威用户消息补进主时间线；后者多拉一次历史无副作用。
       // 若此时已有历史请求在途，loadHistory 会登记尾随刷新，不会拿到旧页后停住。
@@ -1045,6 +1182,11 @@ export class SessionStore {
       this.historyLoaded = false;
       return;
     }
+    // v1.3.0：打开会话要补拉只读投影——待答交互（§5.12）、Todo（§5.13）、Goal（§5.14）。
+    // 这些快照**只在变化时才有事件**，断线/后台期间变过的必须靠拉取补齐。
+    this.loadPendingInteractions(sid);
+    this.loadTodos(sid);
+    this.loadGoal(sid);
     if (!this.cache.has(sid)) {
       this.cache.set(sid, []);
     }
@@ -1078,6 +1220,13 @@ export class SessionStore {
       this.busyEnter = caps.busyEnter === 'steer' ? 'steer' : 'queue';
       // v1.2.0（§5.11.1）：附件能力目录；旧插件缺省该字段 → null（隐藏附件入口）
       this.attachmentCaps = caps.attachments !== undefined ? caps.attachments : null;
+      // v1.3.0（§5.13）：Todo 能力目录；缺省 = 宿主不支持 → 隐藏清单 UI。
+      this.todosSupported = caps.todos !== undefined && caps.todos.supported === true;
+      // v1.3.0（§5.14）：Goal 能力目录；缺省 = 宿主不支持 → 隐藏目标条。
+      this.goalSupported = caps.goal !== undefined && caps.goal.read === true;
+      this.goalActions = caps.goal !== undefined ? caps.goal.actions : [];
+      // v1.3.0（§5.12）：待答交互能力目录；缺省 = 宿主不支持（快照请求会静默降级）。
+      this.pendingInteractionsSupported = caps.pendingInteractions !== undefined;
       this.capabilitiesLoaded = true;
     }).catch((e: Error): void => {
       // 旧插件无此请求 → 能力目录为空（客户端隐藏选择区，不报错）
@@ -1088,6 +1237,10 @@ export class SessionStore {
       this.archiveSupported = false;
       this.busyEnter = 'queue';
       this.attachmentCaps = null;
+      // v1.3.0：旧插件无这些能力目录 → 一律隐藏对应 UI（不报错）。
+      this.todosSupported = false;
+      this.goalSupported = false;
+      this.goalActions = [];
       this.capabilitiesLoaded = true;
       logDshrc(TAG, 'info', 'session.capabilities unavailable: ' + e.message);
     });
@@ -1124,6 +1277,438 @@ export class SessionStore {
       // 旧插件无此请求 → 队列显示为空（不报错，不阻塞会话）
       logDshrc(TAG, 'info', 'session.queue unavailable: ' + e.message);
     });
+  }
+
+  // ---- v1.3.0：待答交互 / Todo / Goal（契约 §5.12 / §5.13 / §5.14）----
+
+  /**
+   * 拉取待答交互快照（契约 §5.12）。
+   *
+   * - **只读恢复通道**：读取失败必须按空数组处理，**绝不能等待、阻塞或改动瀑布**；
+   * - 事件只负责变化，不承担恢复 → 回前台 / 重连 / 打开会话都要拉一次；
+   * - 在途请求不排队（再来一次直接跳过），避免风暴；fail-open。
+   *
+   * @param sessionId 快照范围；空 = 全局（插件仍持有的待答项，不做删除对账）。
+   * @param issuedSeq 快照基准序号（默认取当前值）。调用方在 upsert **之前**取值，
+   *   可保证「请求发出之后才到的 live 卡片」不被这份旧快照误删。
+   */
+  loadPendingInteractions(sessionId?: string, issuedSeq?: number): Promise<void> {
+    if (this.link.getState() !== 'online' || this.pendingLoading) {
+      return Promise.resolve();
+    }
+    this.pendingLoading = true;
+    const base: number = issuedSeq !== undefined ? issuedSeq : this.pendingSeq;
+    const scope: string = sessionId !== undefined ? sessionId : '';
+    return this.link.pendingInteractions(scope.length > 0 ? scope : undefined).then(
+      (snap: DshrcPendingInteractions): void => {
+        this.pendingLoading = false;
+        this.applyPendingInteractions(snap, scope, base);
+      },
+      (e: Error): void => {
+        // 读取失败回空数组（不影响 fail-open，也不影响瀑布计时与桌面端兜底）
+        this.pendingLoading = false;
+        logDshrc(TAG, 'info', 'pending.interactions unavailable: ' + e.message);
+      });
+  }
+
+  /**
+   * 应用待答快照（契约 §5.12）：**合并**而不是丢 live 项；已失效项清掉。
+   *
+   * 规则见 interaction-plan.planPendingMerge：
+   *  1. 快照里的每一项按 askId 幂等 upsert（同 askId 替换，不叠加）；
+   *  2. 范围内、且在快照发出之前就已存在、却不在快照里的卡片 → 移除（已失效）；
+   *  3. 快照发出之后才到的 live 卡片 → 保留。
+   */
+  private applyPendingInteractions(snap: DshrcPendingInteractions, scope: string,
+    issuedSeq: number): void {
+    const metas: PendingCardMeta[] = [];
+    this.pendingMeta.forEach((m: PendingCardMeta): void => {
+      metas.push(m);
+    });
+    const questions: DshrcPendingQuestion[] = snap.questions !== undefined ? snap.questions : [];
+    const approvals: DshrcPendingApproval[] = snap.approvals !== undefined ? snap.approvals : [];
+    const snapshotAskIds: string[] = [];
+    for (let i: number = 0; i < questions.length; i++) {
+      snapshotAskIds.push(questions[i].askId);
+    }
+    for (let j: number = 0; j < approvals.length; j++) {
+      snapshotAskIds.push(approvals[j].askId);
+    }
+    // 先算计划再写：避免把刚 upsert 的新卡片算进 remove。
+    const plan: PendingMergePlan = planPendingMerge(metas, snapshotAskIds, scope, issuedSeq);
+    for (let k: number = 0; k < questions.length; k++) {
+      const q: DshrcPendingQuestion = questions[k];
+      this.upsertQuestion(q.askId, q.sessionId, q.questions, q.multiSelect, q.state,
+        q.callId, q.expiresAt, q.answerable, q.timeoutMs, q.source, false);
+    }
+    for (let m: number = 0; m < approvals.length; m++) {
+      const a: DshrcPendingApproval = approvals[m];
+      this.upsertApproval(a.askId, a.sessionId, a.toolName, a.reason, a.argsPreview,
+        a.answerable, a.expiresAt, a.source, false);
+    }
+    // 已失效项清掉（宿主投影里没有了 = 不可再答）。
+    for (let n: number = 0; n < plan.remove.length; n++) {
+      this.dropQuestion(plan.remove[n]);
+      this.dropApproval(plan.remove[n]);
+      this.pendingMeta.delete(plan.remove[n]);
+    }
+    this.pendingVersion = this.pendingVersion + 1;
+    // v1.3.1：待答卡片增删 → 广播（页面据此刷新自己的快照；scope 为空 = 全体会话）
+    postSessionStateChanged(scope);
+  }
+
+  /**
+   * 幂等 upsert 一张提问卡（契约 §5.12：同一 askId 重发表示状态更新 → **替换**而非叠加）。
+   * 实例保持稳定（Repeat 按 key 复用节点），字段原地更新。
+   */
+  private upsertQuestion(askId: string, sessionId: string, questions: DshrcQuestion[],
+    multiSelect: boolean, state: string, callId: string, expiresAt: number,
+    answerable: boolean, timeoutMs: number, source: string, notify: boolean): void {
+    if (askId.length === 0) {
+      return;
+    }
+    const deadline: number = expiresAt > 0 ? expiresAt :
+      (timeoutMs > 0 ? Date.now() + timeoutMs : 0);
+    for (let i: number = 0; i < this.questions.length; i++) {
+      const card: QuestionCard = this.questions[i];
+      if (card.askId !== askId) {
+        continue;
+      }
+      card.sessionId = sessionId;
+      card.questions = questions;
+      card.multiSelect = multiSelect;
+      card.state = state;
+      card.callId = callId;
+      card.expiresAt = expiresAt;
+      card.answerable = answerable;
+      card.timeoutMs = timeoutMs;
+      card.deadline = deadline;
+      postSessionStateChanged(sessionId);
+      return;
+    }
+    const created: QuestionCard = new QuestionCard(askId, sessionId, questions, multiSelect,
+      deadline, timeoutMs);
+    created.state = state;
+    created.callId = callId;
+    created.expiresAt = expiresAt;
+    created.answerable = answerable;
+    this.questions = this.questions.concat([created]);
+    this.pendingSeq = this.pendingSeq + 1;
+    const meta: PendingCardMeta = {
+      askId: askId,
+      sessionId: sessionId,
+      source: source,
+      bornSeq: this.pendingSeq
+    };
+    this.pendingMeta.set(askId, meta);
+    if (notify) {
+      postQuestionArrived(sessionId, askId);
+    }
+    postSessionStateChanged(sessionId);
+  }
+
+  /** 幂等 upsert 一张审批卡（契约 §5.12：同一 askId 重发表示状态更新 → 替换而非叠加）。 */
+  private upsertApproval(askId: string, sessionId: string, toolName: string, reason: string,
+    argsPreview: string, answerable: boolean, expiresAt: number, source: string,
+    notify: boolean): void {
+    if (askId.length === 0) {
+      return;
+    }
+    const deadline: number = expiresAt > 0 ? expiresAt : 0;
+    for (let i: number = 0; i < this.approvals.length; i++) {
+      const card: ApprovalCard = this.approvals[i];
+      if (card.askId !== askId) {
+        continue;
+      }
+      card.sessionId = sessionId;
+      card.toolName = toolName;
+      card.reason = reason;
+      card.argsPreview = argsPreview;
+      card.answerable = answerable;
+      card.expiresAt = expiresAt;
+      card.deadline = deadline;
+      postSessionStateChanged(sessionId);
+      return;
+    }
+    const created: ApprovalCard = new ApprovalCard(askId, sessionId, toolName, reason,
+      argsPreview, deadline, 0);
+    created.answerable = answerable;
+    created.expiresAt = expiresAt;
+    this.approvals = this.approvals.concat([created]);
+    this.pendingSeq = this.pendingSeq + 1;
+    const meta: PendingCardMeta = {
+      askId: askId,
+      sessionId: sessionId,
+      source: source,
+      bornSeq: this.pendingSeq
+    };
+    this.pendingMeta.set(askId, meta);
+    if (notify) {
+      postApprovalArrived(sessionId, askId, toolName);
+    }
+    postSessionStateChanged(sessionId);
+  }
+
+  /** 某张待答卡所属的会话（快照对账范围用；查不到回空串）。 */
+  private pendingSessionOf(askId: string): string {
+    const meta: PendingCardMeta | undefined = this.pendingMeta.get(askId);
+    if (meta !== undefined) {
+      return meta.sessionId;
+    }
+    for (let i: number = 0; i < this.questions.length; i++) {
+      if (this.questions[i].askId === askId) {
+        return this.questions[i].sessionId;
+      }
+    }
+    for (let j: number = 0; j < this.approvals.length; j++) {
+      if (this.approvals[j].askId === askId) {
+        return this.approvals[j].sessionId;
+      }
+    }
+    return '';
+  }
+
+  // ---- Todo（契约 §5.13 v1.3.0：手机只读）----
+
+  /**
+   * 拉该会话的 Todo 整表（契约 §5.13）。
+   * 失败/宿主不支持 → 标记为不支持并**隐藏**清单 UI（不报错、不阻塞会话）。
+   */
+  loadTodos(sid: string): Promise<void> {
+    if (sid.length === 0 || this.link.getState() !== 'online') {
+      return Promise.resolve();
+    }
+    return this.link.todos(sid).then((snap: DshrcTodosSnapshot): void => {
+      this.applyTodoSnapshot(sid, snap.todos, snap.supported);
+    }).catch((e: Error): void => {
+      // 只有「宿主不支持」（bad-type / unsupported）才降级为隐藏；
+      // 网络/超时等偶发失败保持原状，避免一次抖动就把清单区永久藏掉。
+      if (this.isUnsupportedError(e)) {
+        this.todoSupportedCache.set(sid, false);
+        this.todosVersion = this.todosVersion + 1;
+        postSessionStateChanged(sid);
+      }
+      logDshrc(TAG, 'info', 'session.todos unavailable: ' + e.message);
+    });
+  }
+
+  /**
+   * 是否「宿主不支持该能力」的错误（契约 §5.1：能力目录缺省 = 旧宿主不支持，
+   * 新请求报 bad-type 时静默降级，不得弹错误）。
+   */
+  private isUnsupportedError(e: Error): boolean {
+    const msg: string = e.message !== undefined ? e.message : '';
+    return msg.indexOf('bad-type') >= 0 || msg.indexOf('unsupported') >= 0;
+  }
+
+  /**
+   * Todo 整表落地（契约 §5.13：`todo/write` 覆盖、`turn/start` 清为 null）。
+   *
+   * - `todos=null` → 本回合无清单 / 已清空（UI 显示「暂无任务」）；
+   * - `todos=[]`   → 整表覆盖（旧清单被清空）；
+   * - `supported=false` → 宿主不支持（UI **隐藏**整个清单区）。
+   */
+  private applyTodoSnapshot(sid: string, todos?: DshrcTodoItem[] | null, supported?: boolean): void {
+    if (sid.length === 0) {
+      return;
+    }
+    const incoming: TodoItemShape[] | null = todos !== undefined && todos !== null ?
+      this.todoShapesOf(todos) : null;
+    const next: TodoItemShape[] | null = replaceTodoTable(null, incoming);
+    if (next === null) {
+      this.todoCache.set(sid, null);
+    } else {
+      this.todoCache.set(sid, this.todoItemsOf(next));
+    }
+    if (supported !== undefined) {
+      this.todoSupportedCache.set(sid, supported);
+    } else {
+      // 宿主主动推了 todos 事件 → 它支持 todos（§5.13 的 supported 缺省语义）。
+      this.todoSupportedCache.set(sid, true);
+    }
+    this.todosVersion = this.todosVersion + 1;
+    // v1.3.1：清单变了 → 广播（页面把快照搬进 @Local）
+    postSessionStateChanged(sid);
+  }
+
+  /** wire TodoItem[] → 纯 TS 形状。 */
+  private todoShapesOf(items: DshrcTodoItem[]): TodoItemShape[] {
+    const out: TodoItemShape[] = [];
+    for (let i: number = 0; i < items.length; i++) {
+      const shape: TodoItemShape = { content: items[i].content, status: items[i].status };
+      out.push(shape);
+    }
+    return out;
+  }
+
+  /** 纯 TS 形状 → wire TodoItem[]。 */
+  private todoItemsOf(shapes: TodoItemShape[]): DshrcTodoItem[] {
+    const out: DshrcTodoItem[] = [];
+    for (let i: number = 0; i < shapes.length; i++) {
+      const item: DshrcTodoItem = { content: shapes[i].content, status: shapes[i].status };
+      out.push(item);
+    }
+    return out;
+  }
+
+  /**
+   * 该会话的 Todo 整表（null = 本回合无清单 / 已清空）。
+   * 与「宿主不支持」严格区分：后者看 todosSupportedFor()。
+   */
+  todosFor(sid: string): DshrcTodoItem[] | null {
+    const cached: DshrcTodoItem[] | null | undefined = this.todoCache.get(sid);
+    if (cached === undefined || cached === null) {
+      return null;
+    }
+    return cached.slice();
+  }
+
+  /** 该会话是否支持 Todo（false → 隐藏清单 UI）。 */
+  todosSupportedFor(sid: string): boolean {
+    const known: boolean | undefined = this.todoSupportedCache.get(sid);
+    if (known !== undefined) {
+      return known;
+    }
+    return this.todosSupported;
+  }
+
+  /** 该会话的 Todo 三态计数（UI 用；纯规则见 interaction-plan.todoCounts）。 */
+  todoCountsFor(sid: string): TodoCounts {
+    const items: DshrcTodoItem[] | null = this.todosFor(sid);
+    return todoCounts(items === null ? null : this.todoShapesOf(items));
+  }
+
+  // ---- Goal（契约 §5.14 v1.3.0）----
+
+  /** 拉该会话的目标投影（契约 §5.14）。失败/宿主不支持 → 隐藏目标条。 */
+  loadGoal(sid: string): Promise<void> {
+    if (sid.length === 0 || this.link.getState() !== 'online') {
+      return Promise.resolve();
+    }
+    return this.link.goal(sid).then((snap: DshrcGoalSnapshot): void => {
+      this.applyGoalSnapshot(sid, snap.goal, snap.activation, snap.supported, snap.actions);
+    }).catch((e: Error): void => {
+      // 只有「宿主不支持」才降级为隐藏；偶发失败保持原状态。
+      if (this.isUnsupportedError(e)) {
+        this.goalSupportedCache.set(sid, false);
+        this.goalVersion = this.goalVersion + 1;
+      }
+      logDshrc(TAG, 'info', 'session.goal unavailable: ' + e.message);
+    });
+  }
+
+  /** 目标快照落地（整表覆盖；goal=null = 当前无目标）。 */
+  private applyGoalSnapshot(sid: string, goal: DshrcGoalWire | null, activation: string | null,
+    supported: boolean, actions: DshrcGoalAction[]): void {
+    if (sid.length === 0) {
+      return;
+    }
+    this.goalCache.set(sid, goal);
+    this.goalActivationCache.set(sid, activation !== null ? activation : '');
+    this.goalSupportedCache.set(sid, supported);
+    this.goalActionsCache.set(sid, actions);
+    this.goalVersion = this.goalVersion + 1;
+    // v1.3.1：目标变了 → 广播（页面把快照搬进 @Local）
+    postSessionStateChanged(sid);
+  }
+
+  /** 该会话的目标（null = 当前无目标）。 */
+  goalFor(sid: string): DshrcGoalWire | null {
+    const cached: DshrcGoalWire | null | undefined = this.goalCache.get(sid);
+    if (cached === undefined || cached === null) {
+      return null;
+    }
+    return cached;
+  }
+
+  /** 该会话的目标激活态（'armed' | 'disarmed'；'' = 未知 → 不得显示「自动续跑中」）。 */
+  goalActivationFor(sid: string): string {
+    const cached: string | undefined = this.goalActivationCache.get(sid);
+    return cached !== undefined ? cached : '';
+  }
+
+  /** 该会话是否可读目标（false → 隐藏目标条）。 */
+  goalSupportedFor(sid: string): boolean {
+    const known: boolean | undefined = this.goalSupportedCache.get(sid);
+    if (known !== undefined) {
+      return known;
+    }
+    return this.goalSupported;
+  }
+
+  /** 宿主允许的目标动作子集（UI 只渲染这些动作）。 */
+  goalActionsFor(sid: string): DshrcGoalAction[] {
+    const cached: DshrcGoalAction[] | undefined = this.goalActionsCache.get(sid);
+    if (cached !== undefined) {
+      return cached.slice();
+    }
+    return this.goalActions.slice();
+  }
+
+  /**
+   * 执行目标的人类操作（契约 §5.14）。
+   *
+   * - 除 `create` 外**必须**带手机当前看到的 `{id,revision}`（Host 做 CAS）；
+   * - Host 回 `GOAL_STALE_REVISION` → **重拉** `session.goal` 并给出明确提示，
+   *   绝不覆盖桌面刚做的变更；
+   * - `block` 不是手机的人类操作（类型里没有这个动作）。
+   */
+  private applyGoalAction(sid: string, action: DshrcGoalAction, objective?: string,
+    maxGoalRounds?: number): Promise<void> {
+    let expected: DshrcGoalRef | undefined = undefined;
+    if (goalActionNeedsExpected(action)) {
+      const ref: GoalRefShape | null = goalRefOf(this.goalFor(sid));
+      if (ref === null) {
+        return Promise.reject(new Error('当前没有目标，无法执行该操作'));
+      }
+      const goalRef: DshrcGoalRef = { id: ref.id, revision: ref.revision };
+      expected = goalRef;
+    }
+    return this.link.goalAction(sid, action, expected, objective, maxGoalRounds).then(
+      (updated: DshrcGoalWire | null): void => {
+        this.goalCache.set(sid, updated);
+        this.goalVersion = this.goalVersion + 1;
+        // v1.3.1：动作结果落地 → 广播（页面立即刷新目标条）
+        postSessionStateChanged(sid);
+      },
+      (e: Error): void => {
+        if (e.message.indexOf('GOAL_STALE_REVISION') >= 0) {
+          // 契约 §5.14：陈旧 revision 必须重拉，不能自动覆盖新状态。
+          this.loadGoal(sid);
+          throw new Error('目标已被另一端更新，已重新加载最新状态，请确认后再操作');
+        }
+        throw e;
+      });
+  }
+
+  /** 新建目标（create 不带 expected，objective 必填）。 */
+  createGoal(sid: string, objective: string, maxGoalRounds?: number): Promise<void> {
+    return this.applyGoalAction(sid, 'create', objective, maxGoalRounds);
+  }
+
+  /** 编辑目标（objective / maxGoalRounds 至少一项）。 */
+  editGoal(sid: string, objective: string, maxGoalRounds?: number): Promise<void> {
+    return this.applyGoalAction(sid, 'edit', objective, maxGoalRounds);
+  }
+
+  /** 暂停目标。 */
+  pauseGoal(sid: string): Promise<void> {
+    return this.applyGoalAction(sid, 'pause');
+  }
+
+  /** 恢复目标。 */
+  resumeGoal(sid: string): Promise<void> {
+    return this.applyGoalAction(sid, 'resume');
+  }
+
+  /** 完成目标（UI 侧必须二次确认）。 */
+  completeGoal(sid: string): Promise<void> {
+    return this.applyGoalAction(sid, 'complete');
+  }
+
+  /** 清除目标（UI 侧必须二次确认）。 */
+  clearGoal(sid: string): Promise<void> {
+    return this.applyGoalAction(sid, 'clear');
   }
 
   /** 模式 id（新建会话用；无目录时返回空串）。 */
@@ -1510,6 +2095,8 @@ export class SessionStore {
       mi.images = msg.images !== undefined ? msg.images : [];
       // v1.2.0（§5.11.4）：历史消息里的文件（旧插件不返该字段 → 空数组）
       mi.files = msg.files !== undefined ? msg.files : [];
+      // v1.3.1（§5.3）：唤醒消息的触发来源（旧插件不返该字段 → 空串 = 普通消息）
+      mi.trigger = msg.trigger !== undefined ? msg.trigger : '';
       const priorM: TimelineItem | undefined = oldById.get(mi.id);
       if (priorM !== undefined) {
         this.transferTimelineFields(priorM, mi);
@@ -1602,6 +2189,7 @@ export class SessionStore {
     dst.step = src.step;
     dst.images = src.images;
     dst.files = src.files;
+    dst.trigger = src.trigger;
   }
 
   /** 静默清掉残留的流式标志（不自增 ts / 不加错误文案——只是光标回收）。 */
@@ -2146,6 +2734,13 @@ export class SessionStore {
         this.histMeta.delete(keys[j]);
         this.queueCache.delete(keys[j]); // v1.1.1：会话没了，它的待执行消息也没了
         this.permissionCache.delete(keys[j]);
+        // v1.3.0：会话没了，它的 Todo / Goal 投影也没了
+        this.todoCache.delete(keys[j]);
+        this.todoSupportedCache.delete(keys[j]);
+        this.goalCache.delete(keys[j]);
+        this.goalActivationCache.delete(keys[j]);
+        this.goalActionsCache.delete(keys[j]);
+        this.goalSupportedCache.delete(keys[j]);
       }
     }
     if (this.activeId.length > 0 && !alive.has(this.activeId)) {
@@ -2214,15 +2809,23 @@ export class SessionStore {
     });
   }
 
-  /** 提交提问回答（契约 §5.1 question.answer）。 */
+  /**
+   * 提交提问回答（契约 §5.1 question.answer）。
+   *
+   * v1.3.0（§5.12）：`applied:false` **不能**武断说「桌面已处理」——
+   * 它可能是「已失效」也可能是「另一端刚回答」，本地无从判断。
+   * 故：不给结论、**重拉待答快照**让最新状态说话（fail-open，桌面答案器仍是兜底）。
+   */
   submitQuestion(askId: string, answers: Object, freeText: string): Promise<boolean> {
     return this.link.questionAnswer(askId, answers, freeText).then((applied: boolean): boolean => {
       if (applied) {
         this.markQuestionAnswered(askId);
-      } else {
-        this.lastError = '提问已超时，桌面端已处理';
+        return true;
       }
-      return applied;
+      this.lastError = '回答未生效（可能已被另一端回答或已失效），正在重新核对最新状态';
+      const sid: string = this.pendingSessionOf(askId);
+      this.loadPendingInteractions(sid.length > 0 ? sid : this.activeId);
+      return false;
     });
   }
 
@@ -2476,44 +3079,94 @@ export class SessionStore {
       case TOPIC_APPROVAL_REQUEST: {
         const askId: string = data.askId !== undefined ? data.askId : '';
         if (askId.length > 0) {
-          const timeoutMs: number = data.timeoutMs !== undefined ? data.timeoutMs : 0;
-          const card: ApprovalCard = new ApprovalCard(askId,
+          // 快照基准取**事件处理前**的序号：刚到的卡片不得被随后发出的快照删掉。
+          const issuedBefore: number = this.pendingSeq;
+          this.upsertApproval(askId,
             data.sessionId !== undefined ? data.sessionId : '',
             data.toolName !== undefined ? data.toolName : '',
             data.reason !== undefined ? data.reason : '',
             data.argsPreview !== undefined ? data.argsPreview : '',
-            Date.now() + timeoutMs, timeoutMs);
-          this.approvals = this.approvals.concat([card]);
-          postApprovalArrived(card.sessionId, askId, card.toolName);
+            true,
+            data.expiresAt !== undefined ? data.expiresAt : 0,
+            'plugin', true);
+          // 相关 live 事件后拉一次快照对账（只读、不阻塞、不排队）。
+          this.loadPendingInteractions(
+            data.sessionId !== undefined ? data.sessionId : '', issuedBefore);
         }
         break;
       }
       case TOPIC_APPROVAL_RESOLVED: {
         const askId2: string = data.askId !== undefined ? data.askId : '';
         if (askId2.length > 0) {
+          // 先取会话（drop 之后 meta 已被清掉）。
+          const resolvedSid: string = this.pendingSessionOf(askId2);
           this.dropApproval(askId2);
           postApprovalResolved(askId2);
+          this.loadPendingInteractions(resolvedSid);
         }
         break;
       }
       case TOPIC_QUESTION_REQUEST: {
         const askId3: string = data.askId !== undefined ? data.askId : '';
         if (askId3.length > 0) {
-          const timeoutMs3: number = data.timeoutMs !== undefined ? data.timeoutMs : 0;
-          const qcard: QuestionCard = new QuestionCard(askId3,
+          // 快照基准取**事件处理前**的序号：刚到的卡片不得被随后发出的快照删掉。
+          const issuedBefore3: number = this.pendingSeq;
+          this.upsertQuestion(askId3,
             data.sessionId !== undefined ? data.sessionId : '',
             data.questions !== undefined ? data.questions : [],
-            data.multiSelect === true, Date.now() + timeoutMs3, timeoutMs3);
-          this.questions = this.questions.concat([qcard]);
-          postQuestionArrived(qcard.sessionId, askId3);
+            data.multiSelect === true,
+            data.state !== undefined ? data.state : 'open',
+            data.callId !== undefined ? data.callId : '',
+            data.expiresAt !== undefined ? data.expiresAt : 0,
+            data.answerable !== undefined ? data.answerable : true,
+            data.timeoutMs !== undefined ? data.timeoutMs : 0,
+            'plugin', true);
+          // 相关 live 事件后拉一次快照对账（只读、不阻塞、不排队）。
+          this.loadPendingInteractions(
+            data.sessionId !== undefined ? data.sessionId : '', issuedBefore3);
         }
         break;
       }
       case TOPIC_QUESTION_RESOLVED: {
         const askId4: string = data.askId !== undefined ? data.askId : '';
         if (askId4.length > 0) {
+          // 先取会话（drop 之后 meta 已被清掉）。
+          const resolvedSid4: string = this.pendingSessionOf(askId4);
           this.dropQuestion(askId4);
           postQuestionResolved(askId4);
+          this.loadPendingInteractions(resolvedSid4);
+        }
+        break;
+      }
+      case TOPIC_SESSION_TODOS_CHANGED: {
+        // 契约 §5.13：todo/write 整表覆盖 / turn/start 清为 null；客户端不自行合并。
+        const sidT2: string = data.sessionId !== undefined ? data.sessionId : '';
+        this.applyTodoSnapshot(sidT2, data.todos);
+        break;
+      }
+      case TOPIC_SESSION_GOAL_CHANGED: {
+        // 契约 §5.14：goal/change 事件（clear 时 goal=null；其余给完整 GoalWire）。
+        const sidG: string = data.sessionId !== undefined ? data.sessionId : '';
+        if (sidG.length > 0) {
+          this.goalCache.set(sidG, data.goal !== undefined ? data.goal : null);
+          this.goalVersion = this.goalVersion + 1;
+          postSessionStateChanged(sidG);
+        }
+        break;
+      }
+      case TOPIC_SESSION_GOAL_ACTIVATION_CHANGED: {
+        // 契约 §5.14：进程内激活态变化（不持久；读不到就是未知）。
+        const sidGA: string = data.sessionId !== undefined ? data.sessionId : '';
+        if (sidGA.length > 0) {
+          const activation: string = data.activation !== undefined && data.activation !== null ?
+            data.activation : '';
+          this.goalActivationCache.set(sidGA, activation);
+          const goalGA: DshrcGoalWire | null = this.goalFor(sidGA);
+          if (goalGA !== null) {
+            goalGA.activation = activation;
+          }
+          this.goalVersion = this.goalVersion + 1;
+          postSessionStateChanged(sidGA);
         }
         break;
       }
@@ -2535,6 +3188,7 @@ export class SessionStore {
   }
 
   private dropApproval(askId: string): void {
+    const sid: string = this.pendingSessionOf(askId);
     const next: ApprovalCard[] = [];
     for (let i: number = 0; i < this.approvals.length; i++) {
       if (this.approvals[i].askId !== askId) {
@@ -2542,9 +3196,13 @@ export class SessionStore {
       }
     }
     this.approvals = next;
+    this.pendingMeta.delete(askId);
+    this.pendingVersion = this.pendingVersion + 1;
+    postSessionStateChanged(sid);
   }
 
   private dropQuestion(askId: string): void {
+    const sid: string = this.pendingSessionOf(askId);
     const next: QuestionCard[] = [];
     for (let i: number = 0; i < this.questions.length; i++) {
       if (this.questions[i].askId !== askId) {
@@ -2552,6 +3210,9 @@ export class SessionStore {
       }
     }
     this.questions = next;
+    this.pendingMeta.delete(askId);
+    this.pendingVersion = this.pendingVersion + 1;
+    postSessionStateChanged(sid);
   }
 }
 

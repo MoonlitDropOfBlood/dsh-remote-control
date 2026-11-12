@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2026 dukedsh.
- * DSH Pocket for Android —— 会话仓（契约 §5.1 / §5.2 / §5.7 / §5.10 / §5.11）。
+ * DSH Pocket for Android —— 会话仓（契约 §5.1 / §5.2 / §5.7 / §5.10 / §5.11 / §5.12 / §5.13 / §5.14）。
  *
  * 移植自 HarmonyOS 版（**语义 1:1**，不改口径）：
  *  - app/entry/src/main/ets/model/sessionstore.ets（会话/审批/提问状态仓）
@@ -72,7 +72,12 @@ data class TimelineMessage(
     /** 乐观上屏（本机发出、宿主还没回执）。 */
     val local: Boolean = false,
     /** 本轮错误文案（turn.end status=error；HarmonyOS 版 TimelineItem.errorText）。 */
-    val errorText: String = ""
+    val errorText: String = "",
+    /**
+     * v1.3.1（契约 §5.3）：唤醒消息的触发来源（goal/agent/team/…）。
+     * 非空 → 渲染触发卡（如「继续执行目标」），不画普通气泡。
+     */
+    val trigger: String = ""
 ) : TimelineItem {
     /** 纯附件消息（正文为空但有图片/文件）——**不画空气泡**（契约 §5.11.4）。 */
     val isAttachmentOnly: Boolean
@@ -267,6 +272,42 @@ class SessionStore(
     /** 待回答卡片（契约 §5.2 / §5.4）。 */
     val questions: StateFlow<List<QuestionRequest>> = _questions.asStateFlow()
 
+    // ---- v1.3.0：待答交互 / Todo / Goal（契约 §5.12 / §5.13 / §5.14） ----
+
+    private val _todos = MutableStateFlow<TodoState?>(null)
+
+    /**
+     * 当前会话的 Todo 快照（契约 §5.13）。
+     *
+     * `null` = 还没拉过 / 宿主不支持（隐藏 UI）；
+     * `TodoState(supported=true, todos=null)` = 宿主支持但**本回合没有清单**（显示「暂无任务」）。
+     */
+    val todos: StateFlow<TodoState?> = _todos.asStateFlow()
+
+    private val _goal = MutableStateFlow<GoalWire?>(null)
+
+    /** 当前会话的 Goal（契约 §5.14；null = 当前没有目标）。 */
+    val goal: StateFlow<GoalWire?> = _goal.asStateFlow()
+
+    private val _goalActivation = MutableStateFlow<String?>(null)
+
+    /**
+     * 当前会话的 Goal 续跑激活态（armed | disarmed | null）。
+     *
+     * **null = 读不到**（进程内状态、不持久）→ 不得显示「自动续跑中」。
+     */
+    val goalActivation: StateFlow<String?> = _goalActivation.asStateFlow()
+
+    private val _goalSupported = MutableStateFlow(false)
+
+    /** 宿主是否支持 Goal（契约 §5.1 v1.3.0）：false = 隐藏目标入口。 */
+    val goalSupported: StateFlow<Boolean> = _goalSupported.asStateFlow()
+
+    private val _goalActions = MutableStateFlow<List<String>>(emptyList())
+
+    /** 宿主允许的人类操作子集（契约 §5.1 v1.3.0 actions；空 = 不限制）。 */
+    val goalActions: StateFlow<List<String>> = _goalActions.asStateFlow()
+
     private val _lastError = MutableStateFlow("")
 
     /** 最近一次错误文案（UI 提示用；成功路径自动清空）。 */
@@ -292,6 +333,11 @@ class SessionStore(
     val linkRef: DshrcLink get() = link
 
     private val lock = Any()
+
+    // v1.3.0（契约 §5.12）：待答快照的**本地到达序号**。请求发出后才到的 live 卡
+    // （bornSeq > issuedSeq）不得被那份旧快照误删——与 HarmonyOS 同口径。
+    private var pendingSeq = 0L
+    private val pendingBorn = HashMap<String, Long>()
 
     /** 回前台/重连对账窗口内隐藏尾部直播思考块（v1.3.1；只影响分组投影）。 */
     @Volatile
@@ -322,6 +368,21 @@ class SessionStore(
 
     /** 每父会话的子代理目录。 */
     private val subagentCache = LinkedHashMap<String, List<SubagentInfo>>()
+
+    /** 每会话 Todo 快照（契约 §5.13；null = 宿主不支持 / 还没拉过）。 */
+    private val todoCache = LinkedHashMap<String, TodoState>()
+
+    /** 每会话 Goal（契约 §5.14；缺失 = 当前没有目标）。 */
+    private val goalCache = LinkedHashMap<String, GoalWire>()
+
+    /** 每会话 Goal 续跑激活态（armed | disarmed）。 */
+    private val activationCache = LinkedHashMap<String, String>()
+
+    /** 每会话宿主是否支持 Goal。 */
+    private val goalSupportedCache = LinkedHashMap<String, Boolean>()
+
+    /** 每会话宿主允许的 Goal 人类操作子集。 */
+    private val goalActionsCache = LinkedHashMap<String, List<String>>()
 
     /** 大图内存缓存（key = imageId + '@' + maxEdge）。 */
     private val imageCache = LinkedHashMap<String, FetchedImage>()
@@ -513,6 +574,11 @@ class SessionStore(
             queueCache.remove(k)
             permissionCache.remove(k)
             subagentCache.remove(k)
+            todoCache.remove(k)
+            goalCache.remove(k)
+            activationCache.remove(k)
+            goalSupportedCache.remove(k)
+            goalActionsCache.remove(k)
         }
         val active = _activeSessionId.value
         if (active != null && !alive.contains(active)) {
@@ -522,6 +588,11 @@ class SessionStore(
             _subagents.value = emptyList()
             _sessionModel.value = null
             _sessionPermission.value = null
+            _todos.value = null
+            _goal.value = null
+            _goalActivation.value = null
+            _goalSupported.value = false
+            _goalActions.value = emptyList()
         }
     }
 
@@ -530,7 +601,8 @@ class SessionStore(
     // =================================================================================
 
     /**
-     * 打开会话：切投影 + 拉权威数据（history + queue + subagents + model + permission）。
+     * 打开会话：切投影 + 拉权威数据（history + queue + subagents + model + permission
+     * + todos + goal + 待答快照）。
      */
     suspend fun openSession(sessionId: String) {
         finishHideLiveTail(render = false) // 切会话：上一个会话的隐藏窗口作废
@@ -540,6 +612,11 @@ class SessionStore(
             _sessionPermission.value = permissionCache[sessionId]
             _subagents.value = subagentCache[sessionId] ?: emptyList()
             _queueItems.value = nextTurnItems(queueCache[sessionId])
+            _todos.value = todoCache[sessionId]
+            _goal.value = goalCache[sessionId]
+            _goalActivation.value = goalCache[sessionId]?.activation
+            _goalSupported.value = goalSupportedCache[sessionId] ?: false
+            _goalActions.value = goalActionsCache[sessionId] ?: emptyList()
             val items = itemCache.getOrPut(sessionId) { ArrayList() }
             publishTimeline(items.toList())
         }
@@ -549,6 +626,11 @@ class SessionStore(
         loadSubagents(sessionId)
         loadSessionModel(sessionId)
         loadSessionPermission(sessionId)
+        // v1.3.0：Todo / Goal 是**每会话**的权威投影，打开会话必须拉一次。
+        loadSessionTodos(sessionId)
+        loadSessionGoal(sessionId)
+        // v1.3.0：待答快照（回前台 / 重连 / 开会话都靠它恢复卡片）。
+        loadPendingInteractions(sessionId)
     }
 
     /** 关闭会话（清空投影，保留缓存以便快速切回）。 */
@@ -560,6 +642,11 @@ class SessionStore(
             _subagents.value = emptyList()
             _sessionModel.value = null
             _sessionPermission.value = null
+            _todos.value = null
+            _goal.value = null
+            _goalActivation.value = null
+            _goalSupported.value = false
+            _goalActions.value = emptyList()
         }
     }
 
@@ -589,7 +676,12 @@ class SessionStore(
         return applied
     }
 
-    /** 提交提问回答（契约 §5.1 question.answer；answers 见 §5.4）。 */
+    /**
+     * 提交提问回答（契约 §5.1 question.answer；answers 见 §5.4）。
+     *
+     * v1.3.0：`applied:false` = 已失效或已由另一端处理 → **重拉一次快照**对齐真值
+     * （契约 §5.12 不变量 4：事件只负责变化，恢复靠快照）。
+     */
     suspend fun answerQuestion(
         askId: String,
         answers: Map<String, String>,
@@ -611,6 +703,9 @@ class SessionStore(
             synchronized(lock) { _questions.value = _questions.value.filter { it.askId != askId } }
         } else {
             setLastError("提问已超时，桌面端已处理")
+            // 已失效 / 另一端已处理 → 重拉快照（不阻塞本次调用）。
+            val sid = synchronized(lock) { _questions.value.firstOrNull { it.askId == askId }?.sessionId }
+            scope.launch { loadPendingInteractions(sid) }
         }
         return applied
     }
@@ -939,18 +1034,25 @@ class SessionStore(
     }
 
     /**
-     * 断线恢复 = **权威拉取**：对活动会话重拉 history + queue + subagents + model + permission。
+     * 断线恢复 = **权威拉取**：对活动会话重拉 history + queue + subagents + model + permission
+     * + todos + goal + 待答快照。
      * 中继的离线缓存只覆盖「手机掉线但中继活着」的短窗，不能当事实源。
      */
     suspend fun onLinkOnline() {
         if (link.getState() != LinkState.ONLINE) return
         loadSessions()
         loadCapabilities()
+        // v1.3.0：先拉一次全局待答快照（插件仍持有的待答项）——回前台 / 重连后的卡片恢复入口。
+        loadPendingInteractions()
         val sid = synchronized(lock) { _activeSessionId.value } ?: return
         refreshHistory(sid, prepend = false)
         loadQueue(sid)
         loadSessionModel(sid)
         loadSessionPermission(sid)
+        loadSessionTodos(sid)
+        loadSessionGoal(sid)
+        // 会话级待答快照（含宿主 userQuestions 投影的 open / continued 问题）。
+        loadPendingInteractions(sid)
         val row = synchronized(lock) { allSessions[sid] }
         if (row == null || row.parentSessionId.isNullOrEmpty()) {
             loadSubagents(sid)
@@ -1031,6 +1133,235 @@ class SessionStore(
         synchronized(lock) {
             subagentCache[parentSessionId] = list
             if (parentSessionId == _activeSessionId.value) _subagents.value = list
+        }
+    }
+
+    // =================================================================================
+    // v1.3.0：待答交互 / Todo / Goal（契约 §5.12 / §5.13 / §5.14）
+    // =================================================================================
+
+    /**
+     * 拉取待答交互快照（契约 §5.1 v1.3.0 `pending.interactions` / §5.12）。
+     *
+     * 口径：
+     *  - **只读恢复通道**：读失败按「回空数组」处理——不报错、不阻塞瀑布（fail-open）；
+     *  - 指定 `sessionId` → 合并插件仍持有的待答项 + 该会话宿主 `userQuestions` 投影的
+     *    `open` / `continued` 问题，并**清理已失效**的项；
+     *  - 未指定 → 只合并插件仍持有的全局待答项（不做全量冷读，不清理）。
+     */
+    suspend fun loadPendingInteractions(sessionId: String? = null) {
+        // 快照请求的基准序号必须在**发请求之前**取：请求在途时新到的 live 卡
+        // bornSeq 会更大，合并时保留，不被旧快照误删。
+        val issuedSeq = synchronized(lock) { pendingSeq }
+        val value = try {
+            link.requestPendingInteractions(sessionId)
+        } catch (e: Exception) {
+            // 读取失败回空数组：不影响 fail-open，也不写全局错误（契约 §5.12 不变量 1）
+            return
+        }
+        val snapshotQuestions = value.arrOrNull("questions")
+            ?.mapNotNull { (it as? JsonObject)?.let(PendingQuestion::fromJson) }
+            ?: emptyList()
+        val snapshotApprovals = value.arrOrNull("approvals")
+            ?.mapNotNull { (it as? JsonObject)?.let(PendingApproval::fromJson) }
+            ?: emptyList()
+        synchronized(lock) {
+            applyPendingSnapshot(sessionId, snapshotQuestions, snapshotApprovals, issuedSeq)
+        }
+    }
+
+    /** 快照落地：按 askId 幂等合并 live 项与快照项（快照项为准）。 */
+    private fun applyPendingSnapshot(
+        sessionId: String?,
+        snapshotQuestions: List<PendingQuestion>,
+        snapshotApprovals: List<PendingApproval>,
+        issuedSeq: Long
+    ) {
+        val scoped = !sessionId.isNullOrEmpty()
+        val liveQuestions = _questions.value
+        val liveApprovals = _approvals.value
+        val scopedQuestions = if (scoped) liveQuestions.filter { it.sessionId == sessionId } else liveQuestions
+        val scopedApprovals = if (scoped) liveApprovals.filter { it.sessionId == sessionId } else liveApprovals
+        val merged = mergePendingInteractions(
+            liveQuestions = scopedQuestions,
+            liveApprovals = scopedApprovals,
+            snapshotQuestions = snapshotQuestions,
+            snapshotApprovals = snapshotApprovals,
+            // 只有**会话级**快照才是该会话的权威全集 → 才清理已失效的 live 项。
+            dropLiveMissing = scoped,
+            issuedSeq = issuedSeq,
+            liveBorn = pendingBorn
+        )
+        if (scoped) {
+            _questions.value = liveQuestions.filter { it.sessionId != sessionId } + merged.questions
+            _approvals.value = liveApprovals.filter { it.sessionId != sessionId } + merged.approvals
+        } else {
+            _questions.value = merged.questions
+            _approvals.value = merged.approvals
+        }
+        // 快照新建的项也登记 bornSeq；已被清理的项顺手回收 born。
+        val alive = LinkedHashSet<String>()
+        for (q in _questions.value) alive.add(q.askId)
+        for (a in _approvals.value) alive.add(a.askId)
+        val staleBorn = pendingBorn.keys.filter { it !in alive }
+        for (id in staleBorn) pendingBorn.remove(id)
+        for (id in alive) {
+            if (!pendingBorn.containsKey(id)) pendingBorn[id] = ++pendingSeq
+        }
+    }
+
+    /** live 事件到达：新卡登记 bornSeq；同 askId 更新不再换号。 */
+    private fun markPendingBorn(askId: String) {
+        if (askId.isEmpty()) return
+        if (!pendingBorn.containsKey(askId)) pendingBorn[askId] = ++pendingSeq
+    }
+
+    /**
+     * 拉取会话 Todo 快照（契约 §5.1 v1.3.0 `session.todos` / §5.13）。手机**只读**。
+     *
+     * `supported:false` 与 `todos:null` 必须区分：前者隐藏 UI，后者显示「暂无任务」。
+     */
+    suspend fun loadSessionTodos(sessionId: String) {
+        if (sessionId.isEmpty()) return
+        val value = try {
+            link.requestSessionTodos(sessionId)
+        } catch (e: Exception) {
+            // 旧宿主不认识该请求 → 静默降级为「不支持」（隐藏入口，不报错）。
+            val message = e.message ?: ""
+            if (isUnsupportedRequestError(message)) {
+                synchronized(lock) { applyTodosSnapshot(sessionId, TodoState(supported = false, todos = null)) }
+            }
+            return
+        }
+        val state = TodoState.fromJson(value)
+        synchronized(lock) { applyTodosSnapshot(sessionId, state) }
+    }
+
+    /** 拉取会话 Goal 快照（契约 §5.1 v1.3.0 `session.goal` / §5.14）。 */
+    suspend fun loadSessionGoal(sessionId: String) {
+        if (sessionId.isEmpty()) return
+        val value = try {
+            link.requestSessionGoal(sessionId)
+        } catch (e: Exception) {
+            val message = e.message ?: ""
+            if (isUnsupportedRequestError(message)) {
+                synchronized(lock) {
+                    applyGoalSupported(sessionId, false, emptyList())
+                    applyGoalSnapshot(sessionId, null)
+                }
+            }
+            return
+        }
+        val supported = value.bool("supported", true)
+        val actions = value.strList("actions")
+        val goal = value.objOrNull("goal")?.let(GoalWire::fromJson)
+        val activation = value.strOrNull("activation")?.takeIf { it.isNotEmpty() }
+        synchronized(lock) {
+            applyGoalSupported(sessionId, supported, actions)
+            if (activation != null) activationCache[sessionId] = activation
+            applyGoalSnapshot(sessionId, goal)
+        }
+    }
+
+    /**
+     * 执行 Goal 人类操作（契约 §5.1 v1.3.0 `session.goalAction` / §5.14）。
+     *
+     *  - `create` 不带 expected；其余**必须**带手机当前看到的 `{id, revision}` 做 Host CAS；
+     *  - 宿主回 `GOAL_STALE_REVISION` → **重拉** `session.goal` 并把错误透出，
+     *    **绝不**自动覆盖桌面端刚做的变更；
+     *  - 子代理会话**只读**（不得调用模型工具 / 伪造用户消息）。
+     */
+    suspend fun goalAction(
+        sessionId: String,
+        action: GoalAction,
+        objective: String? = null,
+        maxGoalRounds: Int? = null
+    ): Boolean {
+        if (sessionId.isEmpty()) {
+            setLastError("会话 id 为空")
+            return false
+        }
+        if (!canOperateGoal(sessionId)) {
+            setLastError("子代理会话只读，不能操作目标")
+            return false
+        }
+        val current = synchronized(lock) { goalCache[sessionId] }
+        val payload = buildGoalActionPayload(sessionId, action, current, objective, maxGoalRounds)
+        if (payload == null) {
+            setLastError(
+                when (action) {
+                    GoalAction.CREATE -> "请填写目标内容"
+                    GoalAction.EDIT -> "请填写要修改的目标内容或轮数"
+                    else -> "当前没有可操作的目标"
+                }
+            )
+            return false
+        }
+        val value = try {
+            link.requestSessionGoalAction(payload)
+        } catch (e: Exception) {
+            val message = e.message ?: "未知错误"
+            if (isStaleGoalError(message)) {
+                // 契约 §5.14：版本过期 → 必须重拉，客户端不得覆盖新状态。
+                scope.launch { loadSessionGoal(sessionId) }
+                setLastError("目标已被桌面端更新，已重新拉取，请重试")
+            } else {
+                setLastError("目标操作失败：" + message)
+            }
+            return false
+        }
+        val goal = value.objOrNull("goal")?.let(GoalWire::fromJson)
+        synchronized(lock) { applyGoalSnapshot(sessionId, goal) }
+        return true
+    }
+
+    /** 该会话是否允许操作 Goal（子代理只读；未知会话交给宿主裁决）。 */
+    fun canOperateGoal(sessionId: String): Boolean =
+        synchronized(lock) { isGoalOperationAllowed(allSessions[sessionId]) }
+
+    /** Todo 快照落地（整表覆盖；null = 清空为「暂无任务」）。 */
+    private fun applyTodosSnapshot(sessionId: String, state: TodoState) {
+        todoCache[sessionId] = state
+        if (sessionId == _activeSessionId.value) _todos.value = state
+    }
+
+    /** Goal 落地（null = 已清除）。 */
+    private fun applyGoalSnapshot(sessionId: String, goal: GoalWire?) {
+        val next = goalAfterChange(goalCache[sessionId], goal, activationCache[sessionId])
+        if (next == null) {
+            goalCache.remove(sessionId)
+            activationCache.remove(sessionId)
+        } else {
+            goalCache[sessionId] = next
+        }
+        if (sessionId == _activeSessionId.value) {
+            _goal.value = goalCache[sessionId]
+            _goalActivation.value = goalCache[sessionId]?.activation
+        }
+    }
+
+    /**
+     * Goal 激活态落地（契约 §5.2 `session.goalActivationChanged`）。
+     *
+     * 只认**当前目标**的激活事件（id 不匹配 = 旧目标的迟到事件 → 忽略）。
+     */
+    private fun applyGoalActivation(sessionId: String, activation: GoalActivation) {
+        val next = goalAfterActivation(goalCache[sessionId], activation) ?: return
+        activationCache[sessionId] = next.activation.orEmpty()
+        goalCache[sessionId] = next
+        if (sessionId == _activeSessionId.value) {
+            _goal.value = next
+            _goalActivation.value = next.activation
+        }
+    }
+
+    /** 宿主 Goal 能力落地（supported + 允许的操作子集）。 */
+    private fun applyGoalSupported(sessionId: String, supported: Boolean, actions: List<String>) {
+        goalSupportedCache[sessionId] = supported
+        goalActionsCache[sessionId] = actions
+        if (sessionId == _activeSessionId.value) {
+            _goalSupported.value = supported
+            _goalActions.value = actions
         }
     }
 
@@ -1572,6 +1903,32 @@ class SessionStore(
                 return applyQueueSnapshot(sid, items)
             }
 
+            Protocol.TOPIC_SESSION_TODOS_CHANGED -> {
+                // 契约 §5.13：整表覆盖（todo/write 覆盖；turn/start 清为 null）——客户端不自行合并。
+                val sid = data.str("sessionId")
+                if (sid.isNotEmpty()) {
+                    val todos = data.arrOrNull("todos")
+                        ?.mapNotNull { (it as? JsonObject)?.let(TodoItem::fromJson) }
+                    applyTodosSnapshot(sid, TodoState(supported = true, todos = todos))
+                }
+            }
+
+            Protocol.TOPIC_SESSION_GOAL_CHANGED -> {
+                // 契约 §5.14：clear → goal 为 null；其余给完整 GoalWire（不含 activation）。
+                val sid = data.str("sessionId")
+                if (sid.isNotEmpty()) {
+                    val goal = data.objOrNull("goal")?.let(GoalWire::fromJson)
+                    applyGoalSnapshot(sid, goal)
+                }
+            }
+
+            Protocol.TOPIC_SESSION_GOAL_ACTIVATION_CHANGED -> {
+                val sid = data.str("sessionId")
+                if (sid.isNotEmpty()) {
+                    applyGoalActivation(sid, GoalActivation.fromJson(data))
+                }
+            }
+
             Protocol.TOPIC_ASSISTANT_DELTA -> {
                 finishHideLiveTail(render = false) // 确有回合在生成：立即恢复
                 appendDelta(data.str("sessionId"), data.str("text"))
@@ -1646,14 +2003,8 @@ class SessionStore(
             Protocol.TOPIC_APPROVAL_REQUEST -> {
                 val askId = data.str("askId")
                 if (askId.isNotEmpty()) {
-                    val card = ApprovalRequest(
-                        askId = askId,
-                        sessionId = data.str("sessionId"),
-                        toolName = data.str("toolName"),
-                        reason = data.str("reason"),
-                        argsPreview = data.str("argsPreview"),
-                        timeoutMs = data.long("timeoutMs")
-                    )
+                    markPendingBorn(askId)
+                    val card = ApprovalRequest.fromJson(data)
                     _approvals.value = _approvals.value.filter { it.askId != askId } + card
                 }
             }
@@ -1661,6 +2012,7 @@ class SessionStore(
             Protocol.TOPIC_APPROVAL_RESOLVED -> {
                 val askId = data.str("askId")
                 if (askId.isNotEmpty()) {
+                    pendingBorn.remove(askId)
                     _approvals.value = _approvals.value.filter { it.askId != askId }
                 }
             }
@@ -1668,22 +2020,20 @@ class SessionStore(
             Protocol.TOPIC_QUESTION_REQUEST -> {
                 val askId = data.str("askId")
                 if (askId.isNotEmpty()) {
-                    val card = QuestionRequest(
-                        askId = askId,
-                        sessionId = data.str("sessionId"),
-                        questions = data.arrOrNull("questions")
-                            ?.mapNotNull { (it as? JsonObject)?.let(Question::fromJson) }
-                            ?: emptyList(),
-                        timeoutMs = data.long("timeoutMs"),
-                        multiSelect = data.bool("multiSelect")
-                    )
-                    _questions.value = _questions.value.filter { it.askId != askId } + card
+                    markPendingBorn(askId)
+                    val card = QuestionRequest.fromJson(data)
+                    // v1.3.0：同一 askId 重发 = 状态更新 → **替换**而非叠加（幂等）。
+                    _questions.value = replaceQuestionByAskId(_questions.value, card)
                 }
             }
 
             Protocol.TOPIC_QUESTION_RESOLVED -> {
                 val askId = data.str("askId")
                 if (askId.isNotEmpty()) {
+                    // v1.3.0：插件只在问题**真正结束**时发 resolved（timed 超时改发
+                    // continued 状态更新，不发 resolved）。因此必须无条件移除；对
+                    // continued 卡做“仍可答”保护会让桌面端回答后的旧卡永远删不掉。
+                    pendingBorn.remove(askId)
                     _questions.value = _questions.value.filter { it.askId != askId }
                 }
             }
@@ -1698,12 +2048,17 @@ class SessionStore(
     }
 
     /**
-     * session.queue 事件 / 请求落地：整体覆盖该会话的待执行消息（宿主给的是**全量快照**）。
+     * session.queue 事件 / 请求落地：**整表替换**该会话的待执行消息（宿主给的是**全量快照**）。
+     *
+     * v1.3.0 权威口径：出队以 Host 消息 `id`（wire 里的 `itemId`）为主键 →
+     * 快照按 `itemId` **去重**（同 id 只保留第一条），空数组 = 清空。
+     *
      * @return 队列项被消费（消失）时需要补拉历史的会话 id。
      */
     private fun applyQueueSnapshot(sessionId: String, items: List<QueueItem>): String? {
         if (sessionId.isEmpty()) return null
-        val nextIds = items.mapTo(HashSet()) { it.itemId }
+        val deduped = mergeQueueSnapshot(emptyList(), items)
+        val nextIds = deduped.mapTo(HashSet()) { it.itemId }
         var removed = false
         val previous = queueCache[sessionId]
         if (previous != null) {
@@ -1714,9 +2069,9 @@ class SessionStore(
                 }
             }
         }
-        queueCache[sessionId] = items
+        queueCache[sessionId] = deduped
         if (sessionId == _activeSessionId.value) {
-            _queueItems.value = nextTurnItems(items)
+            _queueItems.value = nextTurnItems(deduped)
         }
         // queue 项消失有两种原因：被宿主消费（须补权威用户消息）或被取消（多拉一次无害）。
         return if (removed && link.getState() == LinkState.ONLINE) sessionId else null
@@ -1750,10 +2105,20 @@ class SessionStore(
             _sessionPermission.value = null
             _queueItems.value = emptyList()
             _subagents.value = emptyList()
+            _todos.value = null
+            _goal.value = null
+            _goalActivation.value = null
+            _goalSupported.value = false
+            _goalActions.value = emptyList()
             modelCache.clear()
             permissionCache.clear()
             queueCache.clear()
             subagentCache.clear()
+            todoCache.clear()
+            goalCache.clear()
+            activationCache.clear()
+            goalSupportedCache.clear()
+            goalActionsCache.clear()
         }
     }
 
@@ -1782,6 +2147,11 @@ private const val LOG_KEEP = 80
 
 /** 历史错误文案前缀（归属到会话，不写全局 lastError）。 */
 private const val HISTORY_ERROR_PREFIX = "加载历史失败："
+
+/**
+ * v1.3.0：新建目标时的默认最大轮数（契约 §5.14 maxGoalRounds；手机端不填就用这个）。
+ */
+private const val DEFAULT_MAX_GOAL_ROUNDS = 12
 
 /** 历史错误文案（已带前缀的不重复加）。 */
 private fun historyErrorText(reason: String): String =
@@ -1973,7 +2343,8 @@ internal fun mergeTimelineItems(
             ts = msg.ts,
             seq = msg.seq,
             images = msg.images,
-            files = msg.files
+            files = msg.files,
+            trigger = msg.trigger
         )
         val prior = oldByKey[msg.id]
         pageItems.add(
@@ -1985,6 +2356,7 @@ internal fun mergeTimelineItems(
                     seq = fresh.seq,
                     images = fresh.images,
                     files = fresh.files,
+                    trigger = fresh.trigger,
                     streaming = false
                 )
             } else {
@@ -2324,4 +2696,243 @@ internal fun coveredLiveStepIds(
     }
     if (live.isEmpty()) return emptySet()
     return collectCoveredLiveStepIds(steps.map { DurableStep(it.callId) }, live, authoritativeIdle)
+}
+
+// =====================================================================================
+// v1.3.0 纯函数：队列快照 / 待答合并 / Goal 载荷（便于 JVM 单测，不依赖链路）
+// =====================================================================================
+
+/**
+ * 队列快照合并（**纯函数**，契约 §5.2 v1.3.0 权威口径）。
+ *
+ *  - **整表替换**：`incoming` 是宿主给的**全量快照** → 旧表整体作废（空数组 = 清空）；
+ *  - **按 itemId 去重**：出队以 Host 消息 `id`（wire 里的 `itemId`）为主键，
+ *    同一 id 只保留第一条。
+ *
+ * @param previous 旧表（仅用于说明「整表替换」语义，不参与合并）。
+ */
+internal fun mergeQueueSnapshot(previous: List<QueueItem>, incoming: List<QueueItem>): List<QueueItem> {
+    val seen = HashSet<String>()
+    val out = ArrayList<QueueItem>(incoming.size)
+    for (item in incoming) {
+        if (item.itemId.isEmpty()) continue
+        if (!seen.add(item.itemId)) continue
+        out.add(item)
+    }
+    return out
+}
+
+/** 待答合并结果（契约 §5.12）。 */
+internal data class PendingMergeResult(
+    val questions: List<QuestionRequest>,
+    val approvals: List<ApprovalRequest>
+)
+
+/**
+ * 待答交互合并（**纯函数**，契约 §5.12）。
+ *
+ *  - **按 askId 幂等**：同一 askId 的快照项**替换** live 项（不叠加、不重复）；
+ *  - 快照里没有的 live 项：`dropLiveMissing=true`（会话级权威快照）→ **清理已失效**；
+ *    `false`（全局快照，只含插件仍持有的项）→ 保留。
+ */
+internal fun mergePendingInteractions(
+    liveQuestions: List<QuestionRequest>,
+    liveApprovals: List<ApprovalRequest>,
+    snapshotQuestions: List<PendingQuestion>,
+    snapshotApprovals: List<PendingApproval>,
+    dropLiveMissing: Boolean,
+    /** 快照请求发出前的本地到达序号；bornSeq > 它的 live 卡必须保留。 */
+    issuedSeq: Long = Long.MAX_VALUE,
+    /** askId -> 本地到达序号。 */
+    liveBorn: Map<String, Long> = emptyMap()
+): PendingMergeResult {
+    val snapQ = LinkedHashMap<String, PendingQuestion>()
+    for (q in snapshotQuestions) {
+        if (q.askId.isEmpty()) continue
+        snapQ[q.askId] = q // 同 askId 幂等：后者覆盖前者
+    }
+    val snapA = LinkedHashMap<String, PendingApproval>()
+    for (a in snapshotApprovals) {
+        if (a.askId.isEmpty()) continue
+        snapA[a.askId] = a
+    }
+
+    val outQ = ArrayList<QuestionRequest>()
+    val usedQ = HashSet<String>()
+    for (live in liveQuestions) {
+        val snap = snapQ[live.askId]
+        if (snap != null) {
+            outQ.add(snap.toQuestionRequest())
+            usedQ.add(live.askId)
+        } else if (!dropLiveMissing || (liveBorn[live.askId] ?: 0L) > issuedSeq) {
+            outQ.add(live)
+        }
+    }
+    for ((askId, snap) in snapQ) {
+        if (!usedQ.contains(askId)) outQ.add(snap.toQuestionRequest())
+    }
+
+    val outA = ArrayList<ApprovalRequest>()
+    val usedA = HashSet<String>()
+    for (live in liveApprovals) {
+        val snap = snapA[live.askId]
+        if (snap != null) {
+            outA.add(snap.toApprovalRequest(live.timeoutMs))
+            usedA.add(live.askId)
+        } else if (!dropLiveMissing || (liveBorn[live.askId] ?: 0L) > issuedSeq) {
+            outA.add(live)
+        }
+    }
+    for ((askId, snap) in snapA) {
+        if (!usedA.contains(askId)) outA.add(snap.toApprovalRequest())
+    }
+
+    return PendingMergeResult(outQ, outA)
+}
+
+/**
+ * 按 askId **幂等替换**一张提问卡（契约 §5.12）。
+ *
+ * 同一 askId 重发表示**状态更新**（例如 open → continued）→ 原地替换，不叠加第二张卡。
+ */
+internal fun replaceQuestionByAskId(
+    list: List<QuestionRequest>,
+    card: QuestionRequest
+): List<QuestionRequest> {
+    val out = ArrayList<QuestionRequest>(list.size + 1)
+    var replaced = false
+    for (item in list) {
+        if (item.askId == card.askId) {
+            if (!replaced) {
+                out.add(card)
+                replaced = true
+            }
+            continue
+        }
+        out.add(item)
+    }
+    if (!replaced) out.add(card)
+    return out
+}
+
+/**
+ * 组装 `session.goalAction` 载荷（**纯函数**，契约 §5.1 v1.3.0 / §5.14）。
+ *
+ *  - `create`：不带 `expected`，`objective` 必填；
+ *  - 其余动作：**必须**带手机当前看到的 `expected{id, revision}`（Host CAS）；
+ *  - `edit`：至少提供 `objective` / `maxGoalRounds` 之一。
+ *
+ * @return null = 参数不足（UI 侧应先拦一道）。
+ */
+internal fun buildGoalActionPayload(
+    sessionId: String,
+    action: GoalAction,
+    current: GoalWire?,
+    objective: String?,
+    maxGoalRounds: Int?
+): JsonObject? {
+    val obj = objective?.trim().orEmpty()
+    val rounds = maxGoalRounds?.takeIf { it > 0 }
+    if (action == GoalAction.CREATE) {
+        if (obj.isEmpty()) return null
+        return buildJsonObject {
+            put("sessionId", sessionId)
+            put("action", action.wire)
+            put("objective", obj)
+            put("maxGoalRounds", rounds ?: DEFAULT_MAX_GOAL_ROUNDS)
+        }
+    }
+    if (current == null || current.id.isEmpty()) return null
+    val withFields = action == GoalAction.EDIT
+    if (withFields && obj.isEmpty() && rounds == null) return null
+    return buildJsonObject {
+        put("sessionId", sessionId)
+        put("action", action.wire)
+        put(
+            "expected",
+            buildJsonObject {
+                put("id", current.id)
+                put("revision", current.revision)
+            }
+        )
+        if (withFields) {
+            if (obj.isNotEmpty()) put("objective", obj)
+            if (rounds != null) put("maxGoalRounds", rounds)
+        }
+    }
+}
+
+/** 宿主是否回了「目标版本过期」（契约 §5.14 GOAL_STALE_REVISION）。 */
+internal fun isStaleGoalError(message: String): Boolean =
+    message.contains(Protocol.ERR_GOAL_STALE_REVISION, ignoreCase = true)
+
+/** 请求是否被宿主判为「不认识这个类型」（旧宿主 → 静默降级，不报错）。 */
+internal fun isUnsupportedRequestError(message: String): Boolean {
+    val lower = message.lowercase()
+    return lower.contains("bad-type") ||
+        lower.contains("unsupported") ||
+        lower.contains("not supported")
+}
+
+/**
+ * 该会话是否允许**手机端**操作 Goal（契约 §5.14）。
+ *
+ * 子代理会话**只读**；根会话可操作。未知会话交给宿主裁决（返回 true）。
+ */
+internal fun isGoalOperationAllowed(summary: SessionSummary?): Boolean {
+    if (summary == null) return true
+    return summary.parentSessionId.isNullOrEmpty() && summary.origin != "subagent"
+}
+
+/** Todo 展示口径（契约 §5.13）。 */
+enum class TodoVisibility {
+    /** 宿主不支持 → 隐藏 UI。 */
+    HIDDEN,
+
+    /** 宿主支持但本回合没有清单 → 显示「暂无任务」。 */
+    EMPTY,
+
+    /** 有清单 → 展开显示条目。 */
+    LIST
+}
+
+/**
+ * Todo 展示口径判定（**纯函数**，契约 §5.13）。
+ *
+ * `supported:false`（宿主不支持）与 `todos:null`（宿主支持但没有清单）**必须区分**：
+ * 前者隐藏 UI，后者显示「暂无任务」。
+ */
+fun todoVisibility(state: TodoState?): TodoVisibility = when {
+    state == null || !state.supported -> TodoVisibility.HIDDEN
+    state.todos.isNullOrEmpty() -> TodoVisibility.EMPTY
+    else -> TodoVisibility.LIST
+}
+
+/**
+ * Goal 变化后的新值（**纯函数**，契约 §5.14 `session.goalChanged`）。
+ *
+ * - `changed == null` → 目标被**清除**；
+ * - 否则取事件里的 GoalWire，并补上已知的进程内激活态（事件本身不含 activation）。
+ */
+internal fun goalAfterChange(
+    current: GoalWire?,
+    changed: GoalWire?,
+    knownActivation: String?
+): GoalWire? {
+    if (changed == null) return null
+    val activation = changed.activation ?: knownActivation
+    return if (activation == null) changed else changed.copy(activation = activation)
+}
+
+/**
+ * Goal 激活态变化后的新值（**纯函数**，契约 §5.14 `session.goalActivationChanged`）。
+ *
+ * - 没有当前目标 → 忽略（返回 null）；
+ * - 事件 id 与当前目标不一致 → 旧目标的迟到事件 → 忽略（返回原值）；
+ * - 否则写入新的激活态。
+ */
+internal fun goalAfterActivation(current: GoalWire?, activation: GoalActivation): GoalWire? {
+    if (current == null) return null
+    if (current.id.isNotEmpty() && activation.id.isNotEmpty() && current.id != activation.id) return current
+    return current.copy(activation = activation.activation)
 }

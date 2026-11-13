@@ -3,6 +3,35 @@
 本仓库的版本说明。发版时（推 `v*` 标签）release workflow 会抽取对应版本段落作为
 GitHub Release 的正文——**bump 版本时必须同步补一段 `## [版本]`**，否则发布失败。
 
+## [1.3.3] - 2026-11-13
+
+修一个真机反馈的显示 bug：**手机时间线里有些工具步骤没有名字**，退化成兜底「工具」。
+纯插件侧取数口径修复，**契约与 wire 形状不变**（中继与两个 App 都不需要重新发版）。
+
+### 根因
+
+宿主 `@deepseek-ai/dsh-compaction-tool-result-pruner`（默认 >8192 字符）在上下文压力/溢出时
+把超长工具结果剪枝成 head+tail：先 `compaction/prune`，再 **append 一条新的 `tool/result`**
+（`surfaceOp:{op:'replace',startSeq,endSeq}` + `sourceEventSeqs:[原 seq]`）。这条是
+**模型面（model-only）的替换副本**：只有结果、**没有配对的 `tool/call`**。
+桌面端的对话记录只收 `surfaceOp === "append"` 的事件（"replacement copies stay model-only"），
+`mapHistoryMessages` 也一直按这条过滤——只有 `mapHistorySteps` 漏掉 → 替换副本被当作一次新调用，
+`name` 恒为空；且它的 seq 在日志尾部，导致步骤**错位**，并与旧页里带名字的同一次调用重复。
+
+### 插件（Host 侧）
+
+- `mapHistorySteps`：非 append 的 `tool/result`（prune 替换副本）**跳过**，不再产出无名步骤。
+- `session/event` 直播闸：替换副本**不再桥接** `tool.result`（避免手机中途接入时在尾部冒出无名
+  步骤、并把已显示的结果文本换成剪枝版）；`tool.call` / `tool.result` 的 append 路径完全不变。
+- 门禁：`verify-steps` **238 项**（+5：替换副本不成步骤 / 不改写原步骤名字与结果 /
+  孤儿副本（call 不在页内）也不成步骤 / 直播闸不桥接替换副本）。
+
+### 验证（真实宿主 + 真实数据）
+
+同一真实会话最新页：旧代码 `mapHistorySteps` 得 79 步 / **18 条 name 为空**，
+修复后 61 步 / **0 条无名**。全机 251 个会话日志里 888 条非 append `tool/result`
+（17 个会话最新页会出无名步骤、单页最多 18 条）全部消除。
+
 ## [1.3.2] - 2026-11-12
 
 会话状态三件套（排队 / 待答交互 / Todo / Goal）的真机验收收尾：**契约升到 v1.3.1**

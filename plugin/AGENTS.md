@@ -694,3 +694,34 @@ capabilities 有无降级、历史 files[]）；源码级断言（不直接塞 a
 手打消息无 trigger、轮次补广播 operation=round、goal 提示不进队 + 真人输入出队、
 子代理初始注入进出队、子代理完成唤醒不进队且成触发卡）；`verify-images` 的出队断言同步改成
 「同 id 不管来源都出队」。
+
+## 2026-11-13：prune 的 surface 替换副本不进步骤（修复手机端「工具」无名步骤）
+
+**症状**（用户反馈）：手机时间线里**有些工具步骤没有名字**，退化成兜底「工具」
+（HarmonyOS `StepCard.toolLabel()` / Android `StepCard` 都有 `name.ifEmpty{ "工具" }`）。
+
+**根因**：宿主 `dsh-compaction-tool-result-pruner`（默认 >8192 字符）在上下文压力/溢出时把
+工具结果剪枝成 head+tail：先 `compaction/prune`（标注 shadowed range），再 **append 一条新的
+`tool/result`**，带 `surfaceOp:{op:'replace',startSeq,endSeq}` + `sourceEventSeqs:[原 seq]`。
+那条是**模型面（model-only）的替换副本**：只有结果，**没有配对的 `tool/call`**。
+
+- 桌面端只把 `surfaceOp === "append"` 的事件当对话记录（`dsh-client-ui-chat` 的
+  `isAppendSurfaceEvent`：replacement copies stay model-only；否则会抹掉用户已看到的内容）。
+  `mapHistoryMessages` 一直按这条过滤，**`mapHistorySteps` 曾漏掉** → 替换副本被当成一次新调用，
+  `name` 恒为空；且它的 seq 在日志尾部 → 步骤**错位**并与老页里同名步骤重复。
+- 直播总闸同样把替换副本桥接成 `tool.result` → 手机中途接入时尾部冒出一条无名步骤，
+  并把已显示的结果文本替换成剪枝版（桌面不会）。
+
+**修法**（协议不变，wire 形状不动）：
+
+1. `mapHistorySteps`：`tool/result` 且 `surfaceOp` 非 append → **跳过**（`isTranscriptEvent()`）。
+2. `session/event` 直播闸的 `tool/result` 分支：替换副本**不再桥接** `tool.result`
+   （ask 提问对账逻辑照旧跑）；append 行为完全不变。
+3. 手机端**不用改**：`name` 由 `tool/call` 提供，两个客户端都已按该口径渲染。
+
+**验证**（真实宿主 + 真实数据）：用网关 RPC 拉某真实会话最新页，旧代码 `mapHistorySteps`
+得到 79 步 / **18 条 name 为空**；修复后 61 步 / **0 条无名**。全机 251 个会话日志里
+888 条非 append `tool/result`（17 个会话的最新页会出无名步骤，单页最多 18 条）→ 全部消除。
+
+门禁：`node scripts/verify-steps.mjs` **238 项**（新增：替换副本不产生步骤 / 不改写原步骤
+名字与结果 / 孤儿副本（call 不在页内）也不成步骤 / 直播闸不桥接替换副本，共 +5）。

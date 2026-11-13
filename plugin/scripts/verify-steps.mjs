@@ -352,6 +352,18 @@ function eventsOf(sent, topic) {
     time: 2100,
     data: { turn: 1, step: 1, message: { role: "tool", toolCallId: "c1", content: [{ type: "text", text: "ok" }] } },
   });
+  // 2026-11-13：compaction/prune 的 **surface 替换副本**（surfaceOp:{op:'replace'}）
+  // 只有 tool/result、没有配对的 tool/call；桌面端把它当 model-only（对话记录只认
+  // surfaceOp==='append'）。不得桥接成 tool.result，否则手机端会冒出一条没有名字的
+  // 步骤（callId 无 call 可查 → name='' → 兜底「工具」）。
+  ctx.emit("session/event", fakeSession, {
+    type: "tool/result",
+    seq: 20,
+    time: 2050,
+    surfaceOp: { op: "replace", startSeq: 11, endSeq: 11 },
+    sourceEventSeqs: [11],
+    data: { turn: 1, step: 1, message: { role: "tool", toolCallId: "c1", content: [{ type: "text", text: "pruned" }] } },
+  });
   ctx.emit("session/event", fakeSession, {
     type: "system/message",
     seq: 12,
@@ -376,6 +388,8 @@ function eventsOf(sent, topic) {
   check("tool.call 字段", toolCalls[0]?.sessionId === "sess-live" && toolCalls[0]?.callId === "c1" && toolCalls[0]?.name === "read" && toolCalls[0]?.arguments === '{"path":"a"}' && toolCalls[0]?.ts === 2000, JSON.stringify(toolCalls[0]));
   check("tool.result 事件 1 条", toolResults.length === 1, JSON.stringify(toolResults));
   check("tool.result 字段", toolResults[0]?.callId === "c1" && toolResults[0]?.status === "ok" && toolResults[0]?.resultText === "ok" && toolResults[0]?.errorText === "", JSON.stringify(toolResults[0]));
+  check("surface 替换副本不桥接 tool.result（也不改写已显示的结果）",
+    toolResults.length === 1 && toolResults[0]?.resultText === "ok", JSON.stringify(toolResults));
   // v1.1.4：system/message 与 developer/message **不再桥接**（它们是宿主的
   // 系统提示词节点 / 工具注册表变更——提示词组装记录，不是对话内容，PC 聊天
   // 视图从不展示；手机端曾把它们显示成「系统消息」大段文本，用户反馈移除）。
@@ -752,6 +766,22 @@ function eventsOf(sent, topic) {
   check("mapHistorySteps：只有 result 时 status=ok、seq=result 的 seq", steps[0]?.status === "ok" && steps[0]?.seq === 7, JSON.stringify(steps[0]));
   check("mapHistorySteps：只有 call 时 status=running", steps[1]?.status === "running" && steps[1]?.seq === 9, JSON.stringify(steps[1]));
   check("mapHistorySteps：忽略非工具事件", steps.length === 2, JSON.stringify(steps));
+
+  // 2026-11-13：compaction/prune 会 append 一条 surfaceOp:{op:'replace'} 的 tool/result
+  // （模型面替换副本，只有结果没有 call）。它不得成为步骤——否则 name 恒为空，
+  // 手机端显示兜底「工具」，且 seq 落在日志尾部（错位并与老页里的同名步骤重复）。
+  const prunedSteps = mapHistorySteps([
+    { event: { type: "tool/call", seq: 30, time: 1, data: { turn: 1, step: 1, callId: "c-keep", name: "read", arguments: "{}" } } },
+    { event: { type: "tool/result", seq: 31, time: 2, surfaceOp: "append", sourceEventSeqs: [30], data: { turn: 1, step: 1, message: { role: "tool", toolCallId: "c-keep", content: [{ type: "text", text: "full-output" }] } } } },
+    { event: { type: "tool/result", seq: 90, time: 3, surfaceOp: { op: "replace", startSeq: 31, endSeq: 31 }, sourceEventSeqs: [31], data: { turn: 1, step: 1, message: { role: "tool", toolCallId: "c-keep", content: [{ type: "text", text: "pruned" }] } } } },
+    { event: { type: "tool/result", seq: 120, time: 4, surfaceOp: { op: "replace", startSeq: 40, endSeq: 40 }, sourceEventSeqs: [40], data: { turn: 1, step: 9, message: { role: "tool", toolCallId: "c-gone", content: [{ type: "text", text: "pruned-only" }] } } } },
+  ]);
+  check("mapHistorySteps：surface 替换副本不产生步骤（含 call 不在页内的孤儿副本）", prunedSteps.length === 1, JSON.stringify(prunedSteps));
+  check("mapHistorySteps：prune 后保留原步骤的名字/结果（不被剪枝副本改写）",
+    prunedSteps[0]?.name === "read" && prunedSteps[0]?.status === "ok" && prunedSteps[0]?.resultText === "full-output",
+    JSON.stringify(prunedSteps[0]));
+  check("mapHistorySteps：任何步骤都不带空名字（手机端不会退化成「工具」）",
+    prunedSteps.every((s) => typeof s.name === "string" && s.name.length > 0), JSON.stringify(prunedSteps));
 
   const perm = mapPermissionOptions({ options: [{ value: "custom" }, { id: "a", name: "A" }], defaultPreset: "a" });
   check("mapPermissionOptions：跳过 custom、接受 id 字段", perm.permissions.length === 1 && perm.permissions[0].id === "a", JSON.stringify(perm));

@@ -589,10 +589,30 @@ export function mapToolResultEvent(sessionId, event) {
 }
 
 /**
+ * 事件是否属于「对话记录（transcript）」来源（2026-11-13 修复）。
+ *
+ * 宿主在 `compaction/prune` 时把超长的工具结果改写成 head+tail，并 **append 一条新的
+ * `tool/result`**（`surfaceOp:{op:'replace',startSeq,endSeq}` + `sourceEventSeqs:[原 seq]`）。
+ * 那条新事件是**模型面（model-only）的替换副本**：只有结果，**没有配对的 `tool/call`**；
+ * 桌面端同样只把 `surfaceOp === "append"` 的事件当对话记录（`dsh-client-ui-chat` 的
+ * `isAppendSurfaceEvent` 注释原话：replacement copies stay model-only）。
+ * `tool/call` 不带 `surfaceOp`（undefined）= append。
+ *
+ * `mapHistoryMessages` 一直按这条口径过滤（见其 `event.surfaceOp !== "append"`），
+ * `mapHistorySteps` 曾经漏掉 → prune 的替换副本被当成一次新调用，`name` 恒为空，
+ * 手机端渲染成兜底「工具」，还带着一个错位的 `seq` 与老页里的同名步骤重复。
+ */
+function isTranscriptEvent(event) {
+  const op = event?.surfaceOp;
+  return op === undefined || op === null || op === "append";
+}
+
+/**
  * 契约 §5.7 StepRecord 提取：session.history 的 page.records → steps[]。
  *
  * 规则：
- *   - 只看 type==='tool/call' 与 'tool/result' 的记录；
+ *   - 只看 type==='tool/call' 与 'tool/result' 的记录；**非 append 的 surface 替换副本跳过**
+ *     （prune 重写的事件只有结果、没有 call，当成步骤就是一条无名行）；
  *   - 按 callId 配对：一次调用合并成一条（call 的字段 + result 的状态/文本）；
  *   - seq：优先取 tool/call 事件的 seq；只有 tool/result 时取它的 seq；
  *   - status：tool/result 的 isError 决定 ok/error；只有 call 没有 result 时 running；
@@ -613,6 +633,8 @@ export function mapHistorySteps(records) {
     if (!event || typeof event !== "object") continue;
     const type = event.type;
     if (type !== "tool/call" && type !== "tool/result") continue;
+    // 替换副本（compaction/prune 的 surface 重写）不是对话事件：跳过。
+    if (type === "tool/result" && !isTranscriptEvent(event)) continue;
     const data = event.data;
     if (!data || typeof data !== "object") continue;
     const ts = eventTime(event);
@@ -1259,7 +1281,10 @@ export class HostBridge {
         return;
       }
       if (type === "tool/result") {
-        const mapped = mapToolResultEvent(sessionId, event);
+        // 2026-11-13：surface 替换副本（prune 重写）是模型面事件，桌面端也不把它当
+        // 对话事件 → **不桥接**。否则手机端会多出一条没有名字的步骤（callId 没有
+        // 配对的 tool/call 可查），并把用户已经看到的结果文本换成剪枝版。
+        const mapped = isTranscriptEvent(event) ? mapToolResultEvent(sessionId, event) : null;
         if (mapped !== null) {
           this.#flushStream(sessionId);
           this.#sendEvent("tool.result", mapped);

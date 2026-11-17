@@ -3,6 +3,50 @@
 本仓库的版本说明。发版时（推 `v*` 标签）release workflow 会抽取对应版本段落作为
 GitHub Release 的正文——**bump 版本时必须同步补一段 `## [版本]`**，否则发布失败。
 
+## [1.3.4] - 2026-11-17
+
+legacy 提问体验重做：**两端同步弹卡 + 双端竞速**（契约升 **v1.3.2**，§5.12.7）。
+修两个真机反馈：①「冷启动/久后打开手机，对话卡在提问、看不到弹窗」；②「手机作答后 PC 的提问卡不关」。
+插件 + 两端 App 同步；中继无行为变更。
+
+### 根因
+
+宿主 `tool-ask-user` 默认 **legacy** 模式的提问**不进** Host `userQuestions` 投影（投影只追踪 timed）。
+旧实现「手机独占窗口 120s → fail-open 交桌面」有三个问题：PC 白等 120s；手机在窗口外/提问时离线就
+再也看不到、答不了该问题（冷启动卡提问的根因）；手机先答时 PC 已弹出的卡不会自动关闭
+（Cordis 瀑布上游先定案不取消下游）。
+
+### 插件（Host 侧，鸿蒙/Android 共用）
+
+- **同步弹卡**：legacy 提问去掉手机独占窗口，`#legacySyncQuestion` 同时推手机
+  `question.request{state:"continued"}` + 调 `next()` 交桌面答案器，两端同时弹卡；手机离线时
+  live 帧进中继缓存、重连后经快照恢复，冷启动仍可答。
+- **双端竞速**：`#withLateAnswer` 登记手机可 resolve 的补答通道，与桌面答案竞速，谁先定案谁生效。
+- **手机先答 → PC 卡同步关**：把下游 `request.signal` 包一层插件 `AbortController`
+  （`AbortSignal.any([原signal, dismiss.signal])`，只改瀑布请求副本、不影响工具 `ask()` 的原 signal）；
+  手机先答时 `dismiss.abort()` → 网关 `startRemoteEvent` 监听 signal abort → `cancelRemoteEvent`
+  向 PC 客户端发 `cancel` 帧 → PC 卡关闭。
+- **PC 先答 → 手机卡关**：发 `question.resolved{source:"desktop"}`，手机删卡。
+- fail-open 不破坏（`next()` 恒在竞速里，桌面随时可答，手机非单点）；在线旧客户端（未声明
+  `session-state-v1`）走 `#legacyExclusive` 旧语义兜底；timed 路径不变。
+
+### 两端 App（墓碑防复活 + 冷启动补拉）
+
+- **墓碑**（契约 §5.12 不变量 8）：收到 resolved 删卡后，**发出于该次解决之前的在途旧快照**不得把卡
+  复活。鸿蒙 `sessionstore.ets` `resolvedAt` + `interaction-plan.planPendingMerge` 规则 5；
+  Android `core/Store.kt` `resolvedAt` + `markResolved` + `mergePendingInteractions` 剔除
+  `tomb > issuedSeq` 项（resolved 事件 / 手机作答 applied=true 均记墓碑，live 新卡到达与断链清墓碑）。
+- **鸿蒙冷启动**：online 对账在无活动会话（落首页）时补拉**全局**待答快照，首页横幅可见待处理。
+  Android 本就有全局补拉、UI 已支持 continued 可答，无需改。
+
+### 验证
+
+- 插件门禁全绿：session-state **57**（含手机先答→包装 signal abort / 原 signal 不受影响 / 桌面迟到答案忽略）、
+  steps 238 / images 170 / attachments 129 / crypto 45 / host-api 35 / qr 33 / pairing 47 /
+  relay-supervisor 165 / settings 151；relay 29/29。
+- 鸿蒙 node 契约 + V2 扫描 0 + `devecocli build` 成功；**真机 HUAWEI Mate 70 终验通过**
+  （同步弹卡 → 手机作答 → PC 卡自动关）。Android `:core:test`（含 3 新墓碑用例）+ `:app:assembleDebug` 成功。
+
 ## [1.3.3] - 2026-11-13
 
 修一个真机反馈的显示 bug：**手机时间线里有些工具步骤没有名字**，退化成兜底「工具」。

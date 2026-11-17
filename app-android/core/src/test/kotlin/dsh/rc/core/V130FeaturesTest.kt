@@ -251,6 +251,49 @@ class V130FeaturesTest {
     }
 
     @Test
+    fun `v1_3_2 墓碑：快照发出后才 resolved 的卡不得被旧快照复活`() {
+        // ask-1 / appr-1 在 seq=5  resolved；快照发出于 seq=3（解决之前）→ 不得复活。
+        val merged = mergePendingInteractions(
+            liveQuestions = emptyList(),
+            liveApprovals = emptyList(),
+            snapshotQuestions = listOf(pendingQuestion("ask-1"), pendingQuestion("ask-2")),
+            snapshotApprovals = listOf(pendingApproval("appr-1")),
+            dropLiveMissing = true,
+            issuedSeq = 3L,
+            resolvedAt = mapOf("ask-1" to 5L, "appr-1" to 5L)
+        )
+        assertEquals(listOf("ask-2"), merged.questions.map { it.askId }, "ask-1 在快照发出后 resolved → 旧快照不得复活")
+        assertTrue(merged.approvals.isEmpty(), "appr-1 同样不得复活")
+    }
+
+    @Test
+    fun `v1_3_2 墓碑：解决之后发出的新快照不受限制`() {
+        val merged = mergePendingInteractions(
+            liveQuestions = emptyList(),
+            liveApprovals = emptyList(),
+            snapshotQuestions = listOf(pendingQuestion("ask-1")),
+            snapshotApprovals = emptyList(),
+            dropLiveMissing = true,
+            issuedSeq = 5L,
+            resolvedAt = mapOf("ask-1" to 5L)
+        )
+        assertEquals(1, merged.questions.size, "resolvedAt == issuedSeq（新快照）→ 不受墓碑限制")
+    }
+
+    @Test
+    fun `v1_3_2 墓碑：参数可省略（向后兼容）`() {
+        val merged = mergePendingInteractions(
+            liveQuestions = emptyList(),
+            liveApprovals = emptyList(),
+            snapshotQuestions = listOf(pendingQuestion("ask-1")),
+            snapshotApprovals = emptyList(),
+            dropLiveMissing = true,
+            issuedSeq = 3L
+        )
+        assertEquals(1, merged.questions.size, "不传墓碑时行为不变")
+    }
+
+    @Test
     fun `同一 askId 的事件重发是替换而不是第二张卡`() {
         val list = listOf(questionRequest("ask-1"), questionRequest("ask-2"))
         val replaced = replaceQuestionByAskId(list, questionRequest("ask-1", state = Protocol.PENDING_STATE_CONTINUED))
@@ -542,9 +585,9 @@ class V130FeaturesTest {
     // =================================================================================
 
     @Test
-    fun `契约版本与请求常量对齐 v1_3_1`() {
-        // v1.3.1（契约 §5.3 / §5.14）只新增可选字段，旧客户端/旧插件保持旧行为。
-        assertEquals("v1.3.1", Protocol.CONTRACT_VERSION)
+    fun `契约版本与请求常量对齐 v1_3_2`() {
+        // v1.3.2（契约 §5.12.7）legacy 迟到补答：wire 形状不变，continued 卡 source=plugin/callId 可空。
+        assertEquals("v1.3.2", Protocol.CONTRACT_VERSION)
         assertEquals("pending.interactions", Protocol.MSG_PENDING_INTERACTIONS)
         assertEquals("session.todos", Protocol.MSG_SESSION_TODOS)
         assertEquals("session.goal", Protocol.MSG_SESSION_GOAL)

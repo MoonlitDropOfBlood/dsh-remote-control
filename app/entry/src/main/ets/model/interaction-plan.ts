@@ -41,15 +41,25 @@ export interface PendingMergePlan {
  *  3. 请求发出之后才到达的 live 卡片（bornSeq > issuedSeq）→ **保留**
  *     （旧快照不能误删刚到的卡片）；
  *  4. scopeSessionId 为空（全局范围）→ 只 upsert，不删除（快照不含其他会话的宿主投影）。
+ *  5. v1.3.2：**快照发出之后才 resolved 的卡片不得被这份旧快照复活**——
+ *     resolvedAt[askId] > issuedSeq 的项从 upsert 里剔除。否则「PC 作答 →
+ *     resolved 删卡 → 在途旧快照落地又把卡加回」，手机弹窗关不掉。
+ *
+ * @param resolvedAt 已解决卡片的墓碑（askId → 解决时的 pendingSeq）；可省略。
  */
 export function planPendingMerge(live: PendingCardMeta[], snapshotAskIds: string[],
-  scopeSessionId: string, issuedSeq: number): PendingMergePlan {
+  scopeSessionId: string, issuedSeq: number,
+  resolvedAt?: Map<string, number>): PendingMergePlan {
   const upsert: string[] = [];
   const snapshotSet: Set<string> = new Set<string>();
   for (let i: number = 0; i < snapshotAskIds.length; i++) {
     const id: string = snapshotAskIds[i];
     if (id.length === 0 || snapshotSet.has(id)) {
       continue;
+    }
+    const tomb: number | undefined = resolvedAt === undefined ? undefined : resolvedAt.get(id);
+    if (tomb !== undefined && tomb > issuedSeq) {
+      continue; // 快照发出后才 resolved → 旧快照不得复活死卡（v1.3.2）
     }
     snapshotSet.add(id);
     upsert.push(id);

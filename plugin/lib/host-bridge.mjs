@@ -1069,6 +1069,11 @@ export class HostBridge {
   // v1.1.7：有效权限的直播兜底；权威查询仍优先走 permissions 持久投影。
   #permissionSelections = new Map(); // sessionId -> string（含派生态 custom）
   #pending = new Map(); // askId -> { resolve, kind, sessionId, timer, abortHandler, signal, meta }
+  // v1.3.2（legacy 迟到补答）：独占窗口结束/提问时手机离线后，已交桌面答案器但仍保留
+  // 手机补答通道的 legacy 提问。askId -> { sessionId, meta, resolve, signal, abortHandler }。
+  // legacy 提问不进 Host userQuestions 投影，fail-open 后原本手机永远看不到/答不了；
+  // 这里与 next()（桌面）竞速，谁先定案谁生效（fail-open 不破坏，桌面随时可答）。
+  #lateQuestions = new Map();
   // v1.3.0：Host userQuestions 投影里仍可回答的问题（continued/open），
   // key = sessionId + "\0" + callId；用于快照、桌面端回答后清理与手机补答路由。
   #hostQuestions = new Map();
@@ -1712,6 +1717,22 @@ export class HostBridge {
         });
       }
     }
+    // v1.3.2（legacy 迟到补答）：已交桌面但仍可手机补答的 legacy 提问，快照暴露为
+    // state:'continued'（窗口已结束但仍可答）。无倒计时（expiresAt/timeoutMs 归零）。
+    for (const [askId, entry] of this.#lateQuestions) {
+      if (sessionId !== "" && entry.sessionId !== sessionId) continue;
+      if (questions.some((q) => q.askId === askId)) continue;
+      questions.push({
+        ...entry.meta,
+        askId,
+        sessionId: entry.sessionId,
+        state: "continued",
+        answerable: true,
+        source: "plugin",
+        callId: "",
+        timeoutMs: 0,
+      });
+    }
     if (sessionId !== "") {
       await this.#sweepHostQuestions(sessionId);
       for (const wire of this.#hostQuestions.values()) {
@@ -1977,6 +1998,14 @@ export class HostBridge {
       entry.resolve({ settled: "timeout" });
     }
     this.#pending.clear();
+    // v1.3.2：迟到补答通道只清手机侧登记（next() 已在竞速里，桌面仍可答 → fail-open）。
+    // 不 resolve/reject 迟到 promise，避免把假答案/错误注入仍在等待的瀑布。
+    for (const entry of this.#lateQuestions.values()) {
+      if (entry.signal && entry.abortHandler) {
+        try { entry.signal.removeEventListener("abort", entry.abortHandler); } catch { /* ignore */ }
+      }
+    }
+    this.#lateQuestions.clear();
     this.#hostQuestions.clear();
     this.#goalActivations.clear();
     this.#askQuestionCalls.clear();
@@ -3887,6 +3916,15 @@ export class HostBridge {
       return;
     }
 
+    // v1.3.2（legacy 迟到补答）：独占窗口已结束、问题已交桌面，但补答通道仍在。
+    // resolve 迟到 promise → 与桌面答案竞速，手机先定案即生效（§5.12.7）。
+    const late = askId === "" ? undefined : this.#lateQuestions.get(askId);
+    if (late !== undefined) {
+      late.resolve({ answers, freeText });
+      this.#reply(m, resultOf(m, { applied: true }));
+      return;
+    }
+
     // v1.3.0：超过插件独占窗口后，Host timed 模式仍将问题保持在 continued；
     // 此时必须走 Host 官方 answer（steer 一条 user-question-reply），禁止伪造消息。
     let hostQuestion = null;
@@ -4038,64 +4076,59 @@ export class HostBridge {
 
   /** user-questions/request 拦截器（同 §5.5 语义，答案是 AskUserQuestionAnswer）。 */
   async #onQuestionRequest(req, next) {
-    if (!this.#shouldIntercept("question")) return next();
     // v1.3.0：timed 模式带 Host callId；用它作为稳定 askId，双端才能围绕
     // 同一个问题对象回答/关闭。legacy 没有 wait，仍用随机 id。
     const callId = typeof req?.wait?.callId === "string" ? req.wait.callId : "";
-    const askId = callId !== "" ? callId : randomUUID();
     const sessionId = String(req?.agent?.session?.id ?? "");
-    const timeoutMs = Number(this.#cfg.approvalTimeoutMs) || 120_000;
-    const expiresAt = Date.now() + timeoutMs;
     const questions = mapWireQuestions(req?.questions);
     if (questions.length === 0) return next(); // 形状不对，放行
+    const timeoutMs = Number(this.#cfg.approvalTimeoutMs) || 120_000;
     const meta = {
       callId,
       questions,
       timeoutMs,
       multiSelect: questions.some((q) => q.multiSelect),
     };
+
+    // ---- legacy：同步弹卡 + 双端竞速（v1.3.2 修订）----
+    // 不再让 PC 干等「手机独占窗口」：提问**同时**推手机 + 交桌面（next()），两端同步弹卡，
+    // 谁先答谁生效；手机先答时 abort 包装 signal → 网关 cancel → PC 卡同步关闭。
+    // 手机离线也走此路（live 帧进中继缓存/重连后快照可见），冷启动仍可恢复作答。
+    if (callId === "") {
+      if (this.#disposed || this.#cfg.enabled !== true || this.#cfg.interceptQuestions !== true) {
+        return next(); // 拦截关闭 → 纯桌面答案器
+      }
+      const online = this.#relay.clientOnline === true;
+      if (online && !this.#clientFeatures.has("session-state-v1")) {
+        // 旧 App 不认识 continued：保持旧语义（独占窗口 → 超时清卡交桌面）。
+        return this.#legacyExclusive(req, next, sessionId, meta, timeoutMs);
+      }
+      return this.#legacySyncQuestion(req, next, sessionId, meta);
+    }
+
+    // ---- timed：保持原语义（手机独占窗口 → Host 投影 continued）----
+    if (!this.#shouldIntercept("question")) return next();
+    const askId = callId;
+    const expiresAt = Date.now() + timeoutMs;
     const sent = this.#sendEvent(
       "question.request",
-      {
-        askId,
-        sessionId,
-        callId,
-        state: "open",
-        answerable: true,
-        source: "plugin",
-        ...meta,
-        expiresAt,
-      },
+      { askId, sessionId, callId, state: "open", answerable: true, source: "plugin", ...meta, expiresAt },
       true,
     );
-    if (!sent) {
-      // 帧没进链路 → 不白等，直接放行桌面答案器
-      return next();
-    }
+    if (!sent) return next();
     this.#notifyKind("question", sessionId, askId, {
       title: "需要回答",
       body: questions[0]?.question?.slice(0, 160) || "助手向你提问",
     });
-
     const outcome = await this.#waitForAnswer({
-      askId,
-      kind: "question",
-      sessionId,
-      signal: req?.signal,
-      timeoutMs,
-      expiresAt,
-      meta,
+      askId, kind: "question", sessionId, signal: req?.signal, timeoutMs, expiresAt, meta,
     });
     if (outcome.settled === "phone") {
       this.#sendEvent("question.resolved", { askId, source: "phone" });
-      this.#hostQuestions.delete(sessionId + "\0" + (callId || askId));
+      this.#hostQuestions.delete(sessionId + "\0" + callId);
       return toAskUserQuestionAnswer(questions, outcome.answers, outcome.freeText);
     }
-    // legacy：没有 Host 投影，超时后问题真的交给桌面，手机卡片必须结束。
-    // timed：同一请求已有 callId；超时只结束手机独占窗口，随后由投影以
-    // state:'continued' 重新发布，不能提前发 resolved 把卡片删掉。
-    if (callId === "" || !this.#clientFeatures.has("session-state-v1")) {
-      // legacy，或旧 App 不认识 continued：保持旧语义，超时即清卡。
+    if (!this.#clientFeatures.has("session-state-v1")) {
       this.#sendEvent("question.resolved", { askId, source: "timeout" });
     }
     try {
@@ -4104,8 +4137,126 @@ export class HostBridge {
       this.#log("warn", "next() after question timeout failed", { error: errText(e) });
       throw e;
     } finally {
-      if (callId !== "") void this.#sweepHostQuestions(sessionId);
+      void this.#sweepHostQuestions(sessionId);
     }
+  }
+
+  /**
+   * v1.3.2（legacy 同步弹卡，契约 §5.12.7）：手机 + PC 同时弹卡、双端竞速。
+   * 关键：把下游 request.signal 包一层插件自己的 AbortController——手机先答时 abort 它，
+   * 网关 startRemoteEvent 监听到 abort 就向 PC 客户端发 cancel 帧 → PC 卡关闭（双端同步关）。
+   * 只改瀑布请求副本 req 的 signal；工具 ask() 持有的原 request.signal 不受影响。
+   */
+  #legacySyncQuestion(req, next, sessionId, meta) {
+    const askId = randomUUID();
+    const originalSignal = req?.signal;
+    const dismiss = new AbortController();
+    req.signal = originalSignal !== undefined
+      ? AbortSignal.any([originalSignal, dismiss.signal])
+      : dismiss.signal;
+    // 同步弹：continued = 可答、无倒计时（复用现有渲染）。在线即达；离线进缓存/快照恢复。
+    this.#sendEvent(
+      "question.request",
+      { askId, sessionId, callId: "", state: "continued", answerable: true, source: "plugin", ...meta, timeoutMs: 0, expiresAt: 0 },
+      true,
+    );
+    this.#notifyKind("question", sessionId, askId, {
+      title: "需要回答",
+      body: meta.questions[0]?.question?.slice(0, 160) || "助手向你提问",
+    });
+    return this.#withLateAnswer(req, next, askId, sessionId, meta, dismiss, originalSignal);
+  }
+
+  /** 旧 App（未声明 session-state-v1）的 legacy 兜底：独占窗口 → 超时清卡交桌面（旧语义）。 */
+  async #legacyExclusive(req, next, sessionId, meta, timeoutMs) {
+    const askId = randomUUID();
+    const expiresAt = Date.now() + timeoutMs;
+    const sent = this.#sendEvent(
+      "question.request",
+      { askId, sessionId, callId: "", state: "open", answerable: true, source: "plugin", ...meta, expiresAt },
+      true,
+    );
+    if (!sent) return next();
+    this.#notifyKind("question", sessionId, askId, {
+      title: "需要回答",
+      body: meta.questions[0]?.question?.slice(0, 160) || "助手向你提问",
+    });
+    const outcome = await this.#waitForAnswer({
+      askId, kind: "question", sessionId, signal: req?.signal, timeoutMs, expiresAt, meta,
+    });
+    if (outcome.settled === "phone") {
+      this.#sendEvent("question.resolved", { askId, source: "phone" });
+      return toAskUserQuestionAnswer(meta.questions, outcome.answers, outcome.freeText);
+    }
+    this.#sendEvent("question.resolved", { askId, source: "timeout" });
+    return next();
+  }
+
+  /**
+   * v1.3.2（legacy 双端竞速，契约 §5.12.7）：问题已交桌面答案器（next()），插件同时保留
+   * 一条手机可 resolve 的通道，与桌面答案**竞速**——谁先定案谁生效。
+   *
+   * 为什么需要：legacy 提问不进 Host userQuestions 投影（projection 只追踪 timed），
+   * 没有这条通道手机就看不到/答不了它（冷启动/久后打开「卡在提问」的根因）。
+   * 快照把本通道暴露为 state:'continued'（可答、无倒计时），question.answer 命中即作答。
+   *
+   * fail-open 不破坏：next() 始终在竞速里，桌面随时可答，手机不是单点阻塞。
+   * 双端同步关：手机先答 → abort 包装 signal（dismiss）→ 网关 cancel → PC 卡关闭；
+   *           桌面先答 → 发 question.resolved{desktop} → 手机删卡（PC 卡自然关闭）。
+   */
+  #withLateAnswer(req, next, askId, sessionId, meta, dismiss, originalSignal) {
+    let settleLate;
+    const late = new Promise((resolve) => { settleLate = resolve; });
+    const entry = { sessionId, meta, resolve: settleLate, signal: originalSignal, abortHandler: null };
+    this.#lateQuestions.set(askId, entry);
+    const cleanup = () => {
+      this.#lateQuestions.delete(askId);
+      if (entry.signal && entry.abortHandler) {
+        try { entry.signal.removeEventListener("abort", entry.abortHandler); } catch { /* ignore */ }
+      }
+    };
+    if (entry.signal) {
+      if (entry.signal.aborted) {
+        cleanup();
+      } else {
+        entry.abortHandler = () => { cleanup(); };
+        try { entry.signal.addEventListener("abort", entry.abortHandler, { once: true }); } catch { /* ignore */ }
+      }
+    }
+    let done = false;
+    const downstream = Promise.resolve().then(() => next()).then(
+      (value) => {
+        if (done) return value;
+        done = true;
+        cleanup();
+        this.#sendEvent("question.resolved", { askId, source: "desktop" });
+        return value;
+      },
+      (err) => {
+        // 手机已先答时，PC 卡被 dismiss.abort() 取消而产生的拒绝是预期的，忽略。
+        if (done) return undefined;
+        cleanup();
+        throw err;
+      },
+    );
+    return Promise.race([
+      downstream,
+      late.then((answer) => {
+        if (done) return undefined;
+        done = true;
+        cleanup();
+        this.#sendEvent("question.resolved", { askId, source: "phone" });
+        // 手机先答 → abort 包装 signal → 网关 cancelRemoteEvent → PC 卡关闭。
+        // 延到宏任务：确保竞速已先以手机答案定案，再触发下游（被上面 rejection 分支吞掉）。
+        if (dismiss) {
+          setTimeout(() => { try { dismiss.abort(); } catch { /* ignore */ } }, 0);
+        }
+        return toAskUserQuestionAnswer(meta.questions, answer.answers, answer.freeText);
+      }),
+    ]).catch((e) => {
+      cleanup();
+      throw e;
+    });
   }
 
   /**

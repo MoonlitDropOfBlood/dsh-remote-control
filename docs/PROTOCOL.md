@@ -66,7 +66,16 @@
 > ④ 新增 `session.goal` / `session.goalAction` 与 `session.goalChanged` /
 > `session.goalActivationChanged`，手机展示并可执行新建/编辑/暂停/恢复/完成/清除；
 > 所有变更携带 `{id,revision}` 做 Host CAS，禁止手机覆盖桌面刚做的变更。
-> 三个实现（DSH 插件 / 中继服务器 / HarmonyOS App）
+> **v1.3.2 于 2026-11-17 增补：legacy 提问「同步弹卡 + 双端竞速」（§5.12.7）**——
+> legacy 模式提问**不进** Host `userQuestions` 投影。旧「手机独占窗口 120s → fail-open」既让 PC 白等、
+> 又使手机窗口外/离线时看不到/答不了（冷启动/久后打开「卡在提问」的根因），且手机先答时 PC 卡不关。
+> 现改为：legacy 提问**手机 + PC 同时弹卡**（不设独占窗口），双端竞速谁先答谁生效；手机先答时插件
+> abort 包装的下游 signal → 网关向 PC 发 cancel → **PC 卡同步关闭**；桌面先答则手机收 resolved 删卡。
+> 快照暴露为 `state:"continued"`（`source:"plugin"`、无倒计时），冷启动/重连可恢复作答。
+> 仅对声明 `session-state-v1` 的客户端启用；在线旧客户端仍走旧语义（独占窗口超时清卡）。
+> 另：App 冷启动落在首页（无活动会话）时，online 对账须补拉**全局**待答快照（首页横幅可见）；
+> 客户端收到 resolved 删卡后，**发出于该次解决之前的在途旧快照不得把卡复活**（§5.12 不变量 8）。
+> 各实现（DSH 插件 / 中继服务器 / HarmonyOS App / Android App）
 > 都必须以本文档为准；任何协议改动必须先改本文档并通知 Lead。
 
 ## 1. 目标与范围（用户已确认）
@@ -258,12 +267,12 @@ dshrc://pair?r=<encodeURIComponent(relayUrl)>&c=<channel>&s=<secret>[&t=<encodeU
 | `session.cancel` | `{sessionId}` | `{cancelled:bool}` | 取消当前运行的 turn |
 | `session.rename` | `{sessionId, title}` | `{title}` | |
 | `image.fetch` | `{imageId, maxEdge?:number}` | `{imageId, mediaType, width, height, data:"data:<mediaType>;base64,…"}` | **v1.0.9** 拉取图片大图（§5.10）：`maxEdge` 缺省 1600、上限 4096；插件等比缩放后回 data URI，单张 ≤ 1MiB（中继硬上限），失败回 `error`（不影响消息流） |
-| `pending.interactions` | `{sessionId?}` | `{questions:[PendingQuestion], approvals:[PendingApproval]}` | **v1.3.0** 拉取待答快照，供回前台/重连恢复。指定 `sessionId` 时同时合并插件仍持有的待答项与该会话 Host `userQuestions` 投影的 `open/continued` 问题；未指定时只回插件仍持有的全局待答项（不做全量冷读）。**只读，绝不能阻塞瀑布**；读取失败回空数组，不影响 fail-open |
+| `pending.interactions` | `{sessionId?}` | `{questions:[PendingQuestion], approvals:[PendingApproval]}` | **v1.3.0** 拉取待答快照，供回前台/重连恢复。指定 `sessionId` 时同时合并插件仍持有的待答项与该会话 Host `userQuestions` 投影的 `open/continued` 问题；未指定时只回插件仍持有的全局待答项（**含 legacy 迟到补答项**，§5.12.7；不做全量冷读）。**只读，绝不能阻塞瀑布**；读取失败回空数组，不影响 fail-open |
 | `session.todos` | `{sessionId}` | `{sessionId, todos:[TodoItem]\|null, supported:bool}` | **v1.3.0** 读 Host `todos` 持久投影。`null` = 本回合尚无清单/已清空；`supported:false` = 宿主未提供该能力。手机只读 |
 | `session.goal` | `{sessionId}` | `{sessionId, goal:GoalWire\|null, activation:'armed'\|'disarmed'\|null, supported:bool, actions:GoalAction[]}` | **v1.3.0** 读 Host `goal` 持久投影；`activation` 来自活 Agent 的服务读取或 activation 事件缓存，未知为 `null`。`null` = 当前无目标。`actions` 是宿主可执行的人类操作子集 |
 | `session.goalAction` | `{sessionId, action:GoalAction, expected?:{id,revision}, objective?:string, maxGoalRounds?:number}` | `{sessionId, goal:GoalWire\|null}` | **v1.3.0** 执行人类操作。`create` 不需要 `expected`，`objective` 必填；`edit` 至少提供 `objective`/`maxGoalRounds`；`pause`/`resume`/`complete`/`clear` 必须带手机当前看到的 `expected`，由 Host 做 CAS。陈旧 revision 回 `GOAL_STALE_REVISION`，客户端必须重拉 `session.goal` 后重试，不得覆盖新状态。禁止手机触发 `block` |
 | `approval.answer` | `{askId, decision:"approved"\|"rejected", note?}` | `{applied:bool}` | decision 只允许 approved/rejected |
-| `question.answer` | `{askId, answers:{ [questionId]: value }, freeText?}` | `{applied:bool}` | answers 结构见 §5.4。**v1.3.0**：`askId` 命中插件待答项走原瀑布；否则若该问题在 Host 投影中为 `continued`，插件可调用 Host 官方 `userQuestions.answer()` 补答。不得伪造用户消息。`applied:false` 表示已失效或已由另一端处理，客户端随后重拉快照 |
+| `question.answer` | `{askId, answers:{ [questionId]: value }, freeText?}` | `{applied:bool}` | answers 结构见 §5.4。**v1.3.0**：`askId` 命中插件待答项走原瀑布；否则若该问题在 Host 投影中为 `continued`，插件可调用 Host 官方 `userQuestions.answer()` 补答。**v1.3.2**：命中 legacy 迟到补答通道亦可补答（§5.12.7，与桌面答案竞速）。不得伪造用户消息。`applied:false` 表示已失效或已由另一端处理，客户端随后重拉快照 |
 | `push.register` | `{pushToken, platform:"harmonyos"}` | `{registered:bool}` | 手机拿到 Push Token 后上报 |
 | `ping` | `{}` | `{pong:ts}` | 应用层探活（与传输层心跳独立） |
 
@@ -674,7 +683,7 @@ host → client: {aborted}
 宿主入口的附件校验错误（`session/attachment-invalid`）**原样透传**（连带 `reason`），
 客户端按宿主文案提示，不吞成通用错误。
 
-### 5.12 待答交互与双端提问同步（v1.3.0）
+### 5.12 待答交互与双端提问同步（v1.3.0 / v1.3.2）
 
 ```json
 PendingQuestion = {
@@ -715,13 +724,45 @@ PendingApproval = {
    `ctx.userQuestions.answer(agent, callId, answer)`，禁止注入伪造的 `user/message`。
 4. 手机在后台/断线错过 `question.request` 时，回前台或重连必须拉一次
    `pending.interactions`；事件只负责变化，不承担恢复。
-5. 已超时且 Host 不再可回答（legacy 模式无投影）的问题不得伪装成可答；快照可以省略它，
-   客户端不得显示可编辑卡。
+5. 已超时且 Host 不再可回答的 **timed** 问题不得伪装成可答；快照可以省略它，客户端不得显示
+   可编辑卡。**legacy** 问题无 Host 投影，另按 §5.12.7「迟到补答」通道处理（fail-open 后手机仍可答）。
 6. 旧客户端兼容：未在 `hello.features` 声明 `session-state-v1` 的客户端，插件仍按旧语义在
    timed 超时时发 `question.resolved`，且不得向它重发 `question.request{state:"continued"}`
    （旧 UI 会重复建卡）。新能力只对声明该特性的客户端启用。
 7. 审批与提问共用同一快照通道。Host 没有审批投影，审批只恢复插件仍持有的未决项；
    超时后仍按 fail-open 交给桌面，不得伪造可答。
+8. **旧快照不得复活死卡**（v1.3.2）：客户端收到 `question.resolved` / `approval.resolved`
+   删卡后，若一份**发出于该次解决之前**的在途快照稍后落地，其中已解决的项**不得**再 upsert
+   （客户端以「解决序号 > 快照发出序号」的墓碑跳过）。否则 PC 作答后手机卡片会被旧快照
+   重新加回、弹窗关不掉。live 事件到达是最新权威，可作废同 askId 的墓碑。
+
+#### 5.12.7 legacy 同步弹卡 + 双端竞速（v1.3.2）
+
+**背景**：Host `userQuestions` 投影只追踪 timed 调用；legacy（`tool-ask-user` 默认 mode）提问
+从不进投影。旧实现「手机独占窗口 120s → fail-open 交桌面」既让 PC 白等、又使手机在窗口外/离线时
+看不到/答不了问题（冷启动/久后打开「卡在提问」的根因），且手机先答时 PC 卡不关。
+
+**机制**（插件侧实现，wire 形状不变）：
+
+1. **同步弹卡**：legacy 提问（拦截开关开）**不再设手机独占窗口**——插件同时把
+   `question.request{state:"continued"}` 推手机、并调 `next()` 交桌面答案器，两端同时弹卡。
+   手机离线时 live 帧进中继缓存、重连后经快照恢复，冷启动仍可答。
+2. **双端竞速**：插件登记一条手机可 resolve 的通道，与 `next()`（桌面）**竞速**，谁先定案谁生效。
+   快照把该通道暴露为 `PendingQuestion{state:"continued", source:"plugin", answerable:true,
+   callId:"", expiresAt/timeoutMs 省略}`（可答、无倒计时）。
+3. **双端同步关**：
+   - 手机先答：插件把下游 `request.signal` 包了一层自己的 AbortController，此刻 abort 它——
+     网关 `startRemoteEvent` 监听该 signal，abort 即向 PC 客户端发 `cancel` 帧 → **PC 卡关闭**；
+     同时发 `question.resolved{source:"phone"}` → 手机删卡。只改瀑布请求副本的 signal，
+     工具 `ask()` 持有的原 signal 不受影响（不是取消工具）。
+   - 桌面先答：发 `question.resolved{source:"desktop"}` → 手机删卡；PC 卡随答案器返回自然关闭。
+   - 一端定案后，另一端的迟到回答回 `applied:false`（被忽略）。
+4. **fail-open 不破坏**：`next()`（桌面）始终在竞速里，桌面随时可答，手机不是单点阻塞。
+
+**客户端口径**：`state:"continued"` 卡无论 `source`（plugin/host）都可答（`canSubmit` 恒真），
+无倒计时时显示「可补答」；不得要求 `callId` 非空（legacy `callId:""`）。
+**兼容**：仅对声明 `session-state-v1` 的客户端启用同步弹；在线旧客户端仍走旧语义
+（独占窗口 → 超时 `question.resolved{source:"timeout"}` 清卡并 fail-open）。
 
 ### 5.13 Todo（v1.3.0）
 

@@ -16,8 +16,8 @@ object Protocol {
     /** 协议版本（契约 §5.1 hello.proto）。 */
     const val PROTO_VERSION: Int = 1
 
-    /** 协议契约文档版本（关于页展示用）。 */
-    const val CONTRACT_VERSION: String = "v1.3.1"
+    /** 协议契约文档版本（关于页展示用）。v1.3.2：§5.12.7 legacy 迟到补答 + 冷启动全局待答快照。 */
+    const val CONTRACT_VERSION: String = "v1.3.2"
 
     /** 角色：host = PC 端 DSH 插件；client = 本 App。 */
     const val ROLE_HOST: String = "host"

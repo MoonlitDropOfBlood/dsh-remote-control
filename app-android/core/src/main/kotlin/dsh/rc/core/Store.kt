@@ -338,6 +338,10 @@ class SessionStore(
     // （bornSeq > issuedSeq）不得被那份旧快照误删——与 HarmonyOS 同口径。
     private var pendingSeq = 0L
     private val pendingBorn = HashMap<String, Long>()
+    // v1.3.2（契约 §5.12 不变量 8）：已解决卡片的墓碑（askId → 解决时的 pendingSeq）。
+    // 「PC/手机作答 → resolved 删卡」后，发出于该次解决之前的在途旧快照不得把卡复活。
+    // 与 HarmonyOS resolvedAt 同口径。
+    private val resolvedAt = HashMap<String, Long>()
 
     /** 回前台/重连对账窗口内隐藏尾部直播思考块（v1.3.1；只影响分组投影）。 */
     @Volatile
@@ -669,7 +673,10 @@ class SessionStore(
         }
         val applied = value.bool("applied")
         if (applied) {
-            synchronized(lock) { _approvals.value = _approvals.value.filter { it.askId != askId } }
+            synchronized(lock) {
+                markResolved(askId) // v1.3.2：本地删卡即记墓碑，防旧快照复活
+                _approvals.value = _approvals.value.filter { it.askId != askId }
+            }
         } else {
             setLastError("审批已超时，桌面端已处理")
         }
@@ -700,7 +707,10 @@ class SessionStore(
         }
         val applied = value.bool("applied")
         if (applied) {
-            synchronized(lock) { _questions.value = _questions.value.filter { it.askId != askId } }
+            synchronized(lock) {
+                markResolved(askId) // v1.3.2：本地删卡即记墓碑，不等 resolved（防旧快照复活）
+                _questions.value = _questions.value.filter { it.askId != askId }
+            }
         } else {
             setLastError("提问已超时，桌面端已处理")
             // 已失效 / 另一端已处理 → 重拉快照（不阻塞本次调用）。
@@ -1190,7 +1200,8 @@ class SessionStore(
             // 只有**会话级**快照才是该会话的权威全集 → 才清理已失效的 live 项。
             dropLiveMissing = scoped,
             issuedSeq = issuedSeq,
-            liveBorn = pendingBorn
+            liveBorn = pendingBorn,
+            resolvedAt = resolvedAt
         )
         if (scoped) {
             _questions.value = liveQuestions.filter { it.sessionId != sessionId } + merged.questions
@@ -1213,7 +1224,25 @@ class SessionStore(
     /** live 事件到达：新卡登记 bornSeq；同 askId 更新不再换号。 */
     private fun markPendingBorn(askId: String) {
         if (askId.isEmpty()) return
+        // live 到达是最新权威：作废同 askId 的墓碑（v1.3.2）。
+        resolvedAt.remove(askId)
         if (!pendingBorn.containsKey(askId)) pendingBorn[askId] = ++pendingSeq
+    }
+
+    /**
+     * v1.3.2：resolved 墓碑——推进序号并记下「该 askId 在此刻已解决」。
+     * 之后落地的旧快照（issuedSeq 更小）不得把它复活（mergePendingInteractions）。
+     * 序号必须推进：否则「快照发出 → resolved」两者序号相同，旧快照仍会复活死卡。
+     */
+    private fun markResolved(askId: String) {
+        if (askId.isEmpty()) return
+        pendingBorn.remove(askId)
+        resolvedAt[askId] = ++pendingSeq
+        // 墓碑上限：askId 是一次性 UUID/callId，防极端场景无限增长。
+        while (resolvedAt.size > 128) {
+            val oldest = resolvedAt.minByOrNull { it.value }?.key ?: break
+            resolvedAt.remove(oldest)
+        }
     }
 
     /**
@@ -2012,7 +2041,7 @@ class SessionStore(
             Protocol.TOPIC_APPROVAL_RESOLVED -> {
                 val askId = data.str("askId")
                 if (askId.isNotEmpty()) {
-                    pendingBorn.remove(askId)
+                    markResolved(askId) // v1.3.2：删卡 + 墓碑，防在途旧快照复活
                     _approvals.value = _approvals.value.filter { it.askId != askId }
                 }
             }
@@ -2033,7 +2062,7 @@ class SessionStore(
                     // v1.3.0：插件只在问题**真正结束**时发 resolved（timed 超时改发
                     // continued 状态更新，不发 resolved）。因此必须无条件移除；对
                     // continued 卡做“仍可答”保护会让桌面端回答后的旧卡永远删不掉。
-                    pendingBorn.remove(askId)
+                    markResolved(askId) // v1.3.2：删卡 + 墓碑，防在途旧快照复活
                     _questions.value = _questions.value.filter { it.askId != askId }
                 }
             }
@@ -2119,6 +2148,7 @@ class SessionStore(
             activationCache.clear()
             goalSupportedCache.clear()
             goalActionsCache.clear()
+            resolvedAt.clear() // v1.3.2：墓碑随主机切换作废（askId 不跨主机复用）
         }
     }
 
@@ -2744,16 +2774,23 @@ internal fun mergePendingInteractions(
     /** 快照请求发出前的本地到达序号；bornSeq > 它的 live 卡必须保留。 */
     issuedSeq: Long = Long.MAX_VALUE,
     /** askId -> 本地到达序号。 */
-    liveBorn: Map<String, Long> = emptyMap()
+    liveBorn: Map<String, Long> = emptyMap(),
+    /** v1.3.2：askId -> 解决时的序号。resolvedAt[askId] > issuedSeq 的快照项不得复活。 */
+    resolvedAt: Map<String, Long> = emptyMap()
 ): PendingMergeResult {
     val snapQ = LinkedHashMap<String, PendingQuestion>()
     for (q in snapshotQuestions) {
         if (q.askId.isEmpty()) continue
+        // v1.3.2：快照发出后才 resolved 的卡，不得被这份旧快照复活（契约 §5.12 不变量 8）。
+        val tomb = resolvedAt[q.askId]
+        if (tomb != null && tomb > issuedSeq) continue
         snapQ[q.askId] = q // 同 askId 幂等：后者覆盖前者
     }
     val snapA = LinkedHashMap<String, PendingApproval>()
     for (a in snapshotApprovals) {
         if (a.askId.isEmpty()) continue
+        val tomb = resolvedAt[a.askId]
+        if (tomb != null && tomb > issuedSeq) continue
         snapA[a.askId] = a
     }
 

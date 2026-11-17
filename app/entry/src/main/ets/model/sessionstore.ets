@@ -704,6 +704,13 @@ export class SessionStore {
   private pendingSeq: number = 0;
   /** v1.3.0（§5.12）：待答快照请求在途标记（不排队、不阻塞，fail-open）。 */
   private pendingLoading: boolean = false;
+  /**
+   * v1.3.2：已解决卡片的墓碑（askId → 解决时的 pendingSeq）。
+   * 「PC 作答 → resolved 删卡」之后，若仍有一份**在途旧快照**（发出于 resolved 之前）
+   * 落地，它里面还带着这个问题——不得把已删的卡重新加回（否则手机弹窗关不掉）。
+   * 快照合并时 resolvedAt[askId] > issuedSeq 的项跳过 upsert（interaction-plan 规则 5）。
+   */
+  private resolvedAt: Map<string, number> = new Map<string, number>();
   /** v1.3.0（§5.13）：每会话 Todo 整表（null = 本回合无清单 / 已清空）。 */
   private todoCache: Map<string, DshrcTodoItem[] | null> = new Map<string, DshrcTodoItem[] | null>();
   /** v1.3.0（§5.13）：每会话是否支持 Todo（false → 隐藏清单 UI）。 */
@@ -794,6 +801,7 @@ export class SessionStore {
       this.queueCache.clear(); // v1.1.1：断开后不留上一台主机的待执行消息
       // v1.3.0：断开/切远程后不留上一台主机的待答交互 / Todo / Goal 投影
       this.pendingMeta.clear();
+      this.resolvedAt.clear(); // v1.3.2：墓碑随主机切换作废（askId 不跨主机复用）
       this.pendingVersion = this.pendingVersion + 1;
       this.todoCache.clear();
       this.todoSupportedCache.clear();
@@ -851,7 +859,14 @@ export class SessionStore {
     this.beginHideLiveTail(this.activeId);
     const list: Promise<SessionRefreshResult> = this.refreshSessions();
     list.then((): void => {
-      if (this.link.getState() !== 'online' || this.activeId.length === 0) {
+      if (this.link.getState() !== 'online') {
+        return;
+      }
+      if (this.activeId.length === 0) {
+        // v1.3.2：冷启动落在首页（无活动会话）也要拉一次**全局**待答快照——否则插件仍
+        // 持有的提问/审批（含 legacy 迟到补答项）不会上首页横幅，用户冷启动看不到「有待处理」。
+        // 此前 online 对账在 activeId 为空时直接早退，全局快照从未被拉取（根因之一）。
+        this.loadPendingInteractions();
         return;
       }
       const sid: string = this.activeId;
@@ -1335,14 +1350,25 @@ export class SessionStore {
       snapshotAskIds.push(approvals[j].askId);
     }
     // 先算计划再写：避免把刚 upsert 的新卡片算进 remove。
-    const plan: PendingMergePlan = planPendingMerge(metas, snapshotAskIds, scope, issuedSeq);
+    // v1.3.2：带上 resolved 墓碑——快照发出后才 resolved 的卡不得被这份旧快照复活。
+    const plan: PendingMergePlan = planPendingMerge(metas, snapshotAskIds, scope, issuedSeq, this.resolvedAt);
+    const upsertSet: Set<string> = new Set<string>();
+    for (let u: number = 0; u < plan.upsert.length; u++) {
+      upsertSet.add(plan.upsert[u]);
+    }
     for (let k: number = 0; k < questions.length; k++) {
       const q: DshrcPendingQuestion = questions[k];
+      if (!upsertSet.has(q.askId)) {
+        continue; // 已在快照发出后 resolved → 旧快照不得复活死卡（v1.3.2）
+      }
       this.upsertQuestion(q.askId, q.sessionId, q.questions, q.multiSelect, q.state,
         q.callId, q.expiresAt, q.answerable, q.timeoutMs, q.source, false);
     }
     for (let m: number = 0; m < approvals.length; m++) {
       const a: DshrcPendingApproval = approvals[m];
+      if (!upsertSet.has(a.askId)) {
+        continue; // 同上（v1.3.2）
+      }
       this.upsertApproval(a.askId, a.sessionId, a.toolName, a.reason, a.argsPreview,
         a.answerable, a.expiresAt, a.source, false);
     }
@@ -3079,6 +3105,10 @@ export class SessionStore {
       case TOPIC_APPROVAL_REQUEST: {
         const askId: string = data.askId !== undefined ? data.askId : '';
         if (askId.length > 0) {
+          logDshrc(TAG, 'info', 'approval.request ' + askId.slice(0, 8) + ' sid=' +
+            (data.sessionId !== undefined ? data.sessionId.slice(0, 20) : ''));
+          // live 到达是最新权威：若该 askId 曾有墓碑，作废之（v1.3.2）。
+          this.resolvedAt.delete(askId);
           // 快照基准取**事件处理前**的序号：刚到的卡片不得被随后发出的快照删掉。
           const issuedBefore: number = this.pendingSeq;
           this.upsertApproval(askId,
@@ -3098,6 +3128,8 @@ export class SessionStore {
       case TOPIC_APPROVAL_RESOLVED: {
         const askId2: string = data.askId !== undefined ? data.askId : '';
         if (askId2.length > 0) {
+          logDshrc(TAG, 'info', 'approval.resolved ' + askId2.slice(0, 8) +
+            ' source=' + (data.source !== undefined ? data.source : ''));
           // 先取会话（drop 之后 meta 已被清掉）。
           const resolvedSid: string = this.pendingSessionOf(askId2);
           this.dropApproval(askId2);
@@ -3109,6 +3141,11 @@ export class SessionStore {
       case TOPIC_QUESTION_REQUEST: {
         const askId3: string = data.askId !== undefined ? data.askId : '';
         if (askId3.length > 0) {
+          logDshrc(TAG, 'info', 'question.request ' + askId3.slice(0, 8) +
+            ' state=' + (data.state !== undefined ? data.state : 'open') +
+            ' sid=' + (data.sessionId !== undefined ? data.sessionId.slice(0, 20) : ''));
+          // live 到达是最新权威：若该 askId 曾有墓碑，作废之（v1.3.2）。
+          this.resolvedAt.delete(askId3);
           // 快照基准取**事件处理前**的序号：刚到的卡片不得被随后发出的快照删掉。
           const issuedBefore3: number = this.pendingSeq;
           this.upsertQuestion(askId3,
@@ -3130,6 +3167,8 @@ export class SessionStore {
       case TOPIC_QUESTION_RESOLVED: {
         const askId4: string = data.askId !== undefined ? data.askId : '';
         if (askId4.length > 0) {
+          logDshrc(TAG, 'info', 'question.resolved ' + askId4.slice(0, 8) +
+            ' source=' + (data.source !== undefined ? data.source : ''));
           // 先取会话（drop 之后 meta 已被清掉）。
           const resolvedSid4: string = this.pendingSessionOf(askId4);
           this.dropQuestion(askId4);
@@ -3197,6 +3236,7 @@ export class SessionStore {
     }
     this.approvals = next;
     this.pendingMeta.delete(askId);
+    this.markResolved(askId);
     this.pendingVersion = this.pendingVersion + 1;
     postSessionStateChanged(sid);
   }
@@ -3211,8 +3251,34 @@ export class SessionStore {
     }
     this.questions = next;
     this.pendingMeta.delete(askId);
+    this.markResolved(askId);
     this.pendingVersion = this.pendingVersion + 1;
     postSessionStateChanged(sid);
+  }
+
+  /**
+   * v1.3.2：resolved 墓碑——推进序号并记下「该 askId 在此刻已解决」。
+   * 之后落地的旧快照（issuedSeq 更小）不得把它复活（interaction-plan 规则 5）。
+   * 序号必须推进：否则「快照发出 → resolved」两者序号相同，旧快照仍会复活死卡。
+   */
+  private markResolved(askId: string): void {
+    this.pendingSeq = this.pendingSeq + 1;
+    this.resolvedAt.set(askId, this.pendingSeq);
+    // 墓碑上限：askId 是一次性 UUID/callId，正常用不到这么多；防极端场景无限增长。
+    while (this.resolvedAt.size > 128) {
+      let oldestKey: string = '';
+      let oldestSeq: number = Number.MAX_SAFE_INTEGER;
+      this.resolvedAt.forEach((seq: number, key: string): void => {
+        if (seq < oldestSeq) {
+          oldestSeq = seq;
+          oldestKey = key;
+        }
+      });
+      if (oldestKey.length === 0) {
+        break;
+      }
+      this.resolvedAt.delete(oldestKey);
+    }
   }
 }
 

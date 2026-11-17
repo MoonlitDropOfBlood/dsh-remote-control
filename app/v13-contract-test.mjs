@@ -82,6 +82,16 @@ const indexPage = readFileSync(new URL('./entry/src/main/ets/pages/Index.ets', i
   // 幂等：同一 askId 在快照里出现多次只 upsert 一次
   const plan5 = planPendingMerge([], ['a1', 'a1', 'a2'], 's1', 0);
   assert.deepEqual(plan5.upsert, ['a1', 'a2'], '同 askId 不得重复 upsert');
+
+  // v1.3.2 墓碑：快照发出后才 resolved 的卡，不得被这份在途旧快照复活
+  // （PC 作答 → resolved 删卡 → 旧快照落地又加回 → 手机弹窗关不掉）。
+  const tombs = new Map([['a1', 5]]); // a1 在 seq=5 时 resolved
+  const plan6 = planPendingMerge([], ['a1', 'a2'], 's1', 3, tombs); // 快照发出于 seq=3（resolved 之前）
+  assert.deepEqual(plan6.upsert, ['a2'], '快照发出后 resolved 的卡不得被旧快照复活（a1 剔除）');
+  const plan7 = planPendingMerge([], ['a1', 'a2'], 's1', 5, tombs); // 快照发出于 seq=5（resolved 之后）
+  assert.deepEqual(plan7.upsert, ['a1', 'a2'], 'resolved 之后发出的新快照不受墓碑限制');
+  const plan8 = planPendingMerge([], ['a1'], 's1', 3); // 不传墓碑 → 旧行为不变
+  assert.deepEqual(plan8.upsert, ['a1'], '墓碑参数可省略（向后兼容）');
 }
 
 // ③ Todo：null（无清单）vs 空表 vs 有条目；三态计数。
@@ -125,7 +135,7 @@ const indexPage = readFileSync(new URL('./entry/src/main/ets/pages/Index.ets', i
 
 // ---------------------------------------------------------------- 协议层接线
 
-assert.match(protocol, /export const CONTRACT_VERSION: string = 'v1\.3\.1'/);
+assert.match(protocol, /export const CONTRACT_VERSION: string = 'v1\.3\.2'/);
 assert.match(protocol, /MSG_PENDING_INTERACTIONS: string = 'pending\.interactions'/);
 assert.match(protocol, /MSG_SESSION_TODOS: string = 'session\.todos'/);
 assert.match(protocol, /MSG_SESSION_GOAL: string = 'session\.goal'/);
@@ -183,7 +193,18 @@ assert.doesNotMatch(store, /this\.approvals = this\.approvals\.concat\(\[card\]\
 
 // 待答快照：合并 + 失效清理。
 assert.match(store, /private applyPendingInteractions\(snap: DshrcPendingInteractions, scope: string,\s+issuedSeq: number\): void/);
-assert.match(store, /const plan: PendingMergePlan = planPendingMerge\(metas, snapshotAskIds, scope, issuedSeq\);/);
+assert.match(store, /const plan: PendingMergePlan = planPendingMerge\(metas, snapshotAskIds, scope, issuedSeq, this\.resolvedAt\);/);
+// v1.3.2 resolved 墓碑：删卡记墓碑（推进序号）→ 旧快照不得复活死卡（PC 作答后弹窗不关的修复）。
+assert.match(store, /private resolvedAt: Map<string, number> = new Map<string, number>\(\);/);
+assert.match(store, /private markResolved\(askId: string\): void \{[\s\S]*?this\.pendingSeq = this\.pendingSeq \+ 1;[\s\S]*?this\.resolvedAt\.set\(askId, this\.pendingSeq\);/,
+  '删卡必须推进序号并记墓碑（序号不推进则旧快照仍会复活死卡）');
+assert.match(store, /private dropQuestion\(askId: string\): void \{[\s\S]*?this\.markResolved\(askId\);/);
+assert.match(store, /private dropApproval\(askId: string\): void \{[\s\S]*?this\.markResolved\(askId\);/);
+assert.match(store, /if \(!upsertSet\.has\(q\.askId\)\) \{[\s\S]*?continue;/,
+  '快照 upsert 必须按合并计划过滤（墓碑项跳过）');
+assert.match(store, /case TOPIC_QUESTION_REQUEST:[\s\S]*?this\.resolvedAt\.delete\(askId3\);/,
+  'live 提问到达必须作废同 askId 墓碑（live 是最新权威）');
+assert.match(store, /this\.resolvedAt\.clear\(\);/, '断链/切远程必须清墓碑');
 assert.match(store, /this\.dropQuestion\(plan\.remove\[n\]\);/);
 assert.match(store, /this\.dropApproval\(plan\.remove\[n\]\);/);
 
@@ -192,6 +213,8 @@ assert.match(store, /onAppForeground\(\): void \{[\s\S]*?this\.loadPendingIntera
   '回前台必须拉待答交互快照');
 assert.match(store, /private reconcileActiveSession\(\): void \{[\s\S]*?this\.loadPendingInteractions\(sid\);/,
   '断线恢复对账必须拉待答交互快照');
+assert.match(store, /private reconcileActiveSession\(\): void \{[\s\S]*?if \(this\.activeId\.length === 0\) \{[\s\S]*?this\.loadPendingInteractions\(\);[\s\S]*?return;/,
+  '冷启动落在首页（无活动会话）online 对账必须拉全局待答快照，否则首页横幅看不到待处理（v1.3.2）');
 assert.match(store, /openSession\(sid: string\): void \{[\s\S]*?this\.loadPendingInteractions\(sid\);/,
   '打开会话必须拉待答交互快照');
 assert.match(store, /case TOPIC_QUESTION_REQUEST:[\s\S]*?this\.loadPendingInteractions\(/,

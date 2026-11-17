@@ -348,34 +348,192 @@ check(
 }
 
 // ---------------------------------------------------------------------------
-// legacy 模式：超时仍按 DSH/fail-open 语义交给桌面，不伪装 continued
+// v1.3.2 legacy 迟到补答（§5.12.7）：legacy 提问不进 Host 投影，fail-open 后
+// 插件保留补答通道与桌面竞速 —— 冷启动/久后打开手机仍能恢复并作答（根因修复）。
 // ---------------------------------------------------------------------------
 {
+  // 场景 A：手机在线 → 独占窗口超时 → 转 continued 补答卡（不清卡）→ 手机迟到作答生效。
   const ctx = makeCtx({});
   const relay = makeRelay();
-  const bridge = makeBridge(ctx, relay, { ...CFG, approvalTimeoutMs: 60 });
+  const bridge = makeBridge(ctx, relay, { ...CFG, approvalTimeoutMs: 40 });
   bridge.attach();
-  await bridge.dispatch({
-    id: "hello-legacy",
-    type: "hello",
-    payload: { features: ["session-state-v1"] },
-  });
+  await bridge.dispatch({ id: "hello-late", type: "hello", payload: { features: ["session-state-v1"] } });
+  let desktopResolve;
+  const desktopAnswer = new Promise((r) => { desktopResolve = r; });
   const requestPromise = ctx.emit(
     "user-questions/request",
-    {
-      questions: [{ id: "q1", question: "legacy" }],
-      agent: { session: { id: "sess-legacy" } },
-      signal: new AbortController().signal,
-    },
+    { questions: [{ id: "q1", question: "legacy 迟到" }], agent: { session: { id: "sess-late" } }, signal: new AbortController().signal },
+    () => desktopAnswer, // 桌面答案器挂着，等手机先答
+  );
+  await new Promise((r) => setTimeout(r, 70)); // 等独占窗口(40ms)超时 → 转迟到通道
+  const contUpdate = eventsOf(relay.sent, "question.request").find((e) => e.state === "continued");
+  check(
+    "legacy 超时转 continued 补答卡（不发 resolved{timeout} 清卡）",
+    contUpdate !== undefined && contUpdate.answerable === true && eventsOf(relay.sent, "question.resolved").length === 0,
+    JSON.stringify({ contUpdate, resolved: eventsOf(relay.sent, "question.resolved") }),
+  );
+  await bridge.dispatch({ id: "p-late", type: "pending.interactions", payload: { sessionId: "sess-late" } });
+  const snapQ = lastResult(relay.sent, "p-late")?.value?.questions ?? [];
+  check(
+    "legacy 迟到项进快照（continued / source=plugin / 可答 / 无倒计时）",
+    snapQ.length === 1 && snapQ[0].state === "continued" && snapQ[0].source === "plugin"
+      && snapQ[0].answerable === true && !snapQ[0].expiresAt,
+    JSON.stringify(snapQ),
+  );
+  await bridge.dispatch({ id: "a-late", type: "question.answer", payload: { askId: snapQ[0]?.askId, answers: { q1: ["phone"] }, freeText: "" } });
+  const settled = await requestPromise;
+  await tick();
+  check(
+    "legacy 手机迟到补答生效（applied:true + 瀑布定案手机答案）",
+    lastResult(relay.sent, "a-late")?.value?.applied === true
+      && settled[0]?.value?.answers?.[0]?.selected?.[0] === "phone",
+    JSON.stringify({ applied: lastResult(relay.sent, "a-late"), settled }),
+  );
+  check(
+    "legacy 手机定案发 resolved{phone}",
+    eventsOf(relay.sent, "question.resolved").at(-1)?.source === "phone",
+    JSON.stringify(eventsOf(relay.sent, "question.resolved")),
+  );
+  desktopResolve({ answers: [{ id: "q1", selected: ["desktop-late"] }] }); // 桌面迟到答案被忽略
+  await tick();
+}
+{
+  // 场景 B（冷启动根因）：提问时手机离线 → 插件仍登记迟到项 → 手机重连拉快照可见 → 补答生效。
+  const ctx = makeCtx({});
+  const relay = makeRelay();
+  relay.clientOnline = false; // 提问发生时手机不在
+  const bridge = makeBridge(ctx, relay, { ...CFG, approvalTimeoutMs: 40 });
+  bridge.attach();
+  let desktopResolve;
+  const desktopAnswer = new Promise((r) => { desktopResolve = r; });
+  const requestPromise = ctx.emit(
+    "user-questions/request",
+    { questions: [{ id: "q1", question: "离线提问" }], agent: { session: { id: "sess-off" } }, signal: new AbortController().signal },
+    () => desktopAnswer,
+  );
+  await tick();
+  relay.clientOnline = true; // 手机冷启动重连
+  await bridge.dispatch({ id: "hello-off", type: "hello", payload: { features: ["session-state-v1"] } });
+  await bridge.dispatch({ id: "p-off", type: "pending.interactions", payload: {} }); // 全局快照（首页横幅）
+  const snapQ = lastResult(relay.sent, "p-off")?.value?.questions ?? [];
+  check(
+    "离线提问也进全局快照（冷启动首页可见）",
+    snapQ.length === 1 && snapQ[0].sessionId === "sess-off" && snapQ[0].state === "continued" && snapQ[0].answerable === true,
+    JSON.stringify(snapQ),
+  );
+  await bridge.dispatch({ id: "a-off", type: "question.answer", payload: { askId: snapQ[0]?.askId, answers: { q1: ["phone"] }, freeText: "" } });
+  const settled = await requestPromise;
+  await tick();
+  check(
+    "离线提问手机补答生效",
+    lastResult(relay.sent, "a-off")?.value?.applied === true
+      && settled[0]?.value?.answers?.[0]?.selected?.[0] === "phone",
+    JSON.stringify({ applied: lastResult(relay.sent, "a-off"), settled }),
+  );
+  desktopResolve({ answers: [{ id: "q1", selected: ["desktop"] }] });
+  await tick();
+}
+{
+  // 场景 C：桌面先答 → 迟到通道清理 → 手机迟到回答 applied:false（不重复定案）。
+  const ctx = makeCtx({});
+  const relay = makeRelay();
+  const bridge = makeBridge(ctx, relay, { ...CFG, approvalTimeoutMs: 40 });
+  bridge.attach();
+  await bridge.dispatch({ id: "hello-deskfirst", type: "hello", payload: { features: ["session-state-v1"] } });
+  const requestPromise = ctx.emit(
+    "user-questions/request",
+    { questions: [{ id: "q1", question: "桌面先答" }], agent: { session: { id: "sess-deskfirst" } }, signal: new AbortController().signal },
+    async () => ({ answers: [{ id: "q1", selected: ["desktop"] }] }), // 桌面立即答
+  );
+  const settled = await requestPromise;
+  await tick();
+  check(
+    "桌面先答仍生效（fail-open 不破坏）",
+    settled[0]?.value?.answers?.[0]?.selected?.[0] === "desktop"
+      && eventsOf(relay.sent, "question.resolved").at(-1)?.source === "desktop",
+    JSON.stringify({ settled, resolved: eventsOf(relay.sent, "question.resolved") }),
+  );
+  await bridge.dispatch({ id: "p-deskfirst", type: "pending.interactions", payload: { sessionId: "sess-deskfirst" } });
+  check(
+    "桌面答后快照不再含该迟到项",
+    (lastResult(relay.sent, "p-deskfirst")?.value?.questions ?? []).length === 0,
+    JSON.stringify(lastResult(relay.sent, "p-deskfirst")),
+  );
+}
+{
+  // 场景 D：旧 App（未声明 session-state-v1）→ legacy 超时仍按旧语义 resolved{timeout} 清卡放行。
+  const ctx = makeCtx({});
+  const relay = makeRelay();
+  const bridge = makeBridge(ctx, relay, { ...CFG, approvalTimeoutMs: 40 });
+  bridge.attach();
+  await bridge.dispatch({ id: "hello-legacyold", type: "hello", payload: {} });
+  const requestPromise = ctx.emit(
+    "user-questions/request",
+    { questions: [{ id: "q1", question: "legacy 旧端" }], agent: { session: { id: "sess-legacyold" } }, signal: new AbortController().signal },
     async () => ({ answers: [{ id: "q1", selected: ["desktop"] }] }),
   );
   const settled = await requestPromise;
   await tick();
   check(
-    "legacy：无 Host callId 时超时发 resolved 并交桌面",
+    "旧客户端 legacy 超时仍 resolved{timeout} 并交桌面（兼容不回归）",
     eventsOf(relay.sent, "question.resolved").at(-1)?.source === "timeout"
       && settled[0]?.value?.answers?.[0]?.selected?.[0] === "desktop",
-    JSON.stringify({ events: eventsOf(relay.sent, "question.resolved"), settled }),
+    JSON.stringify({ resolved: eventsOf(relay.sent, "question.resolved"), settled }),
+  );
+}
+{
+  // 场景 E（v1.3.2 核心修复）：legacy 同步弹卡，手机先答 → 包装 signal 被 abort
+  // （网关据此向 PC 发 cancel → PC 卡关闭）；原工具 signal 不受影响；桌面迟到答案被忽略。
+  const ctx = makeCtx({});
+  const relay = makeRelay();
+  const bridge = makeBridge(ctx, relay, { ...CFG });
+  bridge.attach();
+  await bridge.dispatch({ id: "hello-sync", type: "hello", payload: { features: ["session-state-v1"] } });
+  const toolController = new AbortController();
+  const req = {
+    questions: [{ id: "q1", question: "同步弹" }],
+    agent: { session: { id: "sess-sync" } },
+    signal: toolController.signal,
+  };
+  let desktopResolve;
+  const desktopAnswer = new Promise((r) => { desktopResolve = r; });
+  const requestPromise = ctx.emit("user-questions/request", req, () => desktopAnswer);
+  await tick();
+  const cont = eventsOf(relay.sent, "question.request").find((e) => e.state === "continued");
+  check(
+    "legacy 同步弹：不等独占窗口，立即发可答卡（PC 不白等）",
+    cont !== undefined && cont.answerable === true && !cont.expiresAt,
+    JSON.stringify(cont),
+  );
+  check(
+    "legacy 同步弹：下游 signal 已包装且未 abort",
+    req.signal !== toolController.signal && req.signal.aborted === false && toolController.signal.aborted === false,
+    "",
+  );
+  await bridge.dispatch({ id: "a-sync", type: "question.answer", payload: { askId: cont?.askId, answers: { q1: ["phone"] }, freeText: "" } });
+  const settled = await requestPromise;
+  await new Promise((r) => setTimeout(r, 20)); // dismiss.abort 延到宏任务
+  check(
+    "手机先答：瀑布以手机答案定案",
+    settled[0]?.value?.answers?.[0]?.selected?.[0] === "phone",
+    JSON.stringify(settled),
+  );
+  check(
+    "手机先答：包装 signal 被 abort（网关 cancel → PC 卡关闭）",
+    req.signal.aborted === true,
+    "",
+  );
+  check(
+    "手机先答：原工具 signal 不受影响（不是取消工具）",
+    toolController.signal.aborted === false,
+    "",
+  );
+  desktopResolve({ answers: [{ id: "q1", selected: ["desktop-late"] }] });
+  await tick();
+  check(
+    "桌面迟到答案被忽略（不再发 resolved{desktop}）",
+    eventsOf(relay.sent, "question.resolved").filter((e) => e.source === "desktop").length === 0,
+    JSON.stringify(eventsOf(relay.sent, "question.resolved")),
   );
 }
 

@@ -16,8 +16,8 @@
 /** 协议版本（契约 §5.1 hello.proto）。 */
 export const PROTO_VERSION: number = 1;
 
-/** 协议契约文档版本（v1.3.0：§5.12 待答交互与双端提问同步 + §5.13 Todo + §5.14 Goal；关于页展示用）。 */
-export const CONTRACT_VERSION: string = 'v1.3.1';
+/** 协议契约文档版本（v1.3.2：§5.12.7 legacy 迟到补答 + 冷启动全局待答快照；关于页展示用）。 */
+export const CONTRACT_VERSION: string = 'v1.3.2';
 
 /** 角色：host = PC 端 DSH 插件；client = 本 App。 */
 export const ROLE_HOST: string = 'host';

@@ -196,11 +196,14 @@ export struct StepCard {
         .width('100%')
         .margin({ bottom: SP_1 })
       Scroll() {
+        // copyOption(CopyOptions.LocalDevice)：长按参数出系统选区菜单（复制/全选），
+        // 用户反馈「工具步骤的参数/输出复制不了」。
         Text(this.item.argsText)
           .fontSize(FS_SMALL)
           .fontFamily('monospace')
           .fontColor($r('app.color.label_secondary'))
           .width('100%')
+          .copyOption(CopyOptions.LocalDevice)
       }
       .width('100%')
       .constraintSize({ maxHeight: stepOutputMaxVp() })
@@ -228,11 +231,13 @@ export struct StepCard {
         .width('100%')
         .margin({ bottom: SP_1 })
       Scroll() {
+        // 同参数块：输出 / 错误文本同样支持长按复制。
         Text(this.outputText())
           .fontSize(FS_SMALL)
           .fontFamily('monospace')
           .fontColor(this.isError() ? $r('app.color.state_error') : $r('app.color.label_secondary'))
           .width('100%')
+          .copyOption(CopyOptions.LocalDevice)
       }
       .width('100%')
       .constraintSize({ maxHeight: stepOutputMaxVp() })

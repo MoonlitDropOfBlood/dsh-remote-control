@@ -11,6 +11,7 @@ const indexPage = readFileSync(new URL('./entry/src/main/ets/pages/Index.ets', i
 const connectionsPage = readFileSync(new URL('./entry/src/main/ets/pages/ConnectionsPage.ets', import.meta.url), 'utf8');
 const askCards = readFileSync(new URL('./entry/src/main/ets/pages/AskCards.ets', import.meta.url), 'utf8');
 const approvalQueue = readFileSync(new URL('./entry/src/main/ets/pages/ApprovalQueuePage.ets', import.meta.url), 'utf8');
+const stepCard = readFileSync(new URL('./entry/src/main/ets/pages/StepCard.ets', import.meta.url), 'utf8');
 
 assert.match(protocol, /MSG_SESSION_PERMISSION: string = 'session\.permission'/);
 assert.match(protocol, /MSG_SESSION_SELECT_PERMISSION: string = 'session\.selectPermission'/);
@@ -99,5 +100,33 @@ assert.match(page, /private historyErrorText\(\): string \{\s+return this\.store
 assert.match(page, /if \(this\.historyErrorText\(\)\.length > 0\) \{\s+this\.historyErrorCard\(\)/);
 assert.match(page, /Text\(this\.historyErrorText\(\)\)/);
 assert.match(page, /Button\('重新加载'\)[\s\S]*?this\.store\.loadHistory\(this\.sessionId, false\)/);
+
+// 消息列表复制能力（用户反馈「消息列表中的内容不支持复制」）：
+//  - 原生 Text（用户气泡 / 工具步骤的参数与输出）→ copyOption(CopyOptions.LocalDevice)
+//    长按出系统选区菜单（复制 / 全选），可跨应用粘贴。
+//  - markdown 正文与思考块 → 库的长按菜单模式（菜单 UI 由详情页自绘）：
+//    「复制」走 copyToClipboard，「选取文本」走库的 selectWholeBlock（进选区模式）。
+assert.match(timelineView, /Text\(this\.item\.text\)[\s\S]{0,400}?\.copyOption\(CopyOptions\.LocalDevice\)/,
+  '用户气泡文本必须支持长按复制');
+assert.match(stepCard, /Text\(this\.item\.argsText\)[\s\S]{0,300}?\.copyOption\(CopyOptions\.LocalDevice\)/,
+  '工具步骤「参数」文本必须支持长按复制');
+assert.match(stepCard, /Text\(this\.outputText\(\)\)[\s\S]{0,300}?\.copyOption\(CopyOptions\.LocalDevice\)/,
+  '工具步骤「输出」文本必须支持长按复制');
+assert.match(page, /setTextSelectionEnable\(true\)/,
+  '长按菜单模式依赖跨 Text 文本选择能力');
+assert.match(page, /private applyMarkdownTheme\(ctrl: MarkdownController, dim: boolean\): void \{[\s\S]*?\.setLongPressMenuEnable\(true\)/,
+  'markdown 控制器必须开启长按菜单模式');
+assert.match(page, /\.setLongPressMenuListener\(\(info: LongPressMenuInfo\): void => \{/,
+  'markdown 控制器必须接长按菜单回调');
+assert.match(page, /this\.applyMarkdownTheme\(this\.mdCtrl, false\)/,
+  '正文控制器要接长按菜单');
+assert.match(page, /this\.applyMarkdownTheme\(this\.mdCtrlReasoning, true\)/,
+  '思考块控制器也要接长按菜单');
+assert.match(page, /private onLongPressMenuCopy\(\): void \{[\s\S]*?this\.copyToClipboard\(this\.longPressMenuText\)/,
+  '长按菜单「复制」必须走系统剪贴板');
+assert.match(page, /private onLongPressMenuSelect\(\): void \{[\s\S]*?this\.longPressSelectWholeBlock\(/,
+  '长按菜单「选取文本」必须调用库的 selectWholeBlock');
+assert.match(page, /if \(this\.longPressMenuVisible\) \{[\s\S]*?this\.longPressMenuOverlay\(\)/,
+  '长按菜单浮层必须挂在页面根部（盖在时间线之上）');
 
 console.log('session-detail-contract-test: permission + subagent + history error + RepeatItem wiring assertions passed');

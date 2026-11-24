@@ -529,6 +529,8 @@ export struct MessageBubble {
           Row() {
             // v1.0.9：纯图片/纯附件消息（无正文）不画空气泡——否则会留一个空的蓝色药丸
             if (this.item.text.length > 0) {
+              // copyOption(CopyOptions.LocalDevice)：长按气泡出系统选区菜单（复制/全选），
+              // 复制内容可跨应用粘贴——用户反馈「消息列表内容不支持复制」。
               Text(this.item.text)
                 .fontSize(FS_BODY)
                 .fontColor($r('app.color.label_on_brand'))
@@ -536,6 +538,7 @@ export struct MessageBubble {
                 .backgroundColor($r('app.color.brand_fill'))
                 .borderRadius(RADIUS_BUBBLE)
                 .constraintSize({ maxWidth: '82%' })
+                .copyOption(CopyOptions.LocalDevice)
             }
           }
           .width('100%')

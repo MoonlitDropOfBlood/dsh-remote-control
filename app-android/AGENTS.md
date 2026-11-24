@@ -211,3 +211,27 @@ HarmonyOS 版改完后同步到这里，**wire 与 UI 口径两端必须一致**
 
 回归：`./gradlew :core:test`（`CoreApiContractTest` 新增 trigger 默认值与
 「Todo 无数据时 UI 不可见」两例，共 121 例 0 失败）+ `:app:assembleDebug`。
+
+## 2026-11-24：会话详情页消息列表支持复制（协议不变，对齐 HarmonyOS 版）
+
+用户反馈「消息列表中的内容不支持复制，十分不方便」。此前 Android 端**没有任何复制能力**
+（全仓库无 SelectionContainer / 剪贴板 / 长按菜单）。本次只改
+`app/src/main/kotlin/dsh/rc/pocket/ui/TimelineList.kt`（core 不动）：
+
+1. **文本选区复制**：用户气泡 `Text`、助手正文 `MarkdownText`、`ReasoningCard` 展开态
+   `MarkdownText`、`StepCard` 的 arguments / resultText / errorText 各包一层
+   `SelectionContainer`（`androidx.compose.foundation.text.selection`）→ 长按出系统选区 + 复制条。
+   **只包文本本身**，不把整个气泡容器（图片 / 文件卡 / 点击逻辑）包进去。
+2. **整条消息一键复制**：时间戳行由裸 `Text(clockTime)` 改为 `Row`（时间 + `CopyMessageButton`）。
+   按钮 = 22dp 触控区里 14dp `Icons.Default.ContentCopy`（material-icons-extended），
+   点击 `LocalClipboardManager.current.setText(AnnotatedString(text))` + Toast「已复制」；
+   仅 `item.text` 非空时显示；助手复制的是 **markdown 原文**（与桌面端「复制消息」同口径）。
+3. **为什么不用长按手势做整条复制**：`SelectionContainer` 已消费长按做选区，
+   再叠 `combinedClickable` / `onLongClick` 会互相抢手势 → 整条复制走独立小按钮。
+
+触发卡 / 图片缩略图 / 文件卡 / 过程组折叠与贴底跟随逻辑均未动；Compose BOM（1.7.6）与
+markdown 库版本（≤0.33.0）未动。
+
+回归：`./gradlew :core:test`（124 例 0 失败，需 `--rerun-tasks --no-build-cache` 防
+UP-TO-DATE/FROM-CACHE 假通过）+ `:app:assembleDebug` + `python tools/scan-kotlin-comments.py .`（0 issues）。
+**真机待验**：长按各文本能否拉出系统选区条并复制、复制按钮剪贴板内容与 Toast。

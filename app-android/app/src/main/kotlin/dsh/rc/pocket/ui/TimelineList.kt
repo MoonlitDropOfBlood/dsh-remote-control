@@ -15,11 +15,13 @@
 package dsh.rc.pocket.ui
 
 import android.graphics.BitmapFactory
+import android.widget.Toast
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.scrollBy
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -34,6 +36,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Info
@@ -52,6 +55,9 @@ import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -235,15 +241,19 @@ private fun MessageBubble(
     ) {
         if (isUser) {
             if (item.text.isNotEmpty()) {
-                Text(
-                    text = item.text,
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = colors.labelOnBrand,
-                    modifier = Modifier
-                        .widthIn(max = 320.dp)
-                        .background(colors.brandFill, RoundedCornerShape(Radius.bubble))
-                        .padding(horizontal = 12.dp, vertical = 10.dp),
-                )
+                // 文本选区复制：只包文本本身（长按 → 选区 → 系统复制条），
+                // 不把整个气泡容器包进去（图片 / 文件卡 / 点击逻辑不参与选区）。
+                SelectionContainer {
+                    Text(
+                        text = item.text,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = colors.labelOnBrand,
+                        modifier = Modifier
+                            .widthIn(max = 320.dp)
+                            .background(colors.brandFill, RoundedCornerShape(Radius.bubble))
+                            .padding(horizontal = 12.dp, vertical = 10.dp),
+                    )
+                }
             }
             // 图片在前、文件在后（契约 §5.11.4）
             if (item.images.isNotEmpty() || item.files.isNotEmpty()) {
@@ -271,11 +281,14 @@ private fun MessageBubble(
             ) {
                 if (item.text.isNotEmpty()) {
                     // 助手正文走 markdown（三方库；与 HarmonyOS 版 @luvi/lv-markdown-in 同源思路）
-                    MarkdownText(
-                        text = item.text,
-                        color = colors.labelPrimary,
-                        modifier = Modifier.fillMaxWidth(),
-                    )
+                    // 选区复制：SelectionContainer 包在 markdown 渲染外面（MarkdownText 本身不改）。
+                    SelectionContainer {
+                        MarkdownText(
+                            text = item.text,
+                            color = colors.labelPrimary,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
                 }
                 if (item.errorText.isNotEmpty()) {
                     Text(
@@ -307,11 +320,56 @@ private fun MessageBubble(
                 }
             }
         }
-        Text(
-            text = clockTime(item.ts),
-            style = MaterialTheme.typography.labelSmall,
-            color = colors.labelTertiary,
+        // 时间戳行：时间 + 整条消息复制按钮
+        // （用户消息右对齐、助手左对齐的观感保持不变：Row 由外层 Column 的
+        //   horizontalAlignment 决定贴哪边）
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(Sp.sp1),
             modifier = Modifier.padding(top = 2.dp),
+        ) {
+            Text(
+                text = clockTime(item.ts),
+                style = MaterialTheme.typography.labelSmall,
+                color = colors.labelTertiary,
+            )
+            // 正文为空（纯附件 / 纯错误）时没有可复制的文本 → 不显示按钮
+            if (item.text.isNotEmpty()) {
+                CopyMessageButton(text = item.text)
+            }
+        }
+    }
+}
+
+/**
+ * 整条消息一键复制按钮（时间戳行右侧的小图标）。
+ *
+ * 为什么不用长按手势：SelectionContainer 已经消费长按做文本选区，
+ * 再叠 combinedClickable / onLongClick 会互相抢手势 → 这里单用一个小按钮，
+ * 复制的是消息正文原文（助手消息 = markdown 原文，与桌面端「复制消息」同口径）。
+ */
+@Composable
+private fun CopyMessageButton(
+    text: String,
+    modifier: Modifier = Modifier,
+) {
+    val colors = PocketTheme.colors
+    val context = LocalContext.current
+    val clipboard = LocalClipboardManager.current
+    Box(
+        modifier = modifier
+            .size(22.dp)
+            .clickable {
+                clipboard.setText(AnnotatedString(text))
+                Toast.makeText(context, "已复制", Toast.LENGTH_SHORT).show()
+            },
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(
+            imageVector = Icons.Default.ContentCopy,
+            contentDescription = "复制消息",
+            tint = colors.labelTertiary,
+            modifier = Modifier.size(14.dp),
         )
     }
 }
@@ -556,13 +614,16 @@ private fun ReasoningCard(
         }
         if (expanded) {
             // 思考过程独立渲染（弱化配色，对齐 HarmonyOS 版的独立 markdown 控制器）
-            MarkdownText(
-                text = item.text,
-                dim = true,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = Sp.sp1),
-            )
+            // 选区复制：只包正文（组头的折叠点击逻辑不参与选区）。
+            SelectionContainer {
+                MarkdownText(
+                    text = item.text,
+                    dim = true,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = Sp.sp1),
+                )
+            }
         }
     }
 }
@@ -600,30 +661,37 @@ private fun StepCard(
             )
         }
         if (item.arguments.isNotEmpty()) {
-            Text(
-                text = item.arguments,
-                style = MaterialTheme.typography.labelSmall,
-                fontFamily = FontFamily.Monospace,
-                color = colors.labelSecondary,
-                maxLines = 6,
-                overflow = TextOverflow.Ellipsis,
-            )
+            // 选区复制：参数 / 结果 / 错误三段各自可长按选中
+            SelectionContainer {
+                Text(
+                    text = item.arguments,
+                    style = MaterialTheme.typography.labelSmall,
+                    fontFamily = FontFamily.Monospace,
+                    color = colors.labelSecondary,
+                    maxLines = 6,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
         }
         if (item.errorText.isNotEmpty()) {
-            Text(
-                text = item.errorText,
-                style = MaterialTheme.typography.labelSmall,
-                color = colors.stateError,
-            )
+            SelectionContainer {
+                Text(
+                    text = item.errorText,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = colors.stateError,
+                )
+            }
         } else if (item.resultText.isNotEmpty()) {
             HorizontalDivider(color = colors.borderL1)
-            Text(
-                text = item.resultText,
-                style = MaterialTheme.typography.labelSmall,
-                color = colors.labelTertiary,
-                maxLines = 6,
-                overflow = TextOverflow.Ellipsis,
-            )
+            SelectionContainer {
+                Text(
+                    text = item.resultText,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = colors.labelTertiary,
+                    maxLines = 6,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
         }
     }
 }

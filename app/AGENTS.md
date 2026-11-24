@@ -664,3 +664,53 @@ store 里这些数据是 **Map + 版本号**（`queueVersion` / `todosVersion` /
 
 - `node v13-contract-test.mjs` 新增：Goal 行顺序/图标按钮/无「完成」、编辑面板无轮次、
   Todo 空行隐藏、触发卡分支与 `trigger` 映射/搬运。
+
+## 2026-11-24：会话详情页消息列表支持复制（协议不变）
+
+用户反馈「消息列表中的内容不支持复制，十分不方便」。三条路径分别处理（**无 wire 变化**）：
+
+### ① 原生 Text → 系统选区菜单
+
+- `pages/TimelineView.ets` 用户气泡 `Text(this.item.text)`、
+  `pages/StepCard.ets` 的「参数」`Text(this.item.argsText)` 与「输出 / 错误」`Text(this.outputText())`
+  加 `.copyOption(CopyOptions.LocalDevice)`（API 9+，全局枚举无需 import）：
+  长按出系统选区菜单（复制 / 全选），可跨应用粘贴。
+- ⚠️ `Text` 的 `copyOption` **默认是 None**（与 `TextInput`/`TextArea` 的默认 LocalDevice 不同），
+  不显式加就没有复制能力。
+
+### ② markdown 正文 / 思考块 → 库的长按菜单模式（菜单 UI 自己画）
+
+`@luvi/lv-markdown-in@3.4.7` 内置长按菜单模式（`MarkdownController`）：
+
+- `setLongPressMenuEnable(true)`：长按**不再**立即进选区，改为回调菜单；
+  依赖 `setTextSelectionEnable(true)`（v1.1.4 已设）。
+- `setLongPressMenuListener((info: LongPressMenuInfo) => void)`：回调带
+  `paragraphText`（整段可复制文本）、`globalX/globalY`（**窗口坐标 vp**）、
+  `selectWholeBlock(type?)`（无参 = CUSTOM 自定义起选）。
+- **菜单 UI 由业务实现、业务自己关闭**（库不管外部弹窗）；库的 `clearTextSelection()`
+  用于主动清选区（本次未用：长按菜单模式下本就还没有选区）。
+
+`pages/SessionDetailPage.ets` 的实现：
+
+- `applyMarkdownTheme(ctrl, dim)` 对**正文（mdCtrl）与思考（mdCtrlReasoning）两个控制器**
+  都接 `setLongPressMenuEnable(true)` + 同一个 `setLongPressMenuListener`；
+  放在**独立的 try 块**里（主题链失败不影响菜单，菜单失败不影响主题）。
+- 页面 @Local：`longPressMenuVisible / longPressMenuX / longPressMenuY / longPressMenuText`；
+  `selectWholeBlock` 回调存**私有非状态字段** `longPressSelectWholeBlock`
+  （`@Local` 存函数不行；也不用 union + 判空，用「默认空函数 + ready 布尔」规避 ArkTS 空安全）。
+- 页面根部从 `Column` 改成 `Stack`（内容列 + 浮层），浮层 = 全屏透明点击层
+  （点空白关菜单）+ 定位在按压点的小菜单卡（`复制` / `选取文本`）。
+- **坐标换算**：库给的是窗口坐标，页面根容器 `onAreaChange` 维护
+  `pageOriginX/Y`（`Area.globalPosition`）+ `pageWidthVp/pageHeightVp`，
+  菜单坐标 = 窗口坐标 − 根容器偏移，并做**边界钳制**（靠边不越界，下方放不下就翻到按压点上方）。
+- 样式全走 token（`bg_layer_1` / `border_l1` / `label_primary` + `RADIUS_CTRL` / `FS_BODY`），
+  零硬编码色值；观感参照系统 ContextMenu。
+
+### 回归
+
+- `node session-detail-contract-test.mjs` 新增：用户气泡 / 步骤参数 / 步骤输出的
+  `copyOption(CopyOptions.LocalDevice)`；`setLongPressMenuEnable(true)` 与
+  `setLongPressMenuListener` 已接线（两个控制器）；菜单「复制」走 `copyToClipboard`、
+  「选取文本」走 `selectWholeBlock`；浮层挂在页面根部。
+- **真机待验**：长按菜单的定位是否与手指位置吻合（坐标换算依赖
+  `Area.globalPosition`）、菜单是否被时间线裁剪、「选取文本」后库操作栏的复制是否落地。

@@ -16,7 +16,7 @@
  *    发送时先串行分块上传（begin→chunk→commit）再带 uploads 发 prompt；
  *    subagent / 宿主不支持（capabilities.attachments 缺省）时隐藏附件入口。
  */
-import { LongPressMenuInfo, LongPressSelectionType, MarkdownController } from '@luvi/lv-markdown-in';
+import { MarkdownController } from '@luvi/lv-markdown-in';
 import { pasteboard } from '@kit.BasicServicesKit';
 import { common } from '@kit.AbilityKit';
 import { promptAction, ShowDialogSuccessResponse } from '@kit.ArkUI';
@@ -131,12 +131,6 @@ const NEAR_BOTTOM_VP: number = 32;
 /** 日志 tag（临时调试用）。 */
 const TAG: string = 'dshrc-session-detail';
 
-/** 长按菜单卡宽度（vp）：两行文字按钮。 */
-const LONG_PRESS_MENU_WIDTH: number = 132;
-
-/** 长按菜单卡高度（vp）：两行 × 约 44vp（用于越界钳制计算）。 */
-const LONG_PRESS_MENU_HEIGHT: number = 92;
-
 // hrouter 编译期扫描标记（注释形式：ArkTS 不允许 struct 上挂非框架装饰器）。
 // @Route({ name: 'session_detail' })
 @ComponentV2
@@ -193,15 +187,6 @@ export struct SessionDetailPage {
   @Local pendingQuestionsSnap: QuestionCard[] = [];
   /** 本会话待审批卡。 */
   @Local pendingApprovalsSnap: ApprovalCard[] = [];
-  // ---- 长按菜单（markdown 正文 / 思考块的「复制 / 选取文本」）----
-  /** 菜单是否可见（长按 markdown 文本后弹出；点空白关闭）。 */
-  @Local longPressMenuVisible: boolean = false;
-  /** 菜单左上角在页面坐标系里的 X（vp，已做屏幕边界钳制）。 */
-  @Local longPressMenuX: number = 0;
-  /** 菜单左上角在页面坐标系里的 Y（vp，已做屏幕边界钳制）。 */
-  @Local longPressMenuY: number = 0;
-  /** 长按命中的段落全文（「复制」动作的内容）。 */
-  @Local longPressMenuText: string = '';
   private scroller: Scroller = new Scroller();
   /** 首次进入是否已完成贴底（timeline 有缓存 / 历史异步到达两种都要滚到底）。 */
   private pendingInitialScroll: boolean = true;
@@ -217,23 +202,6 @@ export struct SessionDetailPage {
    * 否则「思考」和「回答」视觉上分不开（用户反馈：颜色和之前版本不一致）。
    */
   private mdCtrlReasoning: MarkdownController = new MarkdownController();
-  /**
-   * 长按菜单的「选取文本」动作（markdown 库回调，**非状态**：放私有字段）。
-   * 库在长按菜单模式下只回传动作函数，菜单 UI 与关闭时机都由本页负责。
-   */
-  private longPressSelectWholeBlock: (type?: LongPressSelectionType) => void = (): void => {
-    // 默认空实现：还没有收到长按回调时调用是安全的空操作。
-  };
-  /** 是否已收到有效的长按菜单回调（决定「选取文本」是否可执行）。 */
-  private longPressSelectReady: boolean = false;
-  /** 页面内容区宽（vp）：菜单越界钳制用（根容器 onAreaChange 维护）。 */
-  private pageWidthVp: number = 0;
-  /** 页面内容区高（vp）：菜单越界钳制用。 */
-  private pageHeightVp: number = 0;
-  /** 页面根容器相对窗口的 X 偏移（vp）：把库的窗口坐标换算成页面坐标。 */
-  private pageOriginX: number = 0;
-  /** 页面根容器相对窗口的 Y 偏移（vp）：把库的窗口坐标换算成页面坐标。 */
-  private pageOriginY: number = 0;
 
   /**
    * markdown 渲染样式：全部走 app.color 资源（深浅色自动适配），
@@ -318,69 +286,6 @@ export struct SessionDetailPage {
       ctrl.setTableInterleaveTextColor(dim ? $r('app.color.label_tertiary') : $r('app.color.label_secondary'));
     } catch (err) {
       // 样式设置失败不影响渲染（库会走默认主题）
-    }
-    // 长按菜单模式（复制 / 选取文本）：库只回调按压点，菜单 UI 与关闭由本页实现。
-    // 依赖 setTextSelectionEnable(true)（上面已设）；单独 try，避免影响上面的主题设置。
-    try {
-      ctrl.setLongPressMenuEnable(true);
-      ctrl.setLongPressMenuListener((info: LongPressMenuInfo): void => {
-        this.onMarkdownLongPress(info);
-      });
-    } catch (err) {
-      // 库不支持长按菜单模式 → 退回库默认的「长按立即选区」行为
-    }
-  }
-
-  /**
-   * markdown 长按回调（正文 / 思考块共用）：把按压点与段落文本搬进页面 @Local，
-   * 「选取文本」动作存私有字段（非状态），菜单渲染与关闭都在本页。
-   */
-  private onMarkdownLongPress(info: LongPressMenuInfo): void {
-    const text: string = info.paragraphText;
-    this.longPressSelectWholeBlock = info.selectWholeBlock;
-    this.longPressSelectReady = true;
-    this.longPressMenuText = text;
-    // 库给的是窗口坐标（vp）→ 换算到页面坐标系。
-    const localX: number = info.globalX - this.pageOriginX;
-    const localY: number = info.globalY - this.pageOriginY;
-    this.longPressMenuX = this.clampMenuX(localX - LONG_PRESS_MENU_WIDTH / 2);
-    // 下方放不下就翻到按压点上方（菜单不越界）。
-    let y: number = localY + 12;
-    if (this.pageHeightVp > 0 && y + LONG_PRESS_MENU_HEIGHT > this.pageHeightVp - SP_2) {
-      y = localY - LONG_PRESS_MENU_HEIGHT - 12;
-    }
-    this.longPressMenuY = this.clampMenuY(y);
-    this.longPressMenuVisible = true;
-  }
-
-  /** 菜单 X 钳制到页面内容区内（靠边不越界）。 */
-  private clampMenuX(x: number): number {
-    const maxX: number = this.pageWidthVp > 0 ? this.pageWidthVp - LONG_PRESS_MENU_WIDTH - SP_2 : SP_2;
-    return Math.max(SP_2, Math.min(x, maxX));
-  }
-
-  /** 菜单 Y 钳制到页面内容区内（靠边不越界）。 */
-  private clampMenuY(y: number): number {
-    const maxY: number = this.pageHeightVp > 0 ? this.pageHeightVp - LONG_PRESS_MENU_HEIGHT - SP_2 : SP_2;
-    return Math.max(SP_2, Math.min(y, maxY));
-  }
-
-  /** 关闭长按菜单（点空白 / 点了某个动作）。 */
-  private closeLongPressMenu(): void {
-    this.longPressMenuVisible = false;
-  }
-
-  /** 菜单「复制」：复制长按所在段落全文（走系统剪贴板 + toast）。 */
-  private onLongPressMenuCopy(): void {
-    this.closeLongPressMenu();
-    this.copyToClipboard(this.longPressMenuText);
-  }
-
-  /** 菜单「选取文本」：进库的选区模式（库自带复制 / 全选 / 取消操作栏）。 */
-  private onLongPressMenuSelect(): void {
-    this.closeLongPressMenu();
-    if (this.longPressSelectReady) {
-      this.longPressSelectWholeBlock(LongPressSelectionType.CUSTOM);
     }
   }
 
@@ -2260,74 +2165,8 @@ export struct SessionDetailPage {
     .backgroundColor($r('app.color.state_error_tint'))
   }
 
-  /**
-   * 长按菜单浮层（markdown 正文 / 思考块长按后弹出）：
-   *  - 全屏透明点击层：点空白关菜单；
-   *  - 菜单卡：定位在按压点附近（越界已钳制），两行动作「复制 / 选取文本」。
-   * 视觉参照系统 ContextMenu：小圆角卡 + 描边 + 两行文字按钮，全部走现有 token。
-   */
-  @Builder
-  longPressMenuOverlay() {
-    Stack({ alignContent: Alignment.TopStart }) {
-      // 透明点击层：吃掉点击，点空白 = 关闭菜单
-      Column()
-        .width('100%')
-        .height('100%')
-        .backgroundColor(Color.Transparent)
-        .hitTestBehavior(HitTestMode.Block)
-        .onClick((): void => {
-          this.closeLongPressMenu();
-        })
-
-      // 菜单卡
-      Column() {
-        Row() {
-          Text('复制')
-            .fontSize(FS_BODY)
-            .fontColor($r('app.color.label_primary'))
-        }
-        .width('100%')
-        .justifyContent(FlexAlign.Center)
-        .padding({ left: SP_3, right: SP_3, top: 10, bottom: 10 })
-        .backgroundColor($r('app.color.bg_layer_1'))
-        .onClick((): void => {
-          this.onLongPressMenuCopy();
-        })
-
-        Row()
-          .width('100%')
-          .height(1)
-          .backgroundColor($r('app.color.border_l1'))
-
-        Row() {
-          Text('选取文本')
-            .fontSize(FS_BODY)
-            .fontColor($r('app.color.label_primary'))
-        }
-        .width('100%')
-        .justifyContent(FlexAlign.Center)
-        .padding({ left: SP_3, right: SP_3, top: 10, bottom: 10 })
-        .backgroundColor($r('app.color.bg_layer_1'))
-        .onClick((): void => {
-          this.onLongPressMenuSelect();
-        })
-      }
-      .width(LONG_PRESS_MENU_WIDTH)
-      .backgroundColor($r('app.color.bg_layer_1'))
-      .borderRadius(RADIUS_CTRL)
-      // 子 Row 自带背景色，不裁剪会画出圆角外（直角盖住圆角）。
-      .clip(true)
-      .border({ width: HAIRLINE, color: $r('app.color.border_l1') })
-      .position({ x: this.longPressMenuX, y: this.longPressMenuY })
-    }
-    .width('100%')
-    .height('100%')
-  }
-
   build() {
     // NavDestination 外壳由 hrouter-compiler 生成的 wrapper 提供。
-    // 根节点用 Stack：内容列（沉浸式）+ 长按菜单浮层（盖在时间线之上）。
-    Stack() {
     Column() {
       this.topBar()
       if (this.historyErrorText().length > 0) {
@@ -2711,26 +2550,6 @@ export struct SessionDetailPage {
       onDisappear: (): void => {
         this.modelSheetOpen = false;
       }
-    })
-
-      // 长按菜单浮层：盖在时间线之上（markdown 正文 / 思考块长按后弹出）
-      if (this.longPressMenuVisible) {
-        this.longPressMenuOverlay()
-      }
-    }
-    .width('100%')
-    .height('100%')
-    // 页面几何（vp）：把 markdown 库给的窗口坐标换算成页面坐标，并做菜单越界钳制
-    .onAreaChange((oldArea: Area, newArea: Area): void => {
-      const w: Length = newArea.width;
-      const h: Length = newArea.height;
-      this.pageWidthVp = typeof w === 'number' ? w : 0;
-      this.pageHeightVp = typeof h === 'number' ? h : 0;
-      const origin: Position = newArea.globalPosition;
-      const ox: Length | undefined = origin.x;
-      const oy: Length | undefined = origin.y;
-      this.pageOriginX = typeof ox === 'number' ? ox : 0;
-      this.pageOriginY = typeof oy === 'number' ? oy : 0;
     })
   }
 }

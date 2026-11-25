@@ -104,29 +104,31 @@ assert.match(page, /Button\('重新加载'\)[\s\S]*?this\.store\.loadHistory\(th
 // 消息列表复制能力（用户反馈「消息列表中的内容不支持复制」）：
 //  - 原生 Text（用户气泡 / 工具步骤的参数与输出）→ copyOption(CopyOptions.LocalDevice)
 //    长按出系统选区菜单（复制 / 全选），可跨应用粘贴。
-//  - markdown 正文与思考块 → 库的长按菜单模式（菜单 UI 由详情页自绘）：
-//    「复制」走 copyToClipboard，「选取文本」走库的 selectWholeBlock（进选区模式）。
+//  - markdown 正文与思考块 → **用 markdown 库自带的文本选择复制**（不自己画长按菜单）：
+//    setTextSelectionEnable(true) 开启跨 Text 文本选择，复制回调 setTextSelectionCopyListener
+//    → copyToClipboard（系统剪贴板 + toast）；代码块 / 表格另有各自的复制按钮回调。
 assert.match(timelineView, /Text\(this\.item\.text\)[\s\S]{0,400}?\.copyOption\(CopyOptions\.LocalDevice\)/,
   '用户气泡文本必须支持长按复制');
 assert.match(stepCard, /Text\(this\.item\.argsText\)[\s\S]{0,300}?\.copyOption\(CopyOptions\.LocalDevice\)/,
   '工具步骤「参数」文本必须支持长按复制');
 assert.match(stepCard, /Text\(this\.outputText\(\)\)[\s\S]{0,300}?\.copyOption\(CopyOptions\.LocalDevice\)/,
   '工具步骤「输出」文本必须支持长按复制');
-assert.match(page, /setTextSelectionEnable\(true\)/,
-  '长按菜单模式依赖跨 Text 文本选择能力');
-assert.match(page, /private applyMarkdownTheme\(ctrl: MarkdownController, dim: boolean\): void \{[\s\S]*?\.setLongPressMenuEnable\(true\)/,
-  'markdown 控制器必须开启长按菜单模式');
-assert.match(page, /\.setLongPressMenuListener\(\(info: LongPressMenuInfo\): void => \{/,
-  'markdown 控制器必须接长按菜单回调');
+assert.match(page, /\.setTextSelectionEnable\(true\)/,
+  'markdown 必须开启库自带的跨 Text 文本选择（复制的前提）');
+assert.match(page, /\.setTextSelectionCopyListener\(\(text: string\): void => \{\s+this\.copyToClipboard\(text\);/,
+  'markdown 选区复制必须落到系统剪贴板');
+assert.match(page, /\.setCodeCopyListener\(\(text: string\): void => \{\s+this\.copyToClipboard\(text\);/,
+  'markdown 代码块复制必须落到系统剪贴板');
+assert.match(page, /\.setTableCopyClickListener\(\(rawTableMarkdown: string\): void => \{\s+this\.copyToClipboard\(rawTableMarkdown\);/,
+  'markdown 表格复制必须落到系统剪贴板');
 assert.match(page, /this\.applyMarkdownTheme\(this\.mdCtrl, false\)/,
-  '正文控制器要接长按菜单');
+  '正文控制器要接复制能力');
 assert.match(page, /this\.applyMarkdownTheme\(this\.mdCtrlReasoning, true\)/,
-  '思考块控制器也要接长按菜单');
-assert.match(page, /private onLongPressMenuCopy\(\): void \{[\s\S]*?this\.copyToClipboard\(this\.longPressMenuText\)/,
-  '长按菜单「复制」必须走系统剪贴板');
-assert.match(page, /private onLongPressMenuSelect\(\): void \{[\s\S]*?this\.longPressSelectWholeBlock\(/,
-  '长按菜单「选取文本」必须调用库的 selectWholeBlock');
-assert.match(page, /if \(this\.longPressMenuVisible\) \{[\s\S]*?this\.longPressMenuOverlay\(\)/,
-  '长按菜单浮层必须挂在页面根部（盖在时间线之上）');
+  '思考块控制器也要接复制能力');
+// 自绘长按菜单已被去掉（用户反馈：md 组件自带复制，只要开启即可）——防止回退。
+assert.doesNotMatch(page, /setLongPressMenuEnable/,
+  '不得再启用 markdown 库的长按菜单模式（用组件自带的选区复制）');
+assert.doesNotMatch(page, /setLongPressMenuListener/,
+  '不得再自绘 markdown 长按菜单（用组件自带的选区复制）');
 
 console.log('session-detail-contract-test: permission + subagent + history error + RepeatItem wiring assertions passed');

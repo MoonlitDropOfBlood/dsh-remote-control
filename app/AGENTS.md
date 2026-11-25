@@ -678,39 +678,28 @@ store 里这些数据是 **Map + 版本号**（`queueVersion` / `todosVersion` /
 - ⚠️ `Text` 的 `copyOption` **默认是 None**（与 `TextInput`/`TextArea` 的默认 LocalDevice 不同），
   不显式加就没有复制能力。
 
-### ② markdown 正文 / 思考块 → 库的长按菜单模式（菜单 UI 自己画）
+### ② markdown 正文 / 思考块 → **用 markdown 库自带的文本选择复制**（不自己画菜单）
 
-`@luvi/lv-markdown-in@3.4.7` 内置长按菜单模式（`MarkdownController`）：
+⚠️ **别自绘长按菜单**：markdown 组件**自带**选区复制，只要开启即可。
+（曾试过库 3.4.7 的长按菜单模式 `setLongPressMenuEnable(true)` +
+`setLongPressMenuListener(...)` 自绘「复制 / 选取文本」浮层——**已按用户反馈撤掉**：
+组件自带能力就够，自绘菜单反而多一套坐标换算与浮层级维护成本。）
 
-- `setLongPressMenuEnable(true)`：长按**不再**立即进选区，改为回调菜单；
-  依赖 `setTextSelectionEnable(true)`（v1.1.4 已设）。
-- `setLongPressMenuListener((info: LongPressMenuInfo) => void)`：回调带
-  `paragraphText`（整段可复制文本）、`globalX/globalY`（**窗口坐标 vp**）、
-  `selectWholeBlock(type?)`（无参 = CUSTOM 自定义起选）。
-- **菜单 UI 由业务实现、业务自己关闭**（库不管外部弹窗）；库的 `clearTextSelection()`
-  用于主动清选区（本次未用：长按菜单模式下本就还没有选区）。
+v1.1.4 的接线（`pages/SessionDetailPage.ets` 的 `applyMarkdownTheme(ctrl, dim)`，
+正文 `mdCtrl` 与思考 `mdCtrlReasoning` **两个控制器都走**）：
 
-`pages/SessionDetailPage.ets` 的实现：
+- `setTextSelectionEnable(true)`：开启**跨 Text 文本选择**（库的默认行为 = 长按立即进选区，
+  库自带「复制 / 全选 / 取消」操作栏）——**这行就是「开启组件自带复制」**。
+- `setTextSelectionCopyListener((text) => copyToClipboard(text))`：选区复制 → 系统剪贴板 + toast。
+- `setCodeCopyListener` / `setTableCopyClickListener`：代码块 / 表格的复制按钮 → 同一落点。
 
-- `applyMarkdownTheme(ctrl, dim)` 对**正文（mdCtrl）与思考（mdCtrlReasoning）两个控制器**
-  都接 `setLongPressMenuEnable(true)` + 同一个 `setLongPressMenuListener`；
-  放在**独立的 try 块**里（主题链失败不影响菜单，菜单失败不影响主题）。
-- 页面 @Local：`longPressMenuVisible / longPressMenuX / longPressMenuY / longPressMenuText`；
-  `selectWholeBlock` 回调存**私有非状态字段** `longPressSelectWholeBlock`
-  （`@Local` 存函数不行；也不用 union + 判空，用「默认空函数 + ready 布尔」规避 ArkTS 空安全）。
-- 页面根部从 `Column` 改成 `Stack`（内容列 + 浮层），浮层 = 全屏透明点击层
-  （点空白关菜单）+ 定位在按压点的小菜单卡（`复制` / `选取文本`）。
-- **坐标换算**：库给的是窗口坐标，页面根容器 `onAreaChange` 维护
-  `pageOriginX/Y`（`Area.globalPosition`）+ `pageWidthVp/pageHeightVp`，
-  菜单坐标 = 窗口坐标 − 根容器偏移，并做**边界钳制**（靠边不越界，下方放不下就翻到按压点上方）。
-- 样式全走 token（`bg_layer_1` / `border_l1` / `label_primary` + `RADIUS_CTRL` / `FS_BODY`），
-  零硬编码色值；观感参照系统 ContextMenu。
+⚠️ `setCopyOption` 自 3.3.1 起**不再维护**（调用无效），别再用它；复制一律走上面三个回调。
 
 ### 回归
 
-- `node session-detail-contract-test.mjs` 新增：用户气泡 / 步骤参数 / 步骤输出的
-  `copyOption(CopyOptions.LocalDevice)`；`setLongPressMenuEnable(true)` 与
-  `setLongPressMenuListener` 已接线（两个控制器）；菜单「复制」走 `copyToClipboard`、
-  「选取文本」走 `selectWholeBlock`；浮层挂在页面根部。
-- **真机待验**：长按菜单的定位是否与手指位置吻合（坐标换算依赖
-  `Area.globalPosition`）、菜单是否被时间线裁剪、「选取文本」后库操作栏的复制是否落地。
+- `node session-detail-contract-test.mjs` 新增：三处 `copyOption(CopyOptions.LocalDevice)`
+  （用户气泡 / 步骤参数 / 步骤输出）；`setTextSelectionEnable(true)` 与三个复制回调都落到
+  `copyToClipboard`；**并断言不得再出现 `setLongPressMenuEnable` / `setLongPressMenuListener`**
+  （防止有人又把自绘菜单加回来）。
+- **真机已验**（HUAWEI Mate 70）：长按正文/思考块 → 库自带选区 + 复制条；长按用户气泡 /
+  工具参数输出 → 系统选区菜单，均可复制。

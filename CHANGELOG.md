@@ -3,6 +3,41 @@
 本仓库的版本说明。发版时（推 `v*` 标签）release workflow 会抽取对应版本段落作为
 GitHub Release 的正文——**bump 版本时必须同步补一段 `## [版本]`**，否则发布失败。
 
+## [1.3.5] - 2026-11-26
+
+手机端**消息列表支持复制**（用户反馈：「消息列表中的内容不支持复制，十分不方便」）。
+纯 App 侧 UI 能力，**协议 / wire / 中继零变化**，插件无行为变更（两个 npm 包只是版本同 bump）。
+
+### 鸿蒙（app/）
+
+- **原生文本 → 系统选区菜单**：用户气泡、工具步骤的「参数」「输出 / 错误」三处 `Text`
+  加 `.copyOption(CopyOptions.LocalDevice)` → 长按出系统选区菜单（复制 / 全选），
+  可跨应用粘贴。
+  - ⚠️ `Text` 的 `copyOption` **默认是 `None`**（与 `TextInput`/`TextArea` 的默认
+    `LocalDevice` 不同）——不显式加就没有复制能力，这是「长按没反应」的根因。
+- **markdown 正文 / 思考块 → 用组件自带的选区复制**：`setTextSelectionEnable(true)` 开启
+  跨 Text 文本选择（库自带「复制 / 全选 / 取消」操作栏），复制回调
+  `setTextSelectionCopyListener` 落系统剪贴板；代码块 / 表格另有各自的复制按钮回调。
+  - ⚠️ **不自绘长按菜单**：库 3.4.7 的 `setLongPressMenuEnable` + `setLongPressMenuListener`
+    模式（菜单 UI 需业务自绘、坐标需窗口→页面换算）**已被放弃**——组件自带能力就够，
+    少一套坐标换算与浮层级维护成本。
+  - ⚠️ `setCopyOption` 自 3.3.1 起不再维护（调用无效），复制一律走上面三个回调。
+
+### Android（app-android/）
+
+- **文本选区复制**：用户气泡、助手正文、思考块展开态、工具步骤参数/结果/错误各包一层
+  `SelectionContainer` → 长按出系统选区 + 复制条（只包文本本身，不包整个气泡容器）。
+- **整条消息一键复制**：时间戳行加复制小按钮 → 复制正文原文（助手 = markdown 原文）
+  +「已复制」Toast。
+  - 不用长按手势做整条复制：`SelectionContainer` 已消费长按做选区，再叠长按会抢手势。
+
+### 验证
+
+- 鸿蒙：`devecocli build` SUCCESSFUL、linter 0 ERROR、V1 装饰器 0 命中、5 个契约回归全过；
+  真机（HUAWEI Mate 70）已验：长按正文/思考块出选区复制条，长按用户气泡/工具输出出系统选区菜单。
+- Android：`:core:test` 124 例 0 失败、`:app:assembleDebug` 成功、嵌套注释扫描 0 issues。
+- 回归：`node session-detail-contract-test.mjs` 新增复制接线断言（含**禁止再引入自绘长按菜单**）。
+
 ## [1.3.4] - 2026-11-17
 
 legacy 提问体验重做：**两端同步弹卡 + 双端竞速**（契约升 **v1.3.2**，§5.12.7）。

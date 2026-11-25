@@ -3,11 +3,34 @@
  * DSH Pocket for Android —— :app（Android application，Compose UI）。
  */
 import java.util.Properties
+import java.io.File
 
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
+}
+
+// ---------------------------------------------------------------------------
+// 版本号：**构建期从事实源推导**，不再手写常量。
+//
+// 事实源 = 仓库根 plugin/package.json 的 version（发版流水线强制它与 git 标签一致）。
+// 以前这里写死 `versionCode = 3 / versionName = "1.3.4"`，仓库发到 1.3.5 了
+// APK 内部还显示 1.3.4 → 设备上装到的 / 应用市场显示的版本永远落后一版
+// （release workflow 只校验 relay/plugin 两个 npm 包，不查 App，漏 bump 不会让发版失败）。
+//
+// 编码：major*1000000 + minor*1000 + patch（与 HarmonyOS app.json5 的 versionCode 同一套）。
+// 校验漂移：node tools/sync-app-versions.mjs --check（CI / release 门禁）。
+// ---------------------------------------------------------------------------
+val repoRoot: File = rootProject.file("..")
+val pluginPkg = File(repoRoot, "plugin/package.json")
+val appVersion: String = Regex("\"version\"\\s*:\\s*\"([^\"]+)\"")
+    .find(pluginPkg.readText())
+    ?.groupValues?.get(1)
+    ?: error("无法从 ${pluginPkg.path} 读取版本号（事实源缺失）")
+val appVersionCode: Int = appVersion.split(".").let { parts ->
+    require(parts.size == 3) { "版本号格式非法（期望 major.minor.patch）：$appVersion" }
+    parts[0].toInt() * 1000000 + parts[1].toInt() * 1000 + parts[2].toInt()
 }
 
 // ---------------------------------------------------------------------------
@@ -48,8 +71,9 @@ android {
         applicationId = "dsh.rc.pocket"
         minSdk = 26
         targetSdk = 36
-        versionCode = 3
-        versionName = "1.3.4"
+        // 版本号由构建期从 plugin/package.json 推导（见文件头「版本号」段），勿写死。
+        versionCode = appVersionCode
+        versionName = appVersion
     }
 
     signingConfigs {

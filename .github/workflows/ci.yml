@@ -117,3 +117,18 @@ jobs:
           node market/sync-into-plugin.mjs
           node market/sync-into-plugin.mjs --check
           test -f plugin/market/index.json
+
+  app-versions:
+    name: app-versions（两端 App 版本号不漂移）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # 事实源 = plugin/package.json 的 version。
+      # 以前两端 App 的版本号是手写常量，仓库发到 1.3.5 了设备上装的还显示 1.3.4，
+      # 而 release 只校验 relay/plugin 两个 npm 包 → 漏 bump 不会让发版失败。
+      # 这里把漂移变成 CI 失败（同一机制也挂在 release.yml 的版本一致性门禁里）。
+      - name: 两端 App 版本号与事实源一致
+        run: node tools/sync-app-versions.mjs --check

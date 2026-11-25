@@ -77,6 +77,27 @@ jobs:
           [ "$pp" = "$v" ] || { echo "plugin/package.json 是 $pp，标签是 $v——先同步 bump 再打标签"; exit 1; }
           # 只发布两个包：插件（含市场索引副本）+ 中继。app 走 AGC，不发 npm。
 
+      # 两端 App 的版本号不参与 npm 发布，但**必须与标签一致**：
+      # APK 内部 versionName / 鸿蒙 app.json5 的 versionName 若落后于仓库版本，
+      # 设备上装到的和应用市场显示的版本就会是旧的一版（2026-11-26 实测踩过）。
+      # 事实源 = plugin/package.json；这里同步后校验，漂移即发版失败。
+      - name: 同步并校验两端 App 版本号
+        run: |
+          node tools/sync-app-versions.mjs
+          node tools/sync-app-versions.mjs --check
+          # 校验 Android 构建期推导出的版本号与标签一致
+          node -e "
+            const fs = require('fs');
+            const v = '${{ steps.ver.outputs.version }}';
+            const kts = fs.readFileSync('app-android/app/build.gradle.kts', 'utf8');
+            if (!kts.includes('versionName = appVersion')) {
+              console.error('app-android/app/build.gradle.kts 的 versionName 不是构建期推导的 appVersion'); process.exit(1);
+            }
+            const pkg = JSON.parse(fs.readFileSync('plugin/package.json', 'utf8'));
+            if (pkg.version !== v) { console.error('事实源 plugin/package.json 是 ' + pkg.version + '，标签是 ' + v); process.exit(1); }
+            console.log('app 版本号 OK：' + v);
+          "
+
       - name: 门禁 relay（安装 + 测试）
         working-directory: relay
         run: |

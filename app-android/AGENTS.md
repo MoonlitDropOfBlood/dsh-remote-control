@@ -212,6 +212,23 @@ HarmonyOS 版改完后同步到这里，**wire 与 UI 口径两端必须一致**
 回归：`./gradlew :core:test`（`CoreApiContractTest` 新增 trigger 默认值与
 「Todo 无数据时 UI 不可见」两例，共 121 例 0 失败）+ `:app:assembleDebug`。
 
+## 2026-11-26：版本号单一事实源（v1.3.6，协议不变）
+
+**App 版本号不许手写**——事实源 = 仓库根 `plugin/package.json` 的 `version`
+（发版流水线强制它与 git 标签一致）。
+
+- `app/build.gradle.kts` 在**配置期直接读**事实源推导
+  `versionCode = major*1000000 + minor*1000 + patch` / `versionName` → **永不漂移**。
+  （以前写死 `versionCode = 3` / `versionName = "1.3.4"` → 仓库发到 1.3.5 了
+  Release 里的 APK 内部还写着 1.3.4，而 release 只校验 relay/plugin 两个 npm 包 →
+  漏 bump 不会失败，**已踩坑**。）
+- 校验漂移：`node tools/sync-app-versions.mjs --check`（挂在 CI 的 `app-versions` job
+  与 release workflow 的版本一致性门禁之后 → 漂移即流水线红）。
+- HarmonyOS 版（`app/AppScope/app.json5`）是静态 JSON5（构建期无法注入）→
+  由同一个脚本写入；Android 不用改文件。
+- 改了版本号后要做的三件事：bump `plugin/package.json` + `relay/package.json` →
+  跑 `node tools/sync-app-versions.mjs` → 补 CHANGELOG 的 `## [版本]` 段落。
+
 ## 2026-11-24：会话详情页消息列表支持复制（协议不变，对齐 HarmonyOS 版）
 
 用户反馈「消息列表中的内容不支持复制，十分不方便」。此前 Android 端**没有任何复制能力**

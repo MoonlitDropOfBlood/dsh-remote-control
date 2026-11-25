@@ -3,6 +3,44 @@
 本仓库的版本说明。发版时（推 `v*` 标签）release workflow 会抽取对应版本段落作为
 GitHub Release 的正文——**bump 版本时必须同步补一段 `## [版本]`**，否则发布失败。
 
+## [1.3.6] - 2026-11-26
+
+修 **v1.3.5 发布出来的 App 版本号是错的**（用户发现 GitHub 上的 APK 显示旧版本）。
+纯构建/发布工程改进，**业务功能与协议零变化**（插件/中继只有版本号同 bump）。
+
+### 根因
+
+两端 App 的版本号都是**手写常量**：
+
+- `app-android/app/build.gradle.kts`：`versionCode = 3` / `versionName = "1.3.4"`
+- `app/AppScope/app.json5`：`versionCode: 1003004` / `versionName: "1.3.4"`
+
+仓库发到 v1.3.5 时，两处都没跟着改 → **v1.3.5 Release 里的 APK 内部 versionName 是
+`1.3.4` / versionCode `3`**，而文件名却写着 `dsh-pocket-android-1.3.5.apk`；
+鸿蒙真机上装到的 bundle 也报 1.3.4（`bm dump` 实测 versionCode 1003004）。
+
+为什么发版没拦住：release workflow 的「版本一致性」门禁**只校验 relay/plugin 两个
+npm 包**与标签一致，**不查 App** → 漏 bump 不会让发版失败，事后也没人发现。
+
+### 修法：单一事实源 + 漂移即失败
+
+- **事实源 = `plugin/package.json` 的 version**（发版流水线已强制它与标签一致）。
+- **Android**：`build.gradle.kts` 在**配置期直接读**事实源推导
+  `versionCode = major*1000000 + minor*1000 + patch` / `versionName` → **永不漂移**。
+- **HarmonyOS**：`app.json5` 是静态 JSON5（DevEco 直接读，构建期无法注入）→
+  由 `tools/sync-app-versions.mjs` 写入，`--check` 模式断言一致。
+- **门禁**：`tools/sync-app-versions.mjs --check` 同时挂进
+  **CI**（新增 `app-versions` job）与 **release workflow**（版本一致性之后立刻执行，
+  还会校验 Android 是构建期推导而非写死）→ **漏 bump 直接让流水线红**。
+
+### 验证
+
+- Android：`./gradlew :app:assembleDebug` 成功，`aapt2 dump badging` 实测
+  `versionName='1.3.6' versionCode='1003006'`（v1.3.5 的坏包是 `1.3.4` / `3`）。
+- HarmonyOS：`devecocli build` 成功，产物 `module.json` 内 `1003006` / `1.3.6`；
+  真机 `bm dump` 复核 versionCode。
+- `node tools/sync-app-versions.mjs --check` 通过。
+
 ## [1.3.5] - 2026-11-26
 
 手机端**消息列表支持复制**（用户反馈：「消息列表中的内容不支持复制，十分不方便」）。

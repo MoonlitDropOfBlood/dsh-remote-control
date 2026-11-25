@@ -665,6 +665,23 @@ store 里这些数据是 **Map + 版本号**（`queueVersion` / `todosVersion` /
 - `node v13-contract-test.mjs` 新增：Goal 行顺序/图标按钮/无「完成」、编辑面板无轮次、
   Todo 空行隐藏、触发卡分支与 `trigger` 映射/搬运。
 
+## 2026-11-26：版本号单一事实源（v1.3.6，协议不变）
+
+**App 版本号不许手写**——事实源 = 仓库根 `plugin/package.json` 的 `version`
+（发版流水线强制它与 git 标签一致）。
+
+- **Android**（`app-android/app/build.gradle.kts`）：**配置期直接读**事实源推导
+  `versionCode = major*1000000 + minor*1000 + patch` / `versionName` → 永不漂移。
+- **HarmonyOS**（`app/AppScope/app.json5`）：静态 JSON5（DevEco 直接读，构建期无法注入）
+  → 由 `tools/sync-app-versions.mjs` 写入（`--check` 只校验）。
+- **门禁**：`node tools/sync-app-versions.mjs --check` 挂在 CI（`app-versions` job）
+  与 release workflow 的版本一致性门禁之后 → **漏 bump 直接让流水线红**。
+- ⚠️ **v1.3.5 踩过的坑**：两端 App 的版本号都是手写常量，仓库发到 1.3.5 了
+  Release 里的 APK 内部还写着 `1.3.4` / versionCode `3`（文件名却是 1.3.5），
+  而 release 只校验 relay/plugin 两个 npm 包 → 漏 bump 不会失败。**别再写死版本号。**
+- 改了版本号后要做的三件事：bump `plugin/package.json` + `relay/package.json` →
+  跑 `node tools/sync-app-versions.mjs` → 补 CHANGELOG 的 `## [版本]` 段落。
+
 ## 2026-11-24：会话详情页消息列表支持复制（协议不变）
 
 用户反馈「消息列表中的内容不支持复制，十分不方便」。三条路径分别处理（**无 wire 变化**）：

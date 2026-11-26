@@ -4,11 +4,12 @@
  * Cordis **类插件**（`export default class RemoteControlService extends TypertRemoteService`）：
  * DSH 装载器把本包作为类插件挂载，服务名 `remoteControl`；Typert 网关把它
  * 标记为 Remote 的方法暴露给浏览器端（`ctx.remote.remoteControl.*`）——
- * 桌面端「设置 → DSH Pocket」分区即通过这三个 Remote 方法驱动：
+ * 桌面端「设置 → DSH Pocket」分区即由这些 Remote 方法驱动：
  *
  *   - getPairing()  → {relayUrl, channel, hidden, qrSvg}（二维码内联进设置页）
  *   - rotateSecret()→ 轮换 channel/secret（旧二维码立即失效）
  *   - setHidden(b)  → 隐藏/恢复配对展示
+ *   - getAndroidDownload() → Android 版 APK 直链 + 二维码（与中继配置无关）
  *
  * 插件同时保留函数式入口 `apply(ctx, config)`（等价于类插件的初始化路径），
  * 供按函数插件方式挂载的宿主使用；两条路径共用 `startRemoteHost()`。
@@ -39,7 +40,8 @@ import { loadConfig, saveConfig, dataDir, bumpSelfEpoch, readEpoch, savePeerEpoc
 import { RelayClient } from "./lib/relay-client.mjs";
 import { RelaySupervisor, shouldTickWatchdog } from "./lib/relay-supervisor.mjs";
 import { PushSender, pushConfigured, pushUnavailableReason } from "./lib/push.mjs";
-import { HostBridge } from "./lib/host-bridge.mjs";
+import { HostBridge, pluginVersion } from "./lib/host-bridge.mjs";
+import { buildAndroidDownload } from "./lib/downloads.mjs";
 import {
   buildPairingUri,
   renderPairing,
@@ -427,7 +429,7 @@ export class RemoteControlService extends TypertRemoteService {
         e,
       );
     }
-    for (const method of ["getPairing", "rotateSecret", "setHidden", "setRelayUrl", "setRelayToken"]) {
+    for (const method of ["getPairing", "rotateSecret", "setHidden", "setRelayUrl", "setRelayToken", "getAndroidDownload"]) {
       try {
         markRemoteMethod(this, method, method);
       } catch (e) {
@@ -466,6 +468,22 @@ export class RemoteControlService extends TypertRemoteService {
       };
     }
     return { ok: true, value: withRelayProcess(pairingValue(cfg, "", true), host) };
+  }
+
+  /**
+   * Android 版安装包下载信息（设置面板渲染用）：版本钉扎的 APK 直链 + 二维码 SVG。
+   * 不依赖中继配置/配对隐藏状态——首次安装、未配对时也照样能下载。
+   * @returns {Promise<{ok:true,value:object}|{ok:false,error:{code:string,message:string}}>}
+   */
+  async getAndroidDownload() {
+    try {
+      return { ok: true, value: buildAndroidDownload(pluginVersion()) };
+    } catch (e) {
+      return {
+        ok: false,
+        error: { code: "download-unavailable", message: String((e && e.message) || e) },
+      };
+    }
   }
 
   /**

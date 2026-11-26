@@ -12,8 +12,10 @@
 //   3. **图标 data-uri 与 icon.svg 同步**：改了 icon.svg 却没跑
 //      `node scripts/sync-client-icon.mjs` 时，设置页导航图标会停在旧造型。
 //   4. **Host 半边真跑一遍**：用临时 DSH_HOME 实例化类插件，走 [Service.init] →
-//      三个 Remote 方法被标记 → getPairing/rotateSecret/setHidden 的返回信封，
+//      六个 Remote 方法被标记 → getPairing/rotateSecret/setHidden/setRelay* 的返回信封，
 //      并断言**返回体里没有 secret 明文**（只有二维码图像）。
+//      另含 getAndroidDownload（v1.3.7）：与中继配置/配对隐藏**无关**、版本钉扎直链、
+//      二维码被独立解码器 jsqr 解回下载地址、未知版本回退 Release 页。
 //   5. **combo 拼接安全**（2026-10-24 生产事故）：DSH web 服务器把所有 web client
 //      bundle **裸拼接**进同一个 combo <script>（buildComboScript，无作用域包裹）。
 //      顶层 const/let/class 会与其他 bundle 的同名声明相撞（我们与 token-stats 的
@@ -54,7 +56,7 @@ const { TYPERT } = await import("../typert.host.js");
 check("TYPERT.package 等于包名", TYPERT.package === pkg.name, TYPERT.package + " vs " + pkg.name);
 check("TYPERT.face 是 host", TYPERT.face === "host", TYPERT.face);
 check("TYPERT.schemas 是数组", Array.isArray(TYPERT.schemas));
-check("TYPERT.invocations 是数组且有 5 条", Array.isArray(TYPERT.invocations) && TYPERT.invocations.length === 5, String(TYPERT.invocations?.length));
+check("TYPERT.invocations 是数组且有 6 条", Array.isArray(TYPERT.invocations) && TYPERT.invocations.length === 6, String(TYPERT.invocations?.length));
 
 /** 收集 manifest 里所有 strict codec。 */
 function collectCodecs(manifest) {
@@ -135,10 +137,20 @@ const clientCreateCount = (clientDescriptorBlock.match(/create:\s*create\w+/g) ?
 const clientCodecCount = (clientDescriptorBlock.match(/mode:\s*"strict"/g) ?? []).length;
 check("client 侧每个 strict codec 都有 create()", clientCreateCount >= clientCodecCount && clientCodecCount > 0, clientCreateCount + "/" + clientCodecCount);
 
-// 三个 Remote 方法齐备
-for (const method of ["getPairing", "rotateSecret", "setHidden"]) {
+// Remote 方法齐备（v1.3.7 起多了 getAndroidDownload：Android 安装包下载卡的数据源）
+for (const method of ["getPairing", "rotateSecret", "setHidden", "getAndroidDownload"]) {
   check("client 侧暴露 " + method + " 调用", clientSrc.includes(method + "()") || clientSrc.includes("remote." + method));
 }
+
+// 设置页的 Android 安装包卡（v1.3.7）：标题/二维码/下载地址/复制/Release 链接齐备，
+// 且数据走独立 state（getPairing 未配置中继时回 error，卡不能依赖它）。
+check("client 侧有 Android 安装包卡标题", clientSrc.includes("Android 版安装包"));
+check("client 侧渲染 APK 二维码（内联 SVG）", /android\.qrSvg/.test(clientSrc) && clientSrc.includes("dangerouslySetInnerHTML"));
+check("client 侧展示下载地址链接", /href:\s*android\.url/.test(clientSrc) && clientSrc.includes('className: "rc-link"'));
+check("client 侧有复制下载地址按钮", clientSrc.includes("copyAndroidUrl") && clientSrc.includes("已复制"));
+check("client 侧有 Release 页链接", clientSrc.includes("所有版本") && /android\.releasesUrl/.test(clientSrc));
+check("旧宿主没有该方法时静默隐藏（typeof 守卫）", clientSrc.includes('typeof remote.getAndroidDownload !== "function"'));
+check("没有下载信息时不渲染整张卡", /android && android\.url/.test(clientSrc));
 
 // v1.1.x：中继地址可直接编辑保存（不再让用户改 config.json）
 check("client 侧暴露 setRelayUrl 调用", clientSrc.includes("remote.setRelayUrl"));
@@ -214,7 +226,7 @@ check("导航图标 CSS 用 currentColor mask（跟随外壳配色）", navIconC
 check("index.js 默认导出类插件", /export default class RemoteControlService extends TypertRemoteService/.test(indexSrc));
 check("index.js 导出类本身（便于测试/引用）", /export class RemoteControlService extends TypertRemoteService/.test(indexSrc));
 check("类插件服务名为 remoteControl", /super\(ctx,\s*"remoteControl"\)/.test(indexSrc));
-for (const method of ["getPairing", "rotateSecret", "setHidden", "setRelayUrl", "setRelayToken"]) {
+for (const method of ["getPairing", "rotateSecret", "setHidden", "setRelayUrl", "setRelayToken", "getAndroidDownload"]) {
   check("index.js 标记 Remote 方法 " + method, indexSrc.includes('"' + method + '"'));
 }
 check("index.js 仍保留函数式 apply 入口", /export function apply\(ctx, config\)/.test(indexSrc));
@@ -247,8 +259,8 @@ await service[Service.init]();
 check("类插件注册为 remoteControl 服务", service.name === "remoteControl", String(service.name));
 const marked = remoteMethods(service).map((m) => m.method).sort();
 check(
-  "五个 Remote 方法都被标记",
-  JSON.stringify(marked) === JSON.stringify(["getPairing", "rotateSecret", "setHidden", "setRelayToken", "setRelayUrl"]),
+  "六个 Remote 方法都被标记",
+  JSON.stringify(marked) === JSON.stringify(["getAndroidDownload", "getPairing", "rotateSecret", "setHidden", "setRelayToken", "setRelayUrl"]),
   JSON.stringify(marked),
 );
 
@@ -257,6 +269,80 @@ const noUrl = await service.getPairing();
 check("未配置 relayUrl 时 getPairing 回 error", noUrl.ok === false, JSON.stringify(noUrl).slice(0, 120));
 check("错误码是 pairing-unavailable", noUrl.error?.code === "pairing-unavailable", String(noUrl.error?.code));
 check("错误信息提到 relayUrl", String(noUrl.error?.message).includes("relayUrl"));
+
+// ---- getAndroidDownload（v1.3.7）：Android APK 版本钉扎直链 + 二维码 ------------
+// 关键性质：**与中继配置/配对隐藏状态无关**——首次安装、还没填中继地址时也必须能下载。
+const { buildAndroidDownload } = await import("../lib/downloads.mjs");
+const { encodeToMatrix } = await import("../lib/qr.mjs");
+const androidNoRelay = await service.getAndroidDownload();
+check("未配置 relayUrl 时 getAndroidDownload 也成功", androidNoRelay.ok === true, JSON.stringify(androidNoRelay).slice(0, 120));
+const apkRepo = "https://github.com/MoonlitDropOfBlood/dsh-remote-control/releases";
+const expectedApk = apkRepo + "/download/v" + pkg.version + "/dsh-pocket-android-" + pkg.version + ".apk";
+
+/** 从 toSvg 输出把黑模块解析回矩阵（只认本包 toSvg 的 `M{x} {y}h1v1h-1z` 路径）。 */
+function matrixFromQrSvg(svg, size) {
+  const vb = /viewBox="0 0 (\d+) (\d+)"/.exec(svg);
+  if (!vb) return null;
+  const dim = Number(vb[1]);
+  const quiet = (dim - size) / 2;
+  if (!Number.isInteger(quiet) || quiet < 0) return null;
+  const modules = Array.from({ length: size }, () => Array(size).fill(false));
+  const re = /M(\d+) (\d+)h1v1h-1z/g;
+  let m;
+  while ((m = re.exec(svg))) {
+    const x = Number(m[1]) - quiet;
+    const y = Number(m[2]) - quiet;
+    if (x >= 0 && x < size && y >= 0 && y < size) modules[y][x] = true;
+  }
+  return { size, modules };
+}
+
+/** 矩阵 → RGBA 像素（jsqr 独立解码用；与 verify-qr 同一口径）。 */
+function rasterizeMatrix(qr, scale = 6, quiet = 4) {
+  const dim = (qr.size + quiet * 2) * scale;
+  const rgba = new Uint8ClampedArray(dim * dim * 4).fill(255);
+  for (let y = 0; y < qr.size; y++) {
+    for (let x = 0; x < qr.size; x++) {
+      if (!qr.modules[y][x]) continue;
+      for (let dy = 0; dy < scale; dy++) {
+        for (let dx = 0; dx < scale; dx++) {
+          const px = ((y + quiet) * scale + dy) * dim + ((x + quiet) * scale + dx);
+          rgba[px * 4] = 0;
+          rgba[px * 4 + 1] = 0;
+          rgba[px * 4 + 2] = 0;
+        }
+      }
+    }
+  }
+  return { rgba, dim };
+}
+
+check("android 版本号等于包版本", androidNoRelay.value?.version === pkg.version, String(androidNoRelay.value?.version));
+check("android 安装包文件名", androidNoRelay.value?.fileName === "dsh-pocket-android-" + pkg.version + ".apk", String(androidNoRelay.value?.fileName));
+check("android 下载地址是版本钉扎的 release 资产直链", androidNoRelay.value?.url === expectedApk, String(androidNoRelay.value?.url));
+check("android releasesUrl 指向 Release 页", androidNoRelay.value?.releasesUrl === apkRepo, String(androidNoRelay.value?.releasesUrl));
+check("android 二维码是 SVG", String(androidNoRelay.value?.qrSvg || "").includes("<svg"));
+check("android 正常版本没有 note", androidNoRelay.value?.note === "", String(androidNoRelay.value?.note));
+check("android 返回体里没有 secret 明文", !JSON.stringify(androidNoRelay).includes(service._host.cfg.secret));
+
+// 二维码必须**真的**编码了下载地址：把 SVG 解析回矩阵 → jsqr 独立解码回读。
+const apkQr = matrixFromQrSvg(String(androidNoRelay.value?.qrSvg || ""), encodeToMatrix(expectedApk).size);
+check("android 二维码 SVG 可解析回矩阵", !!apkQr);
+const jsqrMod = await import("jsqr").catch(() => null);
+const jsqr = jsqrMod ? jsqrMod.default ?? jsqrMod : null;
+if (apkQr && jsqr) {
+  const { rgba, dim } = rasterizeMatrix(apkQr);
+  const decoded = jsqr(rgba, dim, dim);
+  check("android 二维码独立解码回下载地址", decoded?.data === expectedApk, String(decoded?.data));
+} else {
+  console.log("note: jsqr 未安装，跳过 Android 二维码独立解码（npm install 后重跑）");
+}
+
+// 版本未知/非法 → 回退到 Release 页（不生成 404 的直链）。
+const unknownVersion = buildAndroidDownload("dev");
+check("未知版本回退到 Release 页", unknownVersion.url === apkRepo && unknownVersion.fileName === "", JSON.stringify(unknownVersion).slice(0, 160));
+check("未知版本给出可操作说明", unknownVersion.note.includes("Releases"), unknownVersion.note);
+check("未知版本二维码仍可用（指向 Release 页）", String(unknownVersion.qrSvg).includes("<svg"));
 
 // 配好 relayUrl → 返回配对信息（**不含 secret 明文**）
 service._host.cfg.relayUrl = "wss://relay.example.com/ws";
@@ -273,6 +359,10 @@ check("setHidden(true) 成功且 hidden=true", hidden.ok === true && hidden.valu
 check("隐藏后不再返回二维码", !hidden.value?.qrSvg);
 const shown = await service.setHidden(false);
 check("setHidden(false) 恢复显示并带回二维码", shown.ok === true && shown.value?.hidden === false && String(shown.value?.qrSvg || "").includes("<svg"));
+
+// 配对隐藏/恢复只影响配对二维码，不能连带藏掉 Android 安装包下载（两者互不相关）。
+const androidHidden = await service.getAndroidDownload();
+check("配对隐藏不影响 Android 下载信息", androidHidden.ok === true && androidHidden.value?.url === expectedApk, JSON.stringify(androidHidden).slice(0, 120));
 
 // 轮换 → channel/secret 都换
 const oldChannel = service._host.cfg.channel;

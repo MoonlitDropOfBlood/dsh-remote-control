@@ -108,7 +108,7 @@ function deliveredImageId(path, turn) {
 }
 
 /** 从本包 package.json 读版本；失败给 unknown（不抛出）。 */
-function pluginVersion() {
+export function pluginVersion() {
   try {
     const req = createRequire(import.meta.url);
     const pkg = req("../package.json");

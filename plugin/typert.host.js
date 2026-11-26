@@ -55,6 +55,41 @@ const pairingResultSchema = z.union([
 
 const createPairingResult = () => pairingResultSchema;
 
+/** Android 版 APK 下载信息（直链 + 二维码；与中继配置/配对状态无关）。 */
+const androidDownloadValueSchema = z
+  .object({
+    version: z.string(),
+    fileName: z.string(),
+    url: z.string(),
+    releasesUrl: z.string(),
+    qrSvg: z.string(),
+    note: z.string(),
+  })
+  .readonly();
+
+/** getAndroidDownload 的结果信封：{ok:true,value} | {ok:false,error}。 */
+const androidDownloadResultSchema = z.union([
+  z
+    .object({
+      ok: z.literal(true).readonly(),
+      value: androidDownloadValueSchema,
+    })
+    .readonly(),
+  z
+    .object({
+      ok: z.literal(false).readonly(),
+      error: z
+        .object({
+          code: z.string().readonly(),
+          message: z.string().readonly().optional(),
+        })
+        .readonly(),
+    })
+    .readonly(),
+]);
+
+const createAndroidDownloadResult = () => androidDownloadResultSchema;
+
 export const TYPERT = {
   package: "@duke-dsh-plugins/dsh-remote-control",
   face: "host",
@@ -174,12 +209,29 @@ export const TYPERT = {
       },
       sourceLocation: { file: "index.js", line: 1, column: 1 },
     },
+    {
+      // Android 版安装包下载地址 + 二维码（设置面板渲染用）。
+      // 与中继配置、配对隐藏状态无关——首次安装也能下载。
+      id: "dsh-remote-control#remoteControl/getAndroidDownload",
+      service: "remoteControl",
+      namespace: "remoteControl",
+      method: "getAndroidDownload",
+      invocation: { kind: "direct" },
+      parameters: [],
+      result: {
+        mode: "strict",
+        typeSymbol: "dsh-remote-control#AndroidDownloadResult",
+        schema: androidDownloadResultSchema,
+        create: createAndroidDownloadResult,
+      },
+      sourceLocation: { file: "index.js", line: 1, column: 1 },
+    },
   ],
   model: {
     services: [
       {
         description:
-          "Remote-control pairing service: exposes the relay address, the pairing channel and the pairing QR code to the desktop settings panel, plus relay-address editing, key rotation and pairing hide/show.",
+          "Remote-control pairing service: exposes the relay address, the pairing channel and the pairing QR code to the desktop settings panel, plus relay-address editing, key rotation, pairing hide/show and the Android APK download link with its QR code.",
         summary: "Remote-control pairing service for the settings panel.",
         tags: [],
         jsDoc:
@@ -222,6 +274,15 @@ export const TYPERT = {
             jsDoc:
               "/**\n * Set the relay address: the value is validated (ws:// or wss:// with a host,\n * at most 512 characters), persisted to config.json and pushed into the relay\n * link, which reconnects to the new address at once. An empty string clears\n * the address and idles the plugin.\n * @param url - the relay address, or an empty string to clear it.\n * @returns success with the fresh pairing payload or a business failure.\n */",
           },
+          {
+            kind: "method",
+            name: "getAndroidDownload",
+            signature: "@Remote('getAndroidDownload') async getAndroidDownload(): Promise<AndroidDownloadResult>",
+            summary:
+              "Return the Android APK download info: a version-pinned asset direct link plus a QR code for it; independent of the relay configuration.",
+            jsDoc:
+              "/**\n * Return the Android APK download info for the settings panel: the\n * version-pinned release asset URL and a QR code pointing at it.\n * Does not depend on the relay address or the pairing hidden flag, so the\n * APK can be downloaded before the phone is paired.\n * @returns success with the download payload or a business failure.\n */",
+          },
         ],
         types: [
           {
@@ -233,6 +294,16 @@ export const TYPERT = {
             name: "PairingResult",
             declaration:
               "export type PairingResult = { ok: true; value: PairingValue } | { ok: false; error: { code: string; message?: string } };",
+          },
+          {
+            name: "AndroidDownloadValue",
+            declaration:
+              "export interface AndroidDownloadValue {\n    readonly version: string;\n    readonly fileName: string;\n    readonly url: string;\n    readonly releasesUrl: string;\n    readonly qrSvg: string;\n    readonly note: string;\n}",
+          },
+          {
+            name: "AndroidDownloadResult",
+            declaration:
+              "export type AndroidDownloadResult = { ok: true; value: AndroidDownloadValue } | { ok: false; error: { code: string; message?: string } };",
           },
         ],
       },

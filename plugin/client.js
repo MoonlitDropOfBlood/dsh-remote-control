@@ -8,6 +8,8 @@
  *   - the pairing QR code (inline SVG produced by the Host half),
  *   - the actions: save the relay address, rotate the pairing key and
  *     hide / show the pairing.
+ *   - the Android APK download card: the download URL and its QR code
+ *     (for installing the phone app on an Android device).
  *
  * The nav glyph of that section comes from the `settings.section.icon` slot
  * (DSH 0.2.2-rc.1+): we register our whale under the same id as the section,
@@ -71,6 +73,8 @@ const CLIENT_ICON_MASK_URI =
 .rc-qr svg{width:220px;height:220px;max-width:100%;display:block;background:#fff;border-radius:10px;padding:8px}
 .rc-qr-empty{color:var(--dsw-alias-label-secondary);font-size:13px;padding:24px 0;text-align:center}
 .rc-note{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}
+.rc-link{font-size:13px;line-height:18px;color:var(--dsw-alias-brand-primary);word-break:break-all;text-decoration:underline}
+a.rc-btn{display:inline-flex;align-items:center;justify-content:center;text-decoration:none}
 .rc-actions{display:flex;gap:8px;flex-wrap:wrap}
 .rc-btn{box-sizing:border-box;height:30px;font:inherit;cursor:pointer;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);padding:0 14px;font-size:13px;line-height:28px}
 .rc-btn:hover{border-color:var(--dsw-alias-border-l1)}
@@ -149,6 +153,22 @@ const CLIENT_ICON_MASK_URI =
           result: {
             mode: "strict",
             typeSymbol: "dsh-remote-control#PairingResult",
+            schema: passthrough(),
+            create: createPassthrough,
+          },
+        },
+        {
+          // Android 安装包（APK）的下载地址与二维码。旧宿主没有这个方法时，
+          // 调用会失败/不存在 → 设置页静默不显示这张卡（不影响其它部分）。
+          id: "dsh-remote-control#remoteControl/getAndroidDownload",
+          service: "remoteControl",
+          namespace: "remoteControl",
+          method: "getAndroidDownload",
+          invocation: { kind: "direct" },
+          parameters: [],
+          result: {
+            mode: "strict",
+            typeSymbol: "dsh-remote-control#AndroidDownloadResult",
             schema: passthrough(),
             create: createPassthrough,
           },
@@ -357,6 +377,11 @@ const CLIENT_ICON_MASK_URI =
         const [relayDraft, setRelayDraft] = React.useState(null);
         // v1.1.3：中继令牌草稿（null = 跟随宿主值；宿主只回 relayTokenSet，不回明文）
         const [tokenDraft, setTokenDraft] = React.useState(null);
+        // Android 安装包信息（独立 state，不塞进 state.value：getPairing 在未配置
+        // 中继时回 error，而这张卡与中继配置无关）。
+        const [android, setAndroid] = React.useState(null);
+        // 复制按钮文案："" = 「复制地址」/「已复制」/「复制失败」（2 秒后复原）
+        const [androidCopied, setAndroidCopied] = React.useState("");
         // 宿主最近一次返回的中继地址：用来判断「宿主值真的变了」还是「只是轮询刷新」
         const lastHostUrl = React.useRef(null);
 
@@ -414,6 +439,69 @@ const CLIENT_ICON_MASK_URI =
             if (timer) clearInterval(timer);
           };
         }, [load]);
+
+        // Android 安装包信息：**一次性**取（信息随插件版本静态，不参与 15s 轮询）。
+        // 旧宿主没有 getAndroidDownload 这个方法，或调用失败 → 保持 null（静默隐藏
+        // 整张卡，不影响页面其它部分）。
+        React.useEffect(() => {
+          let cancelled = false;
+          if (!remote || typeof remote.getAndroidDownload !== "function") return undefined;
+          void (async function () {
+            try {
+              const res = unwrapRemote(await remote.getAndroidDownload());
+              if (cancelled) return;
+              if (!res.ok) return;
+              const v = res.value;
+              if (!v || !v.url) return;
+              setAndroid(v);
+            } catch (e) {
+              /* 旧宿主/未知错误：静默，不显示这张卡 */
+            }
+          })();
+          return () => {
+            cancelled = true;
+          };
+        }, [remote]);
+
+        // 复制下载地址：优先剪贴板 API，不可用/失败时用隐藏 textarea + execCommand 兜底。
+        const copyAndroidUrl = React.useCallback(
+          async function () {
+            const url = android && android.url;
+            if (!url) return;
+            let ok = false;
+            try {
+              if (
+                typeof navigator !== "undefined" &&
+                navigator.clipboard &&
+                typeof navigator.clipboard.writeText === "function"
+              ) {
+                await navigator.clipboard.writeText(url);
+                ok = true;
+              }
+            } catch (e) {
+              ok = false;
+            }
+            if (!ok) {
+              try {
+                const ta = document.createElement("textarea");
+                ta.value = url;
+                ta.setAttribute("readonly", "readonly");
+                ta.style.position = "fixed";
+                ta.style.left = "-9999px";
+                ta.style.top = "0";
+                document.body.appendChild(ta);
+                ta.select();
+                ok = document.execCommand("copy") === true;
+                document.body.removeChild(ta);
+              } catch (e) {
+                ok = false;
+              }
+            }
+            setAndroidCopied(ok ? "已复制" : "复制失败");
+            setTimeout(() => setAndroidCopied(""), 2000);
+          },
+          [android],
+        );
 
         // 配对状态刷新后，输入框回到「跟随宿主值」——但**只在宿主地址真的变了**时
         // （轮询刷新不能把用户正在编辑的草稿冲掉）；判断已在上面的 load() 里完成。
@@ -712,6 +800,106 @@ const CLIENT_ICON_MASK_URI =
                 )
               : null,
           ),
+          // Android 安装包卡：宿主给了下载地址才渲染（没有就整张卡不出现）。
+          android && android.url
+            ? React.createElement(
+                "div",
+                { className: "rc-card" },
+                React.createElement("h3", { className: "rc-card-title" }, "Android 版安装包"),
+                android.qrSvg
+                  ? React.createElement("div", {
+                      className: "rc-qr",
+                      dangerouslySetInnerHTML: { __html: android.qrSvg },
+                    })
+                  : React.createElement(
+                      "div",
+                      { className: "rc-qr-empty" },
+                      android.note || "暂时无法生成二维码，请直接复制下方下载地址。",
+                    ),
+                React.createElement(
+                  "div",
+                  { className: "rc-row" },
+                  React.createElement(
+                    "div",
+                    { className: "rc-field" },
+                    React.createElement("span", { className: "rc-label" }, "版本"),
+                    React.createElement(
+                      "span",
+                      { className: "rc-value" },
+                      !android.version || android.version === "unknown" ? "未知" : "v" + android.version,
+                    ),
+                  ),
+                  React.createElement(
+                    "div",
+                    { className: "rc-field" },
+                    React.createElement("span", { className: "rc-label" }, "安装包"),
+                    React.createElement(
+                      "span",
+                      { className: "rc-value" },
+                      android.fileName || "（见下载地址）",
+                    ),
+                  ),
+                ),
+                React.createElement(
+                  "div",
+                  { className: "rc-field" },
+                  React.createElement("span", { className: "rc-label" }, "下载地址"),
+                  React.createElement(
+                    "a",
+                    {
+                      className: "rc-link",
+                      href: android.url,
+                      target: "_blank",
+                      rel: "noopener noreferrer",
+                    },
+                    android.url,
+                  ),
+                ),
+                React.createElement(
+                  "div",
+                  { className: "rc-actions" },
+                  React.createElement(
+                    "a",
+                    {
+                      className: "rc-btn rc-btn-primary",
+                      href: android.url,
+                      target: "_blank",
+                      rel: "noopener noreferrer",
+                    },
+                    "下载 APK",
+                  ),
+                  React.createElement(
+                    "button",
+                    {
+                      type: "button",
+                      className: "rc-btn",
+                      onClick: () => {
+                        void copyAndroidUrl();
+                      },
+                    },
+                    androidCopied || "复制地址",
+                  ),
+                  React.createElement(
+                    "a",
+                    {
+                      className: "rc-btn",
+                      href: android.releasesUrl || android.url,
+                      target: "_blank",
+                      rel: "noopener noreferrer",
+                    },
+                    "所有版本",
+                  ),
+                ),
+                React.createElement(
+                  "p",
+                  { className: "rc-note" },
+                  "Android 手机扫码或点击即可下载安装；鸿蒙版请通过华为应用市场安装。安装包与当前插件版本配套，建议成对升级。",
+                ),
+                android.note
+                  ? React.createElement("p", { className: "rc-note" }, android.note)
+                  : null,
+              )
+            : null,
         );
       }
 

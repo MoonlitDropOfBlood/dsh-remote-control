@@ -7,9 +7,10 @@ Cordis 功能插件：把 DSH 的会话/审批/事件桥接到中继，供手机
 
 ```
 index.js              Cordis 类插件入口：export default class RemoteControlService extends TypertRemoteService
-                      （服务名 remoteControl；[Service.init] 启动宿主链路 + 标记四个 Remote 方法；
+                      （服务名 remoteControl；[Service.init] 启动宿主链路 + 标记六个 Remote 方法；
                         另保留函数式 apply(ctx, config) 供函数插件宿主使用，两条路共用 startRemoteHost）
 client.js             Web 半边：window.__ModuleLoader__.load → 注册「设置 → DSH Pocket」分区
+                      （配对信息/配对二维码 + v1.3.7 的 Android 安装包下载卡）
 typert.host.js        TYPERT Host manifest（package/face/invocations + strict codec，每个 codec 带 create()）
 lib/protocol.mjs      信封 + HKDF-SHA256 + AES-256-GCM + assertKat()（契约 §3/§7）
 lib/config.mjs        %DSH_HOME%/remote-control/config.json 读写（首启生成 channel/secret、hidden 标记）
@@ -23,6 +24,8 @@ lib/attachments.mjs  用户提示词的附件（契约 §5.11 v1.2.0）：分块
 lib/pairing.mjs       配对核心：URI（§3.5）/QR（SVG+ASCII）/rotatePairingIdentity/setPairingHidden
                       /isLoopbackRelayUrl+loopbackWarning（回环地址判定与警告文案）
 lib/qr.mjs            内嵌 QR 编码器（移植 Nayuki qrcodegen，MIT；byte 模式 ECC-M v1-10）
+lib/downloads.mjs     Android 安装包下载信息（v1.3.7）：版本钉扎的 Release 资产直链
+                      + 指向该地址的二维码 SVG（buildAndroidDownload；未知版本回退 Release 页）
 lib/push.mjs          Push Kit REST（token 缓存 + messages:send，失败静默降级）
 scripts/verify-*.mjs  dev 验证脚本（jsqr 独立解码 + 配对 API mock + 设置页结构自检）
 scripts/sync-client-icon.mjs  把 icon.svg 同步成 client.js 里的导航图标 CSS mask data-uri
@@ -36,7 +39,7 @@ node -e "import('./lib/protocol.mjs').then(m=>m.assertKat())"           # KAT
 node scripts/verify-qr.mjs && node scripts/verify-pairing.mjs           # QR/配对 API 回归（需 devDependencies）
 node scripts/verify-steps.mjs                                          # 步骤/模式/权限/归档/模型/思考/强度 + 图片/附件回归（无依赖，234 项）
 node scripts/verify-images.mjs                                         # 图片专项 + 交付物桥接 + 排队(session.queue)/宿主投递设置(busyEnter)：元数据映射/缩略图降级/image.fetch/帧预算守卫/历史自动缩页/交付物进历史/排队追踪（无依赖，170 项）
-node scripts/verify-settings.mjs                                       # v1.1.x 设置页/manifest/combo/信封自检 + Host 真跑一遍 + 导航图标（151 项）
+node scripts/verify-settings.mjs                                       # v1.1.x 设置页/manifest/combo/信封自检 + Host 真跑一遍 + 导航图标 + Android 下载卡/二维码解码（177 项）
 node scripts/verify-relay-supervisor.mjs                               # v1.1.1 中继进程托管：决策/端口占用不抢/启停/看门狗/跨平台/bundle（无依赖，162 项）
 node scripts/verify-crypto.mjs                                          # v1.1.3 加密层/抗重放：KAT+AAD 两模式+sid 绑定+证明 v2+纪元单调性+接线层（无依赖，45 项）
 node scripts/verify-attachments.mjs                                    # v1.2.0 附件：分块状态机/canonical base64/limits/TTL/消费墓碑 + HostBridge 真接线 + 历史 files[]（无依赖，129 项）
@@ -416,8 +419,8 @@ present 出来的图当图片记**：
 
 | 文件 | 角色 |
 |---|---|
-| `index.js` | **类插件** `export default class RemoteControlService extends TypertRemoteService`（服务名 `remoteControl`）。`[Service.init]()` 里启动宿主链路（`startRemoteHost`）并把四个方法标记成 Remote 导出。 |
-| `typert.host.js` | **TYPERT Host manifest**：`package` 必须等于 package.json 的 name，`face:"host"`，四个 invocation（`getPairing` / `setRelayUrl` / `rotateSecret` / `setHidden`）。 |
+| `index.js` | **类插件** `export default class RemoteControlService extends TypertRemoteService`（服务名 `remoteControl`）。`[Service.init]()` 里启动宿主链路（`startRemoteHost`）并把六个方法标记成 Remote 导出（`getPairing` / `setRelayUrl` / `setRelayToken` / `rotateSecret` / `setHidden` / `getAndroidDownload`）。 |
+| `typert.host.js` | **TYPERT Host manifest**：`package` 必须等于 package.json 的 name，`face:"host"`，六个 invocation（与上面的方法列表一一对应）。 |
 | `client.js` | **Web 半边**：`window.__ModuleLoader__.load({id: <包名>, factory})` → `ctx.slots.inject("settings.section", …)` 注册 `{id:"remote-control", order:40, label:()=>"DSH Pocket"}`（**同一 id** 再注册 `settings.section.icon` → 导航图标，DSH 0.2.2-rc.1+），并 `ctx.remote.$mount(CLIENT_REMOTE)` 挂自己的 Remote 命名空间。 |
 
 设置页长这样（用户**不需要改任何文件**）：
@@ -428,6 +431,9 @@ present 出来的图当图片记**：
   中继配置」；再下面是只读的「配对频道」。
 - 「手机配对二维码」卡：二维码（内联 SVG）/ 隐藏态 / 空态文案
   「填写中继地址并保存后，这里会显示手机配对二维码。」+「轮换密钥」「隐藏/显示配对」。
+- 「Android 版安装包」卡（v1.3.7，见文末专节）：APK 二维码 + 版本/文件名 + 下载地址
+  （可点链接）+「下载 APK / 复制地址 / 所有版本」；**与中继配置、配对隐藏无关**，
+  首次安装就能看到。
 
 Remote 方法（返回 `{ok:true,value}` 或 `{ok:false,error:{code,message}}`）：
 
@@ -444,6 +450,10 @@ Remote 方法（返回 `{ok:true,value}` 或 `{ok:false,error:{code,message}}`�
   成功后回新的配对信息。
 - `setHidden(hidden)` → 落盘 `config.json` 的 `hidden` 字段；隐藏时删掉盘上 `pairing.svg`，
   恢复时重建。
+- `getAndroidDownload()`（v1.3.7）→ `{version, fileName, url, releasesUrl, qrSvg, note}`：
+  版本钉扎的 APK 直链（`releases/download/v<version>/dsh-pocket-android-<version>.apk`）
+  + 指向该地址的二维码 SVG；版本未知回退到 Release 页并附中文说明。
+  **不依赖 relayUrl / hidden**（未配对时也能下载），error code `download-unavailable`。
 
 实测坑（改动前先读）：
 
@@ -487,10 +497,12 @@ Remote 方法（返回 `{ok:true,value}` 或 `{ok:false,error:{code,message}}`�
   - 老 DSH（无该 slot）回落成默认齿轮——可接受降级，**别再为它加 DOM hack**。
 - **本包 CSS 标签要自己 `setAttribute("data-plugin", 包名)`**：`apply()` 是异步的，追加
   <style> 时 client-modules 的 `claimStyles(ownerId)` 扫描已经过去，不认领会被别的包收养。
-- 回归：`node scripts/verify-settings.mjs`（**151 项**，含双层信封解包用例 + combo 拼接安全 +
+- 回归：`node scripts/verify-settings.mjs`（**177 项**，含双层信封解包用例 + combo 拼接安全 +
   Host 半边真跑一遍 + setRelayUrl 校验/落盘/清除/回环警告 + **导航图标**：注册了
   `settings.section.icon`、图标 id 与分区 id 一致、旧 DOM hack 已删、`NavIcon` 尊重
-  外壳给的 `size`（写死 20px 的变异会被杀死）、CSS 不写死宽高）+ `node scripts/verify-pairing.mjs`（47 项）。
+  外壳给的 `size`（写死 20px 的变异会被杀死）、CSS 不写死宽高 + **Android 下载卡**：
+  未配置中继也能取、版本钉扎直链、二维码被 jsqr 解回下载地址、未知版本回退 Release 页、
+  配对隐藏不影响下载）+ `node scripts/verify-pairing.mjs`（47 项）。
 
 ## v1.1.3：抗重放的会话纪元 + 中继令牌/TLS（2026-10-26，契约 §3.4.1 / §3.4.2）
 
@@ -725,3 +737,18 @@ capabilities 有无降级、历史 files[]）；源码级断言（不直接塞 a
 
 门禁：`node scripts/verify-steps.mjs` **238 项**（新增：替换副本不产生步骤 / 不改写原步骤
 名字与结果 / 孤儿副本（call 不在页内）也不成步骤 / 直播闸不桥接替换副本，共 +5）。
+
+## 2026-11-26：设置页「Android 版安装包」下载卡
+
+- `lib/downloads.mjs` 的 `buildAndroidDownload(version)`：版本钉扎直链
+  `releases/download/v<ver>/dsh-pocket-android-<ver>.apk` + 指向该地址的二维码
+  （`lib/qr.mjs`，生成失败只置空 `qrSvg`）；版本未知/非法回退 Release 页 + note。
+  不用 `releases/latest`（资产名含版本，下一版即 404）。
+- 版本取 `host-bridge.mjs` 导出的 `pluginVersion()`（package.json 唯一事实源）。
+- **独立 Remote `getAndroidDownload()`**（第 6 个）：`getPairing` 未配置 relayUrl 时
+  回 error，而下载与中继配置/配对隐藏无关。index.js 标记 + typert manifest +
+  client descriptor 三处同步。
+- 客户端：独立 `android` state 一次性拉取（不参与 15s 轮询）；旧宿主无该方法 →
+  静默隐藏整卡；卡片 = 二维码 / 版本 / 下载地址 / 下载·复制·所有版本。
+- 门禁：`verify-settings` **177 项**，含 jsqr 独立解码回下载地址、未配置中继也能取、
+  配对隐藏不影响下载、未知版本回退 Release 页。

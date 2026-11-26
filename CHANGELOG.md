@@ -3,6 +3,34 @@
 本仓库的版本说明。发版时（推 `v*` 标签）release workflow 会抽取对应版本段落作为
 GitHub Release 的正文——**bump 版本时必须同步补一段 `## [版本]`**，否则发布失败。
 
+## [1.3.7] - 2026-11-26
+
+设置页新增 **Android 版安装包**下载卡：二维码 + 版本钉扎的 APK 直链 + 下载/复制/Release 页
+入口。手机扫码即可下载安装（此前只能自己去 GitHub Release 翻资产）。**协议零变化**
+（纯插件侧 UI + 一个新 Remote 方法）。
+
+### 实现
+
+- `plugin/lib/downloads.mjs`：由 `plugin/package.json` 版本推导
+  `https://github.com/MoonlitDropOfBlood/dsh-remote-control/releases/download/v<ver>/dsh-pocket-android-<ver>.apk`，
+  并用内嵌 QR 编码器生成二维码。**不用 `releases/latest`**（资产名含版本，下一版必 404）；
+  钉扎保证手机装到的是与当前插件配套的那一版。版本未知（dev 构建）回退 Release 页并附说明。
+- 新增 Remote 方法 `getAndroidDownload()`：**故意独立于 `getPairing()`**——后者在未配置中继
+  地址时回 error，而安装包下载与中继配置/配对隐藏无关，首次安装也要能下载。
+  `typert.host.js` / `client.js` descriptor 同步；旧宿主没有该方法时设置页静默隐藏整卡。
+- 设置页卡片：APK 二维码、版本/文件名、可点下载地址、「下载 APK / 复制地址 / 所有版本」；
+  复制走 clipboard API，失败回退 `textarea` + `execCommand`。
+
+### 验证
+
+- `node scripts/verify-settings.mjs` **177 项**（+26）：未配置中继也能取、版本钉扎直链形状、
+  **二维码 SVG 解析回矩阵 + jsqr 独立解码回下载地址**、未知版本回退 Release 页、
+  配对隐藏不影响下载、客户端卡片结构与旧宿主降级守卫。
+- 其余插件门禁全绿（verify-steps 238 / verify-images 170 / verify-crypto 45 /
+  verify-relay-supervisor 165 / verify-attachments 129 / verify-host-api 35），
+  真实 `validateTypertManifest` + 临时 `DSH_HOME` 真跑 `[Service.init]` 均通过。
+- Release 附件同步产出 `dsh-pocket-android-1.3.7.apk`（与设置页直链一致）。
+
 ## [1.3.6] - 2026-11-26
 
 修 **v1.3.5 发布出来的 App 版本号是错的**（用户发现 GitHub 上的 APK 显示旧版本）。
